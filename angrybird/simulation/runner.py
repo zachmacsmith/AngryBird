@@ -1,35 +1,35 @@
 """
-Simulation runner: wraps the core orchestrator with simulated observers and
-full four-way strategy comparison.
+Simulation runners for IGNIS.
 
-Phase 4b — simulation harness only. None of this ships with production code.
-(Build order test: "would you ship it with real drones?" → No → simulation/)
+CycleRunner (Phase 4b — strategy comparison)
+    Cycle-based harness for multi-strategy PERR comparison.  All strategies
+    run on the same ensemble each cycle; only the primary strategy's
+    observations update the real GP/EnKF state.  No clock, no drone movement.
 
-Design:
-  - All strategies run on the SAME ensemble each cycle (same seed → same data).
-    This is critical for fair comparison: differences in PERR are purely due
-    to the selection algorithm, not to different stochastic fire runs.
-  - The SimulationRunner computes the ensemble externally and passes it to
-    orchestrator.run_cycle(ensemble=...) to avoid redundant computation.
-  - Only the PRIMARY strategy's observations update the real GP/EnKF state.
-    Other strategies are evaluated counterfactually — "what would have happened."
-  - Pending observations (primary strategy's cells from cycle N) are collected
-    at the end of cycle N and passed to the orchestrator at the start of cycle N+1.
+SimulationRunner (Phase 4b — clock-based demo)
+    Clock-based harness implementing the full simulation loop from the
+    architecture spec.  Drones move continuously, collect observations, and
+    IGNIS cycles trigger at fixed intervals.  Produces an MP4 video via
+    FrameRenderer.
 
-Usage:
-    from angrybird.simulation import SimulationRunner, generate_ground_truth
+LiveEstimator
+    Lightweight between-cycle estimator.  Snapshots the GP state at each
+    IGNIS cycle boundary, then accumulates raw observations as they arrive
+    and computes an updated (FMC mean, wind mean, estimated arrival time)
+    at each render frame — using only a GP predict() call + one fire member.
+    This avoids the 30-member ensemble and runs in seconds, allowing the
+    operator display to reflect new observations immediately rather than
+    waiting 20 minutes for the next IGNIS cycle.
 
-    truth  = generate_ground_truth(shape, gp_prior, seed=42)
-    runner = SimulationRunner(
-        orchestrator, truth, fire_engine,
-        strategies=["greedy", "qubo", "uniform", "fire_front"],
-    )
-    reports = runner.run_comparison(fire_states)   # list[CycleReport]
+SimulationConfig
+    Shared configuration dataclass for SimulationRunner (and scenarios.py).
 """
 
 from __future__ import annotations
 
+import copy
 import logging
+from dataclasses import dataclass, field, replace as dc_replace
 from typing import Optional
 
 import numpy as np
@@ -41,25 +41,257 @@ from ..config import (
     SIMULATION_HORIZON_MIN,
 )
 from ..information import compute_information_field
-from ..orchestrator import FireEngineProtocol, IGNISOrchestrator
+from ..orchestrator import IGNISOrchestrator, FireEngineProtocol
 from ..path_planner import plan_paths
 from ..selectors import registry as _default_registry
 from ..selectors.base import SelectorRegistry
 from ..types import (
     CycleReport,
     DroneObservation,
+    GPPrior,
     SelectionResult,
+    StrategyEvaluation,
+)
+from .drone_sim import (
+    DroneState,
+    NoiseConfig,
+    assign_waypoints,
+    cell_to_pos_m,
+    collect_observations,
+    move_drone,
 )
 from .evaluator import CounterfactualEvaluator
-from .ground_truth import GroundTruth
+from .ground_truth import GroundTruth, compute_wind_field
+from .observation_buffer import ObservationBuffer, thin_observations
 from .observer import ObservationSource, SimulatedObserver
+from .renderer import FrameRenderer
 
 logger = logging.getLogger(__name__)
 
 
-class SimulationRunner:
+# ---------------------------------------------------------------------------
+# SimulationConfig
+# ---------------------------------------------------------------------------
+
+@dataclass
+class SimulationConfig:
+    """Configuration for the clock-based SimulationRunner."""
+    dt: float = 10.0                        # simulation timestep (seconds)
+    total_time_s: float = 21600.0           # 6 hours
+    ignis_cycle_interval_s: float = 1200.0  # IGNIS runs every 20 minutes
+    n_drones: int = 5
+    drone_speed_ms: float = 15.0            # m/s cruise speed
+    drone_endurance_s: float = 1800.0       # 30 minutes per sortie
+    camera_footprint_m: float = 100.0       # FMC observation footprint radius
+    base_cell: tuple[int, int] = (195, 100) # (row, col) drone home location
+    frame_interval: int = 6                 # render one frame every N sim steps
+    fps: int = 10                           # video frames per second
+    output_path: str = "out/simulation"
+    scenario_name: str = "simulation"
+
+
+# ---------------------------------------------------------------------------
+# LiveEstimator
+# ---------------------------------------------------------------------------
+
+class LiveEstimator:
     """
-    Simulation harness for multi-cycle, multi-strategy comparison.
+    Provides a continuously-updated "best estimate" of FMC, wind, and fire
+    arrival times between IGNIS planning cycles.
+
+    Why this exists
+    ---------------
+    IGNIS cycles run every ~20 minutes and require a full 30-member ensemble.
+    But the operator display only needs:
+      • GP posterior mean for FMC and wind   ←  cheap: GP predict() ~ ms
+      • Estimated arrival time per cell      ←  cheap: 1 fire member ~ seconds
+
+    LiveEstimator snapshots the orchestrator's GP at each cycle boundary, then
+    incrementally adds raw observations as drones collect them.  At each render
+    frame it calls gp.predict() (auto-re-fits if dirty) and runs one fire
+    member with the mean-field conditions, yielding arrival times in hours.
+
+    The orchestrator's own GP is not touched between cycles; LiveEstimator
+    operates on its own deep-copied GP instance so cycle logic is unaffected.
+
+    Usage (inside SimulationRunner)
+    --------------------------------
+        # After each IGNIS cycle completes:
+        self._live_est.snapshot_from_cycle()
+
+        # After each drone observation step:
+        self._live_est.add_observations(new_obs)
+
+        # At each render frame:
+        prior, arrival_h = self._live_est.compute_estimate(
+            shape, fire_state, rng
+        )
+    """
+
+    def __init__(
+        self,
+        orchestrator: IGNISOrchestrator,
+        terrain,
+        horizon_h: float = 1.0,
+    ) -> None:
+        self._orchestrator  = orchestrator
+        self._terrain       = terrain
+        self.horizon_h      = horizon_h
+        # Snapshot of the orchestrator GP at the last cycle boundary.
+        # Never modified between cycles — all inter-cycle obs go into _obs_buffer.
+        self._live_gp       = copy.deepcopy(orchestrator.gp)
+        # ObservationBuffer applies the same 200 m spatial thinning the main
+        # runner uses before IGNIS cycles.  Raw obs are added here; thinned()
+        # view is computed in compute_estimate without consuming the buffer.
+        self._obs_buffer = ObservationBuffer(
+            min_spacing_m=200.0,
+            resolution_m=terrain.resolution_m,
+        )
+        self._has_obs       = False   # True when buffer has new unseen obs
+        self._cached_prior: Optional[GPPrior] = None  # reused when buffer unchanged
+
+    # ------------------------------------------------------------------
+
+    def snapshot_from_cycle(self) -> None:
+        """
+        Sync live GP to orchestrator GP state immediately after an IGNIS cycle.
+
+        Called once per cycle boundary.  Deep-copy is ~ms (sklearn GP objects
+        are small once fitted) and happens only every 20 sim-minutes.
+        The obs buffer is cleared so the next inter-cycle estimate starts fresh
+        from the updated posterior rather than re-adding old observations.
+        """
+        self._live_gp     = copy.deepcopy(self._orchestrator.gp)
+        self._obs_buffer  = ObservationBuffer(
+            min_spacing_m=200.0,
+            resolution_m=self._terrain.resolution_m,
+        )
+        self._has_obs     = False
+        self._cached_prior = None
+
+    def add_observations(self, obs: list[DroneObservation]) -> None:
+        """
+        Buffer incoming drone observations.
+
+        The ObservationBuffer handles duplicate suppression — passing raw
+        footprint obs (which can arrive at 50–100 m spacing) is fine; the
+        buffer uses the same 200 m coarse-binning thinning as the main
+        observation pipeline.
+        """
+        if obs:
+            self._obs_buffer.add(obs)
+            self._has_obs = True
+
+    def compute_estimate(
+        self,
+        shape: tuple[int, int],
+        fire_state: np.ndarray,
+        rng: np.random.Generator,
+    ) -> tuple[GPPrior, Optional[np.ndarray]]:
+        """
+        Compute the live best estimate using thinned drone observations.
+
+        When new observations have arrived since the last call, thin the
+        buffer (200 m min spacing — identical to the IGNIS cycle pipeline) and
+        temporarily condition a copy of the snapshot GP on FMC + wind speed +
+        wind direction from those thinned obs.  The snapshot GP itself is never
+        mutated between cycles.
+
+        Returns
+        -------
+        prior : GPPrior
+            GP posterior conditioned on all thinned observations collected since
+            the last IGNIS cycle (FMC mean, wind speed mean, wind dir mean,
+            and their variances).
+        arrival_times_h : ndarray or None
+            Float32 (rows, cols) estimated ignition time in hours from
+            simulation start.  NaN for cells not reached within the horizon.
+            None if no fire engine is available.
+        """
+        if self._has_obs:
+            # Thin the buffer's raw contents without consuming them (non-destructive).
+            # thin_observations() is O(n) via coarse-bin dict — fast even with
+            # thousands of raw footprint obs accumulated in a 20-min cycle.
+            thinned = thin_observations(
+                self._obs_buffer._buffer,
+                self._obs_buffer._min_spacing,
+                self._obs_buffer._resolution_m,
+            )
+            if thinned:
+                work_gp    = copy.deepcopy(self._live_gp)
+                locs       = [o.location  for o in thinned]
+                fmc_vals   = [o.fmc       for o in thinned]
+                fmc_sigmas = [o.fmc_sigma for o in thinned]
+
+                # Wind speed — nadir cells only (off-centre footprint obs have NaN)
+                ws_obs     = [o for o in thinned
+                              if o.wind_speed is not None
+                              and np.isfinite(o.wind_speed)
+                              and o.wind_speed_sigma is not None
+                              and np.isfinite(o.wind_speed_sigma)]
+                ws_locs    = [o.location         for o in ws_obs]
+                ws_vals    = [o.wind_speed        for o in ws_obs]
+                ws_sigmas  = [o.wind_speed_sigma  for o in ws_obs]
+
+                # Wind direction — same nadir cells (also carry wind_dir)
+                wd_obs     = [o for o in ws_obs
+                              if o.wind_dir is not None
+                              and np.isfinite(o.wind_dir)]
+                wd_locs    = [o.location   for o in wd_obs]
+                wd_vals    = [o.wind_dir   for o in wd_obs]
+                wd_sigmas  = [o.wind_dir_sigma
+                              if o.wind_dir_sigma is not None else 10.0
+                              for o in wd_obs]
+
+                work_gp.add_observations(
+                    locs, fmc_vals, fmc_sigmas,
+                    ws_vals=ws_vals or None,
+                    ws_sigmas=ws_sigmas or None,
+                    ws_locs=ws_locs or None,
+                    wd_vals=wd_vals or None,
+                    wd_sigmas=wd_sigmas or None,
+                    wd_locs=wd_locs or None,
+                )
+                self._cached_prior = work_gp.predict(shape)
+            # Always reset so we don't redo the expensive deepcopy/predict unless
+            # add_observations() brings in new data between render frames.
+            self._has_obs = False
+
+        prior = self._cached_prior if self._cached_prior is not None \
+            else self._live_gp.predict(shape)
+
+        arrival_times_h: Optional[np.ndarray] = None
+        fire_engine = getattr(self._orchestrator, "fire_engine", None)
+        if fire_engine is not None:
+            try:
+                result = fire_engine.run(
+                    self._terrain,
+                    prior,
+                    fire_state,
+                    n_members=1,
+                    horizon_min=int(self.horizon_h * 60),
+                    rng=rng,
+                )
+                # member_arrival_times: (n_members, rows, cols) in hours;
+                # NaN for cells not reached within the horizon.
+                arrival_times_h = result.member_arrival_times[0].astype(np.float32)
+            except Exception as exc:
+                logger.warning("LiveEstimator fire run failed: %s", exc)
+
+        return prior, arrival_times_h
+
+
+# ---------------------------------------------------------------------------
+# CycleRunner  (renamed from SimulationRunner — cycle-based, no clock)
+# ---------------------------------------------------------------------------
+
+class CycleRunner:
+    """
+    Cycle-based harness for multi-strategy comparison.
+
+    All strategies run on the SAME ensemble each cycle (same seed → same data).
+    Only the PRIMARY strategy's observations update the real GP/EnKF state.
+    Other strategies are evaluated counterfactually.
 
     Args:
         orchestrator:       IGNISOrchestrator — holds GP + terrain + primary selector
@@ -67,7 +299,6 @@ class SimulationRunner:
         fire_engine:        implements FireEngineProtocol
         strategies:         names of strategies to compare (must be in registry)
         primary_strategy:   which strategy's observations update real state
-                            (defaults to orchestrator.selector_name)
         selector_registry:  registry used to run all strategies
         n_drones:           number of drones per cycle
         horizon_min:        fire-spread simulation horizon in minutes
@@ -103,8 +334,12 @@ class SimulationRunner:
         self.obs_source       = obs_source or SimulatedObserver(ground_truth)
         self.evaluator        = CounterfactualEvaluator(self.obs_source, orchestrator.gp)
 
-        # Observations collected at end of each cycle for the next cycle's assimilation
         self._pending_observations: list[DroneObservation] = []
+
+        self.first_ensemble = None
+        self.first_gp_prior = None
+        self.last_ensemble  = None
+        self.last_gp_prior  = None
 
     # ------------------------------------------------------------------
     # Single cycle
@@ -118,36 +353,37 @@ class SimulationRunner:
         """
         Run one full comparison cycle.
 
-          1. Build shared ensemble (same seed → all strategies see identical data)
-          2. Compute information field
-          3. Run all strategies
-          4. Plan paths for each strategy
-          5. Evaluate each strategy counterfactually
-          6. Collect primary strategy's observations (fed to orchestrator as assimilation input)
-          7. Call orchestrator.run_cycle with pre-built ensemble + pending observations
-          8. Assemble full CycleReport with evaluations from all strategies
+        1. Build shared ensemble (same seed → all strategies see identical data)
+        2. Compute information field
+        3. Run all strategies
+        4. Plan paths for each strategy
+        5. Evaluate each strategy counterfactually
+        6. Collect primary strategy's observations
+        7. Call orchestrator.run_cycle with pre-built ensemble + pending observations
+        8. Assemble full CycleReport
         """
         shape = self.orchestrator.terrain.shape
         rng   = np.random.default_rng(cycle_seed)
 
-        # Current GP prior — reflects all observations assimilated so far
         gp_prior = self.orchestrator.gp.predict(shape)
 
-        # 1. Shared ensemble — all strategies evaluate against this
-        #    (PotentialBugs1 §8: identical seed → identical ensemble → fair comparison)
         ensemble = self.fire_engine.run(
             self.orchestrator.terrain, gp_prior, fire_state,
             self.n_members, self.horizon_min, rng,
         )
 
-        # 2. Information field
+        if self.first_ensemble is None:
+            self.first_ensemble = ensemble
+            self.first_gp_prior = gp_prior
+        self.last_ensemble = ensemble
+        self.last_gp_prior = gp_prior
+
         info_field = compute_information_field(
             ensemble, gp_prior,
             resolution_m=self.resolution_m,
             horizon_minutes=self.horizon_min,
         )
 
-        # 3. Run all strategies
         selection_results: dict[str, SelectionResult] = {}
         for name in self.strategies:
             try:
@@ -157,7 +393,6 @@ class SimulationRunner:
             except Exception as exc:
                 logger.warning("Strategy '%s' raised an exception: %s", name, exc)
 
-        # 4. Plan paths for every strategy
         drone_plans_by_strategy = {
             name: plan_paths(
                 sel.selected_locations,
@@ -169,7 +404,6 @@ class SimulationRunner:
             for name, sel in selection_results.items()
         }
 
-        # 5. Counterfactual evaluation — read-only, no state mutation
         evaluations = {
             name: self.evaluator.evaluate(
                 strategy_name=name,
@@ -182,7 +416,6 @@ class SimulationRunner:
             for name, sel in selection_results.items()
         }
 
-        # 6. Primary strategy drives actual state: collect its observations
         if self.primary_strategy in drone_plans_by_strategy:
             primary_cells: set[tuple[int, int]] = set()
             for plan in drone_plans_by_strategy[self.primary_strategy]:
@@ -195,18 +428,14 @@ class SimulationRunner:
             )
             new_observations = []
 
-        # 7. Orchestrator cycle — passes pre-built ensemble and pending observations
-        #    so neither the ensemble nor the GP are computed twice.
         _, cycle_report = self.orchestrator.run_cycle(
             fire_state=fire_state,
             observations=self._pending_observations,
             ensemble=ensemble,
         )
 
-        # Stage observations for the next cycle's assimilation
         self._pending_observations = new_observations
 
-        # 8. Attach full evaluations to the report
         full_report = CycleReport(
             cycle_id=cycle_report.cycle_id,
             info_field=info_field,
@@ -231,19 +460,7 @@ class SimulationRunner:
         fire_states: list[np.ndarray],
         base_seed: int = 0,
     ) -> list[CycleReport]:
-        """
-        Run a multi-cycle comparison across a sequence of fire states.
-
-        Args:
-            fire_states: one burn mask (bool/float32[rows, cols]) per cycle.
-                         len(fire_states) determines the number of cycles.
-            base_seed:   base seed; cycle index is added so each cycle is
-                         independently reproducible (PotentialBugs1 §8).
-
-        Returns:
-            list[CycleReport] with full per-strategy evaluations for every cycle.
-            Use evaluations[strategy_name].perr for the headline PERR metric.
-        """
+        """Run a multi-cycle comparison across a sequence of fire states."""
         reports: list[CycleReport] = []
         for cycle_idx, fire_state in enumerate(fire_states):
             report = self.run_cycle(
@@ -252,7 +469,6 @@ class SimulationRunner:
             )
             reports.append(report)
 
-        # Summary log
         if reports:
             for name in self.strategies:
                 perrs = [
@@ -267,3 +483,312 @@ class SimulationRunner:
                     )
 
         return reports
+
+
+# ---------------------------------------------------------------------------
+# SimulationRunner  (clock-based, full simulation loop)
+# ---------------------------------------------------------------------------
+
+class SimulationRunner:
+    """
+    Clock-based simulation harness implementing the full architecture spec loop.
+
+    At each timestep (default dt=10s):
+      1. Wind field updated via compute_wind_field()
+      2. Ground truth fire stepped forward
+      3. All drones moved and observations collected
+      4. New observations fed to LiveEstimator (cheap: GP dirty + 1 fire member)
+      5. Observations buffered; flushed + thinned at each IGNIS cycle boundary
+      6. IGNIS cycle runs (full ensemble → info field → selection → assimilation)
+      7. LiveEstimator syncs to updated GP state after each cycle
+      8. Frame rendered (every frame_interval steps) with live estimate
+
+    The live estimate panels (FMC+wind, arrival time) update every render
+    frame — reflecting new observations immediately rather than waiting for
+    the next 20-minute IGNIS cycle.  The information field and mission
+    targets still update only at IGNIS cycle boundaries (require full ensemble).
+
+    Args:
+        config:        SimulationConfig
+        terrain:       TerrainData (static)
+        ground_truth:  GroundTruth (mutable — wind + fire updated in-place)
+        orchestrator:  IGNISOrchestrator (runs IGNIS cycles)
+    """
+
+    def __init__(
+        self,
+        config: SimulationConfig,
+        terrain,
+        ground_truth: GroundTruth,
+        orchestrator: IGNISOrchestrator,
+    ) -> None:
+        self.config       = config
+        self.terrain      = terrain
+        self.truth        = ground_truth
+        self.orchestrator = orchestrator
+
+        horizon_h = getattr(orchestrator, "horizon_min", SIMULATION_HORIZON_MIN) / 60.0
+
+        self.obs_buffer = ObservationBuffer(
+            min_spacing_m=200.0,
+            resolution_m=terrain.resolution_m,
+        )
+        self.renderer = FrameRenderer(
+            terrain=terrain,
+            out_dir=config.output_path,
+            frame_interval=config.frame_interval,
+            fps=config.fps,
+            horizon_h=horizon_h,
+        )
+        self.noise = NoiseConfig(camera_footprint_m=config.camera_footprint_m)
+
+        # Tracks info_field.w.sum() from the previous cycle to compute per-cycle
+        # entropy reduction cheaply (no kernel evaluations needed).
+        self._prev_info_entropy: Optional[float] = None
+
+        base_pos = cell_to_pos_m(config.base_cell, terrain.resolution_m)
+        self.drones = [
+            DroneState(
+                drone_id=f"drone_{i}",
+                position=base_pos.copy(),
+                speed=config.drone_speed_ms,
+                status="idle",
+                waypoint_queue=[],
+                current_target=None,
+                path_history=[base_pos.copy()],
+                endurance_remaining_s=config.drone_endurance_s,
+                base_position=base_pos.copy(),
+            )
+            for i in range(config.n_drones)
+        ]
+
+        self.current_time: float = 0.0
+        # Trigger first IGNIS cycle immediately at t=0
+        self._last_cycle_time: float = -config.ignis_cycle_interval_s
+        self.cycle_reports: list[CycleReport] = []
+
+        # Cached IGNIS outputs for the renderer (update per cycle)
+        self._gp_prior: Optional[GPPrior] = None
+        self._burn_probability: Optional[np.ndarray] = None
+        self._mission_targets: list[tuple[int, int]] = []
+
+        # Live estimator — updates between cycles with raw per-step observations
+        self._live_est = LiveEstimator(
+            orchestrator=orchestrator,
+            terrain=terrain,
+            horizon_h=horizon_h,
+        )
+        self._live_gp_prior: Optional[GPPrior] = None
+        self._live_arrival_times_h: Optional[np.ndarray] = None
+
+    # ------------------------------------------------------------------
+    # Main loop
+    # ------------------------------------------------------------------
+
+    def run(self) -> list[CycleReport]:
+        """
+        Execute the full simulation.
+
+        Returns list[CycleReport] — one per IGNIS cycle.
+        """
+        n_steps = int(self.config.total_time_s / self.config.dt)
+        rng     = np.random.default_rng(0)
+
+        logger.info(
+            "SimulationRunner starting: %s | %.0f h | dt=%.0f s | %d drones | %d steps",
+            self.config.scenario_name,
+            self.config.total_time_s / 3600.0,
+            self.config.dt,
+            self.config.n_drones,
+            n_steps,
+        )
+
+        for step in range(n_steps):
+            self.current_time = step * self.config.dt
+
+            # 1. Update ground truth wind
+            ws, wd = compute_wind_field(
+                self.truth.base_wind_speed,
+                self.truth.base_wind_direction,
+                self.terrain,
+                self.current_time,
+                self.truth.wind_events,
+                rng=rng,
+            )
+            self.truth.wind_speed     = ws
+            self.truth.wind_direction = wd
+
+            # 2. Advance ground truth fire
+            self.truth.fire.step(
+                self.config.dt,
+                self.truth.wind_speed,
+                self.truth.wind_direction,
+                self.truth.fmc,
+            )
+
+            # 3. Move drones + collect observations
+            new_obs_this_step: list[DroneObservation] = []
+            for drone in self.drones:
+                move_drone(drone, self.config.dt)
+                self._refuel_if_home(drone)
+
+                if drone.status in ("transit", "returning"):
+                    obs = collect_observations(
+                        drone=drone,
+                        fmc_field=self.truth.fmc,
+                        wind_speed_field=self.truth.wind_speed,
+                        wind_direction_field=self.truth.wind_direction,
+                        terrain_shape=self.terrain.shape,
+                        resolution_m=self.terrain.resolution_m,
+                        noise=self.noise,
+                        current_time=self.current_time,
+                        fire_arrival_times=self.truth.fire.arrival_times,
+                        rng=rng,
+                    )
+                    self.obs_buffer.add(obs)
+                    new_obs_this_step.extend(obs)
+
+            # 4. Feed new observations to the live estimator
+            #    (GP dirty-flag means refit is deferred to next predict() call)
+            if new_obs_this_step:
+                self._live_est.add_observations(new_obs_this_step)
+
+            # 5. IGNIS cycle when due
+            if (self.current_time - self._last_cycle_time
+                    >= self.config.ignis_cycle_interval_s):
+                self._run_ignis_cycle()
+                self._last_cycle_time = self.current_time
+
+            # 6. Update live estimate at render cadence
+            #    Predict (refit if dirty) + 1 fire member — cheap enough to run
+            #    every render frame (every frame_interval*dt seconds of sim time).
+            if step % self.config.frame_interval == 0:
+                fire_state = self.truth.fire.fire_state
+                self._live_gp_prior, self._live_arrival_times_h = (
+                    self._live_est.compute_estimate(
+                        shape=self.terrain.shape,
+                        fire_state=fire_state,
+                        rng=np.random.default_rng(step),
+                    )
+                )
+
+            # 7. Render frame
+            self.renderer.render_frame(
+                step=step,
+                time_s=self.current_time,
+                ground_truth=self.truth,
+                drones=self.drones,
+                gp_prior=self._gp_prior,
+                burn_probability=self._burn_probability,
+                info_field=(self.cycle_reports[-1].info_field
+                            if self.cycle_reports else None),
+                mission_targets=self._mission_targets,
+                cycle_reports=self.cycle_reports,
+                live_gp_prior=self._live_gp_prior,
+                live_arrival_times_h=self._live_arrival_times_h,
+            )
+
+        self.renderer.finalize()
+        logger.info(
+            "SimulationRunner finished: %d IGNIS cycles | %d frames",
+            len(self.cycle_reports),
+            self.renderer._frame_count,
+        )
+        return self.cycle_reports
+
+    # ------------------------------------------------------------------
+    # IGNIS cycle
+    # ------------------------------------------------------------------
+
+    def _run_ignis_cycle(self) -> None:
+        """Flush observation buffer, run orchestrator, dispatch drones."""
+        observations = self.obs_buffer.flush_thinned()
+
+        fire_state = self.truth.fire.fire_state  # current burn mask (float32)
+
+        mission_queue, cycle_report = self.orchestrator.run_cycle(
+            fire_state=fire_state,
+            observations=observations,
+        )
+
+        # Cache cycle-level outputs for the renderer (info field, targets)
+        shape = self.terrain.shape
+        self._gp_prior = self.orchestrator.gp.predict(shape)
+        self._burn_probability = (
+            self.orchestrator.fire_engine.run(
+                self.terrain, self._gp_prior, fire_state,
+                self.orchestrator.n_members,
+                self.orchestrator.horizon_min,
+                np.random.default_rng(len(self.cycle_reports)),
+            ).burn_probability
+            if hasattr(self.orchestrator, "fire_engine")
+            else None
+        )
+
+        targets = self.orchestrator._previous_selections
+        self._mission_targets = list(targets)
+
+        # Cheap entropy tracking: diff consecutive info_field.w.sum() values.
+        # info_field.w encodes GP variance × fire sensitivity — it naturally falls
+        # as the GP accumulates observations, giving a real entropy-reduction signal
+        # without the O(cells × n_train × grid) cost of CounterfactualEvaluator.
+        evaluations: dict[str, StrategyEvaluation] = {}
+        if cycle_report.info_field is not None:
+            curr_entropy = float(cycle_report.info_field.w.sum())
+            prev_entropy = (self._prev_info_entropy
+                            if self._prev_info_entropy is not None
+                            else curr_entropy)
+            reduction = max(0.0, prev_entropy - curr_entropy)
+            self._prev_info_entropy = curr_entropy
+            evaluations["greedy"] = StrategyEvaluation(
+                strategy_name="greedy",
+                selected_locations=list(targets),
+                entropy_before=prev_entropy,
+                entropy_after=curr_entropy,
+                entropy_reduction=reduction,
+                perr=reduction / max(self.config.n_drones, 1),
+                cells_observed=[],
+            )
+
+        # CycleReport is frozen — use dataclasses.replace to attach evaluations.
+        cycle_report = dc_replace(cycle_report, evaluations=evaluations)
+        self.cycle_reports.append(cycle_report)
+
+        # Sync live estimator to the updated orchestrator GP state so the next
+        # inter-cycle live estimate starts from the freshest posterior.
+        self._live_est.snapshot_from_cycle()
+
+        self._assign_drone_waypoints(targets)
+
+        logger.info(
+            "IGNIS cycle %d | t=%.0fs | obs=%d | targets=%d | info_w=%.2f | entropy_red=%.4f",
+            len(self.cycle_reports),
+            self.current_time,
+            len(observations),
+            len(targets),
+            self._prev_info_entropy or 0.0,
+            evaluations.get("greedy", StrategyEvaluation("greedy", [], 0., 0., 0., 0., [])).entropy_reduction,
+        )
+
+    # ------------------------------------------------------------------
+    # Drone helpers
+    # ------------------------------------------------------------------
+
+    def _assign_drone_waypoints(
+        self, targets: list[tuple[int, int]]
+    ) -> None:
+        """Assign mission targets to idle or recently-returned drones."""
+        available = [d for d in self.drones if d.status == "idle"]
+        for drone, target_cell in zip(available, targets):
+            assign_waypoints(drone, target_cell, self.terrain.resolution_m)
+
+    def _refuel_if_home(self, drone: DroneState) -> None:
+        """Reset endurance when a drone returns to its base cell."""
+        from .drone_sim import pos_m_to_cell
+        cell = pos_m_to_cell(
+            drone.position, self.terrain.resolution_m, self.terrain.shape
+        )
+        if (drone.status in ("idle", "returning")
+                and cell == self.config.base_cell):
+            drone.endurance_remaining_s = self.config.drone_endurance_s
+            drone.status = "idle"

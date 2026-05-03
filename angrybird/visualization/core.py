@@ -82,7 +82,7 @@ def plot_fire_prediction_map(
     bp_levels = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
     cmap_bp = plt.get_cmap(VIZ_CONFIG["burn_prob_cmap"])
     cf = ax.contourf(bp, levels=bp_levels, cmap=cmap_bp,
-                     alpha=alpha_bp, origin="upper")
+                     alpha=alpha_bp)
     cb = fig.colorbar(cf, ax=ax, fraction=0.046, pad=0.04)
     cb.set_label("Burn Probability", fontsize=VIZ_CONFIG["label_size"])
     cb.ax.tick_params(labelsize=VIZ_CONFIG["tick_size"])
@@ -94,13 +94,13 @@ def plot_fire_prediction_map(
                   if h < np.nanmax(ensemble.mean_arrival_time)]
     if iso_levels:
         cs = ax.contour(arr, levels=iso_levels, colors="white",
-                        linewidths=0.9, linestyles="--", origin="upper")
+                        linewidths=0.9, linestyles="--")
         ax.clabel(cs, fmt="%.0fh", fontsize=6, colors="white",
                   inline=True, inline_spacing=2)
 
     # Confirmed perimeter (burn_prob > 0.9) — bold red outline
     ax.contour(bp, levels=[0.9], colors=["#CC0000"],
-               linewidths=1.8, origin="upper")
+               linewidths=1.8)
 
     # RAWS stations
     _mark_stations(ax, station_locs or [], label="RAWS", marker="o")

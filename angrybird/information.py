@@ -27,6 +27,60 @@ from .config import (
 )
 from .types import EnsembleResult, GPPrior, InformationField
 
+# Fire type constant (mirrors fire_oracle and gpu_fire_engine)
+_CROWN_FIRE = 2
+
+
+# ---------------------------------------------------------------------------
+# Bimodal detection (Extended Fire Physics §3)
+# ---------------------------------------------------------------------------
+
+def _binary_entropy(p: np.ndarray) -> np.ndarray:
+    """
+    Binary entropy H(p) = -(p·log₂p + (1-p)·log₂(1-p)), clipped to [0, 1].
+    Maximum = 1.0 at p = 0.5; zero at p ∈ {0, 1}.
+    """
+    eps = 1e-10
+    p   = np.clip(p, eps, 1.0 - eps)
+    return -(p * np.log2(p) + (1.0 - p) * np.log2(1.0 - p))
+
+
+def detect_bimodality(
+    member_arrival_times: np.ndarray,
+    max_arrival: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Classify each cell by burn/no-burn bimodality across ensemble members.
+
+    member_arrival_times : float32[N, rows, cols] — sentinel = max_arrival for unburned
+    max_arrival          : sentinel value used for unburned cells
+
+    Returns:
+        burn_fraction  : float32[rows, cols] — fraction of members that burned
+        bimodal_score  : float32[rows, cols] — 0=consensus, 1=50/50 split
+    """
+    burns          = member_arrival_times < (max_arrival * 0.9)  # (N, rows, cols)
+    burn_fraction  = burns.mean(axis=0).astype(np.float32)       # (rows, cols)
+    bimodal_score  = (1.0 - 2.0 * np.abs(burn_fraction - 0.5)).astype(np.float32)
+    return burn_fraction, bimodal_score
+
+
+def detect_regime_split(
+    member_fire_types: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Detect disagreement about surface vs crown fire regime across ensemble members.
+
+    member_fire_types : int8[N, rows, cols] — 1=surface, 2=crown
+
+    Returns:
+        crown_fraction  : float32[rows, cols] — fraction of members with crown fire
+        regime_bimodal  : float32[rows, cols] — 0=consensus, 1=50/50 split
+    """
+    crown_fraction = (member_fire_types == _CROWN_FIRE).mean(axis=0).astype(np.float32)
+    regime_bimodal = (1.0 - 2.0 * np.abs(crown_fraction - 0.5)).astype(np.float32)
+    return crown_fraction, regime_bimodal
+
 
 # ---------------------------------------------------------------------------
 # Unburned-cell sentinel (PotentialBugs1 §3)
@@ -80,8 +134,10 @@ def compute_sensitivity(
         P_c = P - P.mean(axis=0)
         std_P = P.std(axis=0)
         std_P = np.where(std_P < 1e-10, 1e-10, std_P)
-        cov = (A_c * P_c).sum(axis=0) / max(N - 1, 1)   # (D,)
-        corr = cov / (std_A * std_P)                       # (D,) in [-1, 1]
+        # Use population mean (N denominator) to be consistent with std().
+        # N-1 Bessel correction mixed with population std can push |corr| > 1.
+        cov = (A_c * P_c).mean(axis=0)                     # (D,) population cov
+        corr = np.clip(cov / (std_A * std_P), -1.0, 1.0)  # (D,) guaranteed in [-1, 1]
         return corr.reshape(rows, cols).astype(np.float32)
 
     # FMC perturbation = member field − prior mean
@@ -146,12 +202,16 @@ def compute_information_field(
     horizon_minutes: float = SIMULATION_HORIZON_MIN,
     priority_weight_field: Optional[np.ndarray] = None,
     exclusion_mask: Optional[np.ndarray] = None,
+    bimodal_alpha: float = 0.0,
+    bimodal_beta: float = 0.0,
 ) -> InformationField:
     """
     Compute the information value w at every grid cell.
 
         w = gp_variance_fmc   * |sensitivity_fmc|   * D_fmc
           + gp_variance_wind  * |sensitivity_wind|  * D_wind
+          + bimodal_alpha     * H_binary(burn_fraction)       [optional]
+          + bimodal_beta      * H_binary(crown_fraction)      [optional]
 
     Args:
         ensemble:              EnsembleResult from fire engine
@@ -160,6 +220,9 @@ def compute_information_field(
         horizon_minutes:       simulation horizon (for unburned sentinel)
         priority_weight_field: float32[rows,cols], >1 in priority regions (optional)
         exclusion_mask:        bool[rows,cols], True where drones are excluded (optional)
+        bimodal_alpha:         weight for binary burn-probability entropy (0 = disabled)
+        bimodal_beta:          weight for crown fire regime entropy (0 = disabled;
+                               requires ensemble.member_fire_types to be set)
 
     Returns:
         InformationField with total w and per-variable breakdowns.
@@ -183,6 +246,16 @@ def compute_information_field(
     ).astype(np.float32)
 
     w = w_fmc + w_wind
+
+    # Bimodal entropy augmentation (Extended Fire Physics §3)
+    max_arrival = _max_arrival_sentinel(horizon_minutes)
+    if bimodal_alpha > 0.0:
+        burn_frac, _ = detect_bimodality(ensemble.member_arrival_times, max_arrival)
+        w = (w + bimodal_alpha * _binary_entropy(burn_frac)).astype(np.float32)
+
+    if bimodal_beta > 0.0 and ensemble.member_fire_types is not None:
+        crown_frac, _ = detect_regime_split(ensemble.member_fire_types)
+        w = (w + bimodal_beta * _binary_entropy(crown_frac)).astype(np.float32)
 
     # Cells already burned have zero information value (fire won't spread back)
     burned = ensemble.burn_probability > 0.95

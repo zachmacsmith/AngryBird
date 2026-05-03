@@ -241,17 +241,34 @@ class IGNISGPPrior:
         fmc_sigmas: list[float],
         ws_vals: Optional[list[float]] = None,
         ws_sigmas: Optional[list[float]] = None,
+        ws_locs: Optional[list[tuple[int, int]]] = None,
+        wd_vals: Optional[list[float]] = None,
+        wd_sigmas: Optional[list[float]] = None,
+        wd_locs: Optional[list[tuple[int, int]]] = None,
     ) -> None:
-        """Add drone FMC (and optionally wind) observations. Triggers refit on next predict."""
+        """Add drone FMC (and optionally wind speed + direction) observations.
+
+        Triggers refit on next predict().  Wind direction is now accepted so that
+        the live-estimator and assimilation pipeline can update the posterior wind
+        direction field from drone nadir measurements.
+        """
         self._fmc_locs.extend(locations)
         self._fmc_vals.extend(fmc_vals)
         self._fmc_sigmas.extend(fmc_sigmas)
 
         if ws_vals is not None:
-            ws_sigmas = ws_sigmas or [self.noise_wind_speed] * len(locations)
-            self._ws_locs.extend(locations)
+            _ws_locs = ws_locs if ws_locs is not None else locations
+            ws_sigmas = ws_sigmas or [self.noise_wind_speed] * len(_ws_locs)
+            self._ws_locs.extend(_ws_locs)
             self._ws_vals.extend(ws_vals)
             self._ws_sigmas.extend(ws_sigmas)
+
+        if wd_vals is not None:
+            _wd_locs = wd_locs if wd_locs is not None else locations
+            wd_sigmas = wd_sigmas or [self.noise_wind_dir] * len(_wd_locs)
+            self._wd_locs.extend(_wd_locs)
+            self._wd_vals.extend(wd_vals)
+            self._wd_sigmas.extend(wd_sigmas)
 
         self._dirty = True
 
@@ -282,15 +299,42 @@ class IGNISGPPrior:
         sigmas: list[float],
         length_scale: float,
         noise_sigma: float,
+        previous_gp: Optional[GaussianProcessRegressor] = None,
     ) -> Optional[GaussianProcessRegressor]:
         if not locs:
             return None
         X = _obs_features(locs, self.terrain, self.resolution_m)
         y = np.array(vals, dtype=np.float64)
-        gp = self._build_gp(length_scale, noise_sigma)
+        if previous_gp is not None:
+            # Lock hyperparameters to the first-fit values; only update the posterior.
+            # Re-optimizing every cycle lets the kernel amplitude grow when new obs span
+            # a wider range, reversing variance reductions from earlier cycles.
+            gp = GaussianProcessRegressor(
+                kernel=previous_gp.kernel_,
+                alpha=noise_sigma ** 2,
+                n_restarts_optimizer=0,
+                normalize_y=True,
+                copy_X_train=True,
+                optimizer=None,
+            )
+        else:
+            gp = self._build_gp(length_scale, noise_sigma)
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            gp.fit(X, y)
+            try:
+                gp.fit(X, y)
+            except np.linalg.LinAlgError:
+                if previous_gp is not None:
+                    # Locked kernel became ill-conditioned with accumulated obs.
+                    # Fall back to a fresh fit with hyperparameter optimization.
+                    logger.warning(
+                        "Locked-kernel Cholesky failed (%d obs); "
+                        "re-fitting with optimization.", len(locs)
+                    )
+                    gp = self._build_gp(length_scale, noise_sigma)
+                    gp.fit(X, y)
+                else:
+                    raise
         return gp
 
     def fit(self) -> None:
@@ -298,14 +342,17 @@ class IGNISGPPrior:
         self._gp_fmc = self._fit_variable(
             self._fmc_locs, self._fmc_vals, self._fmc_sigmas,
             self.length_scale_fmc, self.noise_fmc,
+            previous_gp=self._gp_fmc,
         )
         self._gp_ws = self._fit_variable(
             self._ws_locs, self._ws_vals, self._ws_sigmas,
             self.length_scale_wind, self.noise_wind_speed,
+            previous_gp=self._gp_ws,
         )
         self._gp_wd = self._fit_variable(
             self._wd_locs, self._wd_vals, self._wd_sigmas,
             self.length_scale_wind, self.noise_wind_dir,
+            previous_gp=self._gp_wd,
         )
         self._dirty = False
 

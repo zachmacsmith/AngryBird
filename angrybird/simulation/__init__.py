@@ -1,41 +1,70 @@
 """
-Phase 4b — simulation harness for multi-strategy comparison.
+Phase 4b — simulation harness for strategy comparison and demo video.
 
 These components substitute for real drones at hackathon time and enable the
-four-way PERR comparison. None of this ships with the production system.
+four-way PERR comparison and the animated simulation video.  None of this
+ships with the production system.
 
-(Build-order test: "would you ship it with real drones?" → No → simulation/)
+Quick start (cycle-based strategy comparison):
 
-Quick start:
-    from angrybird.simulation import (
-        generate_ground_truth,
-        SimulatedObserver,
-        SimulationRunner,
-    )
+    from angrybird.simulation import CycleRunner, generate_ground_truth
 
-    truth   = generate_ground_truth(terrain, seed=42)
-    runner  = SimulationRunner(
+    truth  = generate_ground_truth(terrain, ignition_cell=(150, 40), seed=42)
+    runner = CycleRunner(
         orchestrator, truth, fire_engine,
         strategies=["greedy", "qubo", "uniform", "fire_front"],
     )
     reports = runner.run_comparison(fire_states)
 
-    # Headline metric: per-drone entropy reduction rate (PERR)
-    for cycle_report in reports:
-        for name, eval_ in cycle_report.evaluations.items():
-            print(f"Cycle {cycle_report.cycle_id} | {name}: PERR={eval_.perr:.4f}")
+Quick start (clock-based simulation video):
+
+    from angrybird.simulation import (
+        SimulationRunner, SimulationConfig,
+        hilly_heterogeneous,
+    )
+
+    terrain, truth, config = hilly_heterogeneous()
+    runner = SimulationRunner(config, terrain, truth, orchestrator)
+    reports = runner.run()          # writes out/sim_hilly/frame_*.png + MP4
 """
 
+from .drone_sim import DroneState, NoiseConfig
 from .evaluator import CounterfactualEvaluator
-from .ground_truth import GroundTruth, generate_ground_truth
+from .fire_oracle import GroundTruthFire
+from .gpu_fire_engine import GPUFireEngine
+from .ground_truth import GroundTruth, WindEvent, generate_ground_truth
+from .observation_buffer import ObservationBuffer
 from .observer import ObservationSource, SimulatedObserver
-from .runner import SimulationRunner
+from .renderer import FrameRenderer
+from .runner import CycleRunner, SimulationConfig, SimulationRunner
+from .scenarios import crown_fire_risk, flat_homogeneous, hilly_heterogeneous, wind_shift
 
 __all__ = [
+    # runners
+    "CycleRunner",
     "SimulationRunner",
-    "CounterfactualEvaluator",
+    "SimulationConfig",
+    # fire engines
+    "GPUFireEngine",
+    # ground truth
     "GroundTruth",
+    "WindEvent",
     "generate_ground_truth",
+    "GroundTruthFire",
+    # drones
+    "DroneState",
+    "NoiseConfig",
+    # observation
+    "ObservationBuffer",
     "ObservationSource",
     "SimulatedObserver",
+    # rendering
+    "FrameRenderer",
+    # evaluation
+    "CounterfactualEvaluator",
+    # scenarios
+    "hilly_heterogeneous",
+    "wind_shift",
+    "flat_homogeneous",
+    "crown_fire_risk",
 ]

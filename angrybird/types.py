@@ -16,6 +16,10 @@ class TerrainData:
     resolution_m: float          # grid cell size in meters (default 50.0)
     origin: tuple[float, float]  # (lat, lon) of NW corner
     shape: tuple[int, int]       # (rows, cols)
+    # Optional canopy layers — from LANDFIRE or proxy tables when absent
+    canopy_base_height: Optional[np.ndarray] = field(default=None)   # float32[rows, cols], m
+    canopy_bulk_density: Optional[np.ndarray] = field(default=None)  # float32[rows, cols], kg/m³
+    canopy_cover: Optional[np.ndarray] = field(default=None)          # float32[rows, cols], fraction 0-1
 
 
 @dataclass(frozen=True)
@@ -30,13 +34,14 @@ class GPPrior:
 
 @dataclass(frozen=True)
 class EnsembleResult:
-    member_arrival_times: np.ndarray   # float32[N, rows, cols], NaN = unburned
+    member_arrival_times: np.ndarray   # float32[N, rows, cols], sentinel=2×horizon for unburned
     member_fmc_fields: np.ndarray      # float32[N, rows, cols], perturbed FMC used
     member_wind_fields: np.ndarray     # float32[N, rows, cols], perturbed wind speed used
     burn_probability: np.ndarray       # float32[rows, cols], fraction of members that burned
     mean_arrival_time: np.ndarray      # float32[rows, cols]
     arrival_time_variance: np.ndarray  # float32[rows, cols]
     n_members: int
+    member_fire_types: Optional[np.ndarray] = field(default=None)  # int8[N, rows, cols]: 1=surface 2=crown
 
 
 @dataclass(frozen=True)
@@ -66,6 +71,8 @@ class DroneObservation:
     wind_speed_sigma: float     # measurement noise std dev
     wind_dir: Optional[float] = None        # degrees from north
     wind_dir_sigma: Optional[float] = None
+    timestamp: Optional[float] = None      # simulation time (seconds)
+    drone_id: Optional[str] = None
 
 
 @dataclass(frozen=True)

@@ -47,11 +47,11 @@ class SimulatedObserver:
         wind_dir_sigma: float = OBS_WIND_DIR_SIGMA,
         rng: Optional[np.random.Generator] = None,
     ) -> None:
-        self.truth           = ground_truth
-        self.fmc_sigma       = fmc_sigma
+        self.truth            = ground_truth
+        self.fmc_sigma        = fmc_sigma
         self.wind_speed_sigma = wind_speed_sigma
-        self.wind_dir_sigma  = wind_dir_sigma
-        self._rng            = rng or np.random.default_rng()
+        self.wind_dir_sigma   = wind_dir_sigma
+        self._rng             = rng or np.random.default_rng()
 
     def observe(self, cells: list[tuple[int, int]]) -> list[DroneObservation]:
         """
@@ -60,9 +60,9 @@ class SimulatedObserver:
         """
         observations: list[DroneObservation] = []
         for r, c in cells:
-            true_fmc = float(self.truth.fmc_field[r, c])
-            true_ws  = float(self.truth.wind_speed_field[r, c])
-            true_wd  = float(self.truth.wind_dir_field[r, c])
+            true_fmc = float(self.truth.fmc[r, c])
+            true_ws  = float(self.truth.wind_speed[r, c])
+            true_wd  = float(self.truth.wind_direction[r, c])
 
             obs_fmc = true_fmc + float(self._rng.normal(0.0, self.fmc_sigma))
             obs_ws  = max(0.0, true_ws + float(self._rng.normal(0.0, self.wind_speed_sigma)))

@@ -1,0 +1,172 @@
+"""
+run_sim.py — Clock-based IGNIS simulation with animated video output.
+
+PRIMARY DEMO SCRIPT. Runs the full SimulationRunner:
+  - Unified simulation clock (dt=10 s, 6 h total by default)
+  - Dynamic wind evolution + scheduled wind-shift events (wind_shift scenario)
+  - CA-based ground truth fire advancing every timestep
+  - Simulated drone fleet: movement, FMC + wind sensor collection
+  - IGNIS cycles every 20 minutes (ensemble → info field → selection → assimilation)
+  - 6-panel frame renderer → PNG sequence + MP4 video
+
+Scenarios
+---------
+  hilly   (default)  Complex ridge/valley terrain, mixed fuels, steady SW wind
+  shift              Same terrain + 45° wind shift at hour 3
+  flat               Flat/uniform control — minimal PERR advantage expected
+
+Usage
+-----
+    cd /path/to/AngryBird
+    python scripts/run_sim.py                        # hilly, 6 h, 5 drones
+    python scripts/run_sim.py --scenario shift       # wind-shift stress test
+    python scripts/run_sim.py --scenario flat        # control baseline
+    python scripts/run_sim.py --drones 3 --hours 1  # quick 1-hour test run
+    python scripts/run_sim.py --out out/my_run       # custom output directory
+
+No real terrain, no QPU, no cloud required.
+"""
+
+from __future__ import annotations
+
+import argparse
+import logging
+import sys
+import time
+from pathlib import Path
+
+import matplotlib
+matplotlib.use("Agg")
+import numpy as np
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+# Fire engine + make_gp reused from demo_sim; SimpleFire lives there until
+# it is promoted to a proper angrybird module.
+from demo_sim import SimpleFire, make_gp  # noqa: E402
+
+from angrybird.gp import IGNISGPPrior
+from angrybird.orchestrator import IGNISOrchestrator
+from angrybird.simulation import (
+    SimulationConfig,
+    SimulationRunner,
+    flat_homogeneous,
+    hilly_heterogeneous,
+    wind_shift,
+)
+
+logging.basicConfig(level=logging.INFO,
+                    format="%(levelname)s | %(name)s | %(message)s")
+log = logging.getLogger("run_sim")
+
+
+# ---------------------------------------------------------------------------
+# Scenario registry
+# ---------------------------------------------------------------------------
+
+_SCENARIOS = {
+    "hilly": hilly_heterogeneous,
+    "shift": wind_shift,
+    "flat":  flat_homogeneous,
+}
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main(
+    scenario: str = "hilly",
+    n_drones: int = 5,
+    n_members: int = 30,
+    hours: float = 6.0,
+    out_dir: str | None = None,
+) -> None:
+
+    t0 = time.time()
+
+    # ── scenario ──────────────────────────────────────────────────────────
+    factory = _SCENARIOS[scenario]
+    terrain, ground_truth, config = factory(seed=42)
+
+    # Override hours and drones from CLI
+    config.total_time_s = hours * 3600.0
+    config.n_drones     = n_drones
+    if out_dir:
+        config.output_path = out_dir
+
+    log.info(
+        "=== run_sim | scenario=%s | %.1f h | dt=%.0f s | %d drones | %d members ===",
+        scenario, hours, config.dt, config.n_drones, n_members,
+    )
+
+    # ── IGNIS components ──────────────────────────────────────────────────
+    gp          = make_gp(terrain)
+    fire_engine = SimpleFire()
+
+    rows, cols  = terrain.shape
+    staging_area = config.base_cell
+
+    orchestrator = IGNISOrchestrator(
+        terrain=terrain,
+        gp=gp,
+        fire_engine=fire_engine,
+        selector_name="greedy",
+        n_drones=config.n_drones,
+        staging_area=staging_area,
+        n_members=n_members,
+        horizon_min=360,         # 6-hour fire spread horizon
+    )
+
+    # ── run ───────────────────────────────────────────────────────────────
+    runner = SimulationRunner(
+        config=config,
+        terrain=terrain,
+        ground_truth=ground_truth,
+        orchestrator=orchestrator,
+    )
+
+    reports = runner.run()
+
+    elapsed = time.time() - t0
+    out    = runner.renderer.out_dir          # actual dir chosen (may have _N suffix)
+    frames = runner.renderer._frame_count
+    cycles = len(reports)
+
+    log.info(
+        "Done. %d IGNIS cycles | %d frames | %.1f s wall-clock | output: %s",
+        cycles, frames, elapsed, out.resolve(),
+    )
+
+    video = out.parent / "simulation.mp4"
+    if video.exists():
+        log.info("Video: %s  (%.1f MB)", video, video.stat().st_size / 1e6)
+    else:
+        log.info("PNG frames in %s  (ffmpeg not available — no MP4 assembled)", out)
+
+
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="IGNIS clock-based simulation")
+    parser.add_argument(
+        "--scenario", choices=list(_SCENARIOS), default="hilly",
+        help="Scenario: hilly (default), shift (wind-shift stress test), flat (control)",
+    )
+    parser.add_argument("--drones",  type=int,   default=5,
+                        help="Number of drones (default 5)")
+    parser.add_argument("--members", type=int,   default=30,
+                        help="Ensemble size (default 30; lower = faster)")
+    parser.add_argument("--hours",   type=float, default=6.0,
+                        help="Simulation duration in hours (default 6)")
+    parser.add_argument("--out",     default=None,
+                        help="Output directory (overrides scenario default)")
+    args = parser.parse_args()
+
+    main(
+        scenario=args.scenario,
+        n_drones=args.drones,
+        n_members=args.members,
+        hours=args.hours,
+        out_dir=args.out,
+    )

@@ -20,7 +20,7 @@ import numpy as np
 from scipy.ndimage import zoom as ndimage_zoom
 from scipy.ndimage import sobel
 
-from .config import FUEL_PARAMS, GRID_RESOLUTION_M
+from .config import CANOPY_CBH_M, CANOPY_CBD_KGM3, CANOPY_COVER_FRACTION, FUEL_PARAMS, GRID_RESOLUTION_M
 from .types import TerrainData
 
 
@@ -58,8 +58,12 @@ def _slope_aspect(
 
     slope = np.degrees(np.arctan(np.sqrt(dz_dx ** 2 + dz_dy ** 2))).astype(np.float32)
 
-    # Aspect: degrees clockwise from north
-    aspect_rad = np.arctan2(dz_dx, -dz_dy)               # north = 0, east = 90
+    # Aspect: downslope direction, degrees clockwise from north (standard GIS convention).
+    # The gradient vector (dz_dx, -dz_dy) = (∂z/∂east, ∂z/∂north) points UPslope.
+    # Negate it to get the DOWNslope direction.
+    # arctan2(-dz_dx, dz_dy) = arctan2(-∂z/∂east, -∂z/∂north) corrected for numpy row ordering.
+    # Verification: south-facing slope (dz_dy<0, dz_dx=0) → arctan2(0, negative) = 180° ✓
+    aspect_rad = np.arctan2(-dz_dx, dz_dy)                # downslope bearing, 0=N 90=E 180=S 270=W
     aspect = (np.degrees(aspect_rad) % 360).astype(np.float32)
 
     return slope, aspect
@@ -119,6 +123,9 @@ def synthetic_terrain(
     # Sprinkle non-burnable (model 91/93 — water/urban) is outside Anderson 13,
     # so just keep everything burnable for the simulation domain.
 
+    # ── Canopy arrays from proxy tables + small spatial jitter ───────────
+    cbh, cbd, cc = _canopy_from_fuel(fuel_model, rng)
+
     logger.info(
         "Synthetic terrain generated: shape=%s, elev=[%.0f, %.0f] m",
         shape, elevation.min(), elevation.max(),
@@ -131,7 +138,42 @@ def synthetic_terrain(
         resolution_m=resolution_m,
         origin=origin,
         shape=shape,
+        canopy_base_height=cbh,
+        canopy_bulk_density=cbd,
+        canopy_cover=cc,
     )
+
+
+# ---------------------------------------------------------------------------
+# Canopy array helpers
+# ---------------------------------------------------------------------------
+
+def _canopy_from_fuel(
+    fuel_model: np.ndarray,
+    rng: Optional[np.random.Generator] = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Generate CBH, CBD, and canopy cover arrays from fuel model proxy tables.
+    Adds ±10% multiplicative jitter (when rng is provided) for spatial realism.
+
+    Returns (cbh, cbd, cc) all as float32[rows, cols].
+    """
+    cbh = np.zeros(fuel_model.shape, dtype=np.float32)
+    cbd = np.zeros(fuel_model.shape, dtype=np.float32)
+    cc  = np.zeros(fuel_model.shape, dtype=np.float32)
+    for fid in CANOPY_CBH_M:
+        mask = fuel_model == fid
+        cbh[mask] = CANOPY_CBH_M[fid]
+        cbd[mask] = CANOPY_CBD_KGM3[fid]
+        cc[mask]  = CANOPY_COVER_FRACTION[fid]
+
+    if rng is not None:
+        jitter = rng.uniform(0.9, 1.1, fuel_model.shape).astype(np.float32)
+        cbh = np.clip(cbh * jitter, 0.0, None)
+        cbd = np.clip(cbd * jitter, 0.0, None)
+        cc  = np.clip(cc  * jitter, 0.0, 1.0)
+
+    return cbh, cbd, cc
 
 
 # ---------------------------------------------------------------------------
@@ -140,10 +182,13 @@ def synthetic_terrain(
 
 # LANDFIRE layer names for each product
 _LANDFIRE_LAYERS = {
-    "elevation":   "ELEV2020",
-    "slope":       "SLP2020",
-    "aspect":      "ASP2020",
-    "fuel_model":  "220F13_22",   # Anderson 13 fuel models
+    "elevation":          "ELEV2020",
+    "slope":              "SLP2020",
+    "aspect":             "ASP2020",
+    "fuel_model":         "220F13_22",   # Anderson 13 fuel models
+    "canopy_base_height": "CBD_2020",    # canopy base height (m)
+    "canopy_bulk_density":"CBH_2020",    # canopy bulk density (kg/m³) [LANDFIRE naming is inverted]
+    "canopy_cover":       "CC_2020",     # canopy cover fraction (0-100 in LANDFIRE, scaled to 0-1)
 }
 
 
@@ -245,6 +290,11 @@ def _load_from_landfire(
     valid = np.isin(fuel_model, list(FUEL_PARAMS.keys()))
     fuel_model[~valid] = 1    # default to grass (model 1) for unknown codes
 
+    # Canopy layers (LANDFIRE values: CBH in m, CBD in kg/m³, CC in 0-100 percent)
+    cbh = np.clip(arrays.get("canopy_base_height", np.zeros_like(elevation)), 0.0, 50.0).astype(np.float32)
+    cbd = np.clip(arrays.get("canopy_bulk_density", np.zeros_like(elevation)), 0.0,  2.0).astype(np.float32)
+    cc  = np.clip(arrays.get("canopy_cover",        np.zeros_like(elevation)) / 100.0, 0.0, 1.0).astype(np.float32)
+
     shape = (elevation.shape[0], elevation.shape[1])
     logger.info(
         "LANDFIRE terrain loaded: shape=%s, elev=[%.0f, %.0f] m, resolution=%.0f m",
@@ -258,4 +308,7 @@ def _load_from_landfire(
         resolution_m=target_resolution_m,
         origin=origin,
         shape=shape,
+        canopy_base_height=cbh,
+        canopy_bulk_density=cbd,
+        canopy_cover=cc,
     )

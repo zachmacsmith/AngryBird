@@ -552,12 +552,12 @@ def plot_ground_truth_reveal(
     fig.suptitle(title, fontsize=VIZ_CONFIG["font_size"] + 1, fontweight="bold")
 
     if variable == "fmc":
-        truth_field = ground_truth.fmc_field
+        truth_field = ground_truth.fmc
         est_field   = gp_prior.fmc_mean
         label       = "FMC"
         cmap        = VIZ_CONFIG["fmc_cmap"]
     else:
-        truth_field = ground_truth.wind_speed_field
+        truth_field = ground_truth.wind_speed
         est_field   = gp_prior.wind_speed_mean
         label       = "Wind Speed (m/s)"
         cmap        = VIZ_CONFIG["uncertainty_cmap"]

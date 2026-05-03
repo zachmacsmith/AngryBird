@@ -104,3 +104,28 @@ FUEL_PACKING_RATIO: dict[int, float] = {
 FUEL_MINERAL_CONTENT: float = 0.0555
 FUEL_MINERAL_SILICA_FREE: float = 0.0100
 FUEL_PARTICLE_DENSITY: float = 512.0  # kg/m³
+
+# ---------------------------------------------------------------------------
+# Canopy proxy values per Anderson-13 fuel model
+# Used when LANDFIRE canopy layers are unavailable.
+# CBH = canopy base height (m), CBD = canopy bulk density (kg/m³),
+# CC  = canopy cover fraction (0-1).
+# ---------------------------------------------------------------------------
+
+CANOPY_CBH_M: dict[int, float] = {
+    1: 0.0,  2: 0.0,  3: 0.0,
+    4: 1.0,  5: 1.5,  6: 1.0,  7: 1.0,
+    8: 2.5,  9: 3.0,  10: 4.0, 11: 2.0, 12: 1.5, 13: 2.0,
+}
+
+CANOPY_CBD_KGM3: dict[int, float] = {
+    1: 0.00, 2: 0.00, 3: 0.00,
+    4: 0.05, 5: 0.05, 6: 0.05, 7: 0.08,
+    8: 0.12, 9: 0.10, 10: 0.15, 11: 0.07, 12: 0.10, 13: 0.12,
+}
+
+CANOPY_COVER_FRACTION: dict[int, float] = {
+    1: 0.00, 2: 0.10, 3: 0.05,
+    4: 0.30, 5: 0.40, 6: 0.20, 7: 0.20,
+    8: 0.80, 9: 0.75, 10: 0.70, 11: 0.50, 12: 0.40, 13: 0.30,
+}

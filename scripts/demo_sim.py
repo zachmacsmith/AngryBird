@@ -1,16 +1,18 @@
 """
-demo_sim.py — Full IGNIS simulation demo with synthetic terrain.
+demo_sim.py — DEPRECATED.
 
-Runs a multi-cycle simulation on a synthetic 200×200 grid (10 km × 10 km),
-then renders every visualization from the spec and saves to out/demo_sim/
+Use scripts/run_sim.py instead.
 
-Usage:
-    cd /path/to/AngryBird
-    python scripts/demo_sim.py                          # 6 cycles, 5 drones
-    python scripts/demo_sim.py --cycles 4 --members 20 # quicker run
-    python scripts/demo_sim.py --show                   # interactive windows
+This script runs the cycle-based CycleRunner (no simulation clock, no drone
+movement, no video output) and renders static PNG visualisations.  It exists
+only as a source of shared utilities (SimpleFire, make_terrain, make_gp) that
+run_sim.py imports until those components are promoted to proper angrybird modules.
 
-No real terrain, no QPU, no cloud required.
+DO NOT use this as the primary demo — it does not produce the animated video
+and does not implement the clock-based simulation architecture.
+
+Legacy usage (kept for reference):
+    python scripts/demo_sim.py --cycles 4 --members 20
 """
 
 from __future__ import annotations
@@ -36,7 +38,7 @@ from angrybird.types import (
 from angrybird.gp import IGNISGPPrior
 from angrybird.orchestrator import IGNISOrchestrator
 from angrybird.simulation.ground_truth import generate_ground_truth
-from angrybird.simulation.runner import SimulationRunner
+from angrybird.simulation.runner import CycleRunner
 from angrybird import visualization as viz
 
 logging.basicConfig(level=logging.INFO,
@@ -82,6 +84,71 @@ def make_terrain(rows: int = 200, cols: int = 200,
 # 2.  Simple fire engine
 # ============================================================
 
+# ---------------------------------------------------------------------------
+# Module-level worker — must be at module scope for ProcessPoolExecutor;
+# also used by ThreadPoolExecutor with zero-copy array sharing.
+# ---------------------------------------------------------------------------
+
+def _run_fire_member(args: tuple) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Compute arrival times for one SimpleFire ensemble member.
+
+    Change 1 (algorithm): the multi-source distance problem is equivalent to
+    nearest-neighbor search in scaled (along-wind, cross-wind) coordinates.
+    scipy.cKDTree solves it in O((N+K) log K) instead of O(N×K), where
+    N = grid cells (40 000) and K = ignition cells (up to ~3 400 at cycle 6).
+    cKDTree.query(workers=-1) also uses all CPU cores for the query itself.
+
+    Change 2 (thread parallelism): function is module-level so it can be
+    submitted to ThreadPoolExecutor without pickling class instances.
+    """
+    from scipy.spatial import cKDTree
+
+    (m_seed, fmc_mean, fmc_std, ws_mean, ws_std, wd_mean,
+     ig_r, ig_c, ignition, rows, cols, res, fuel_arr, horizon_min) = args
+
+    rng = np.random.default_rng(int(m_seed))
+
+    fmc_m = np.clip(fmc_mean + rng.standard_normal((rows, cols)) * fmc_std,
+                    0.04, 0.60).astype(np.float32)
+    ws_m  = np.clip(ws_mean  + rng.standard_normal((rows, cols)) * ws_std,
+                    0.5, 20.0).astype(np.float32)
+    wd_m  = (wd_mean + rng.normal(0, 8, (rows, cols))).astype(np.float32)
+
+    mean_fmc   = float(fmc_m.mean())
+    mean_ws    = float(ws_m.mean())
+    wd_rad     = np.deg2rad(float(wd_m.mean()))
+    fmc_factor = float(np.clip(np.exp(-6.0 * (mean_fmc - 0.06)), 0.1, 8.0))
+    R          = max(3.0 * mean_ws * fmc_factor * float(fuel_arr.mean()), 1e-6)
+    R_cross    = max(R * (1.0 - float(np.clip(0.08 * mean_ws, 0.0, 0.85))), 1e-6)
+    wx         = float(np.sin(wd_rad))
+    wy         = float(-np.cos(wd_rad))
+
+    # Map ignition cells into scaled (u, v) wind-frame coordinates.
+    # Euclidean distance in this space equals the elliptical arrival time t.
+    ig_r_m = ig_r.astype(np.float64) * res
+    ig_c_m = ig_c.astype(np.float64) * res
+    ig_uv  = np.column_stack([
+        (ig_r_m * wy + ig_c_m * wx) / R,        # along-wind / R
+        (ig_r_m * wx - ig_c_m * wy) / R_cross,  # cross-wind / R_cross
+    ])
+
+    r_m = np.arange(rows, dtype=np.float64) * res
+    c_m = np.arange(cols, dtype=np.float64) * res
+    RR, CC = np.meshgrid(r_m, c_m, indexing="ij")
+    cell_uv = np.column_stack([
+        (RR.ravel() * wy + CC.ravel() * wx) / R,
+        (RR.ravel() * wx - CC.ravel() * wy) / R_cross,
+    ])
+
+    # workers=-1 uses all CPU cores for the query (scipy ≥ 1.6)
+    dist, _ = cKDTree(ig_uv).query(cell_uv, k=1, workers=-1)
+    best = dist.reshape(rows, cols).astype(np.float32)
+    best[ignition] = 0.0
+    best[best > horizon_min] = np.nan
+    return best, fmc_m, ws_m
+
+
 class SimpleFire:
     """
     Huygens-style elliptical fire spread — one ellipse per ignition cell.
@@ -113,94 +180,53 @@ class SimpleFire:
         horizon_min: int,
         rng: np.random.Generator,
     ) -> EnsembleResult:
+        import os
+        from concurrent.futures import ThreadPoolExecutor
+
         rows, cols = terrain.shape
-        res = terrain.resolution_m
-
-        all_arrival = np.full((n_members, rows, cols), np.nan, dtype=np.float32)
-        all_fmc     = np.zeros((n_members, rows, cols), dtype=np.float32)
-        all_wind    = np.zeros((n_members, rows, cols), dtype=np.float32)
-
-        # Cell centres in metres (for distance calculation)
-        r_m = np.arange(rows, dtype=np.float64) * res
-        c_m = np.arange(cols, dtype=np.float64) * res
-        RR, CC = np.meshgrid(r_m, c_m, indexing="ij")  # [rows, cols]
+        res        = terrain.resolution_m
 
         ignition = fire_state.astype(bool)
         if not ignition.any():
             ignition[rows // 2, cols // 2] = True
-
         ig_r, ig_c = np.where(ignition)
 
-        # Fuel factor per cell
         fuel_arr = np.vectorize(self._FUEL_SPREAD.get)(terrain.fuel_model, 1.0)
+        fmc_std  = np.sqrt(np.clip(gp_prior.fmc_variance, 0.0, None)).astype(np.float32)
+        ws_std   = np.sqrt(np.clip(gp_prior.wind_speed_variance, 0.0, None)).astype(np.float32)
 
-        for m in range(n_members):
-            # --- perturb FMC and wind from GP prior ---
-            fmc_std = np.sqrt(np.clip(gp_prior.fmc_variance, 0.0, None))
-            ws_std  = np.sqrt(np.clip(gp_prior.wind_speed_variance, 0.0, None))
+        # One unique seed per member drawn from the caller's rng
+        seeds = rng.integers(0, 2**31, size=n_members)
 
-            fmc_m = np.clip(
-                gp_prior.fmc_mean + rng.standard_normal((rows, cols)) * fmc_std,
-                0.04, 0.60).astype(np.float32)
-            ws_m  = np.clip(
-                gp_prior.wind_speed_mean + rng.standard_normal((rows, cols)) * ws_std,
-                0.5, 20.0).astype(np.float32)
-            wd_m  = (gp_prior.wind_dir_mean
-                     + rng.normal(0, 8, (rows, cols))).astype(np.float32)
+        member_args = [
+            (seeds[m],
+             gp_prior.fmc_mean.astype(np.float32), fmc_std,
+             gp_prior.wind_speed_mean.astype(np.float32), ws_std,
+             gp_prior.wind_dir_mean.astype(np.float32),
+             ig_r, ig_c, ignition,
+             rows, cols, res, fuel_arr, horizon_min)
+            for m in range(n_members)
+        ]
 
-            all_fmc[m]  = fmc_m
-            all_wind[m] = ws_m
+        # Change 2: parallel execution across CPU cores.
+        # ThreadPoolExecutor: no spawn overhead, numpy element-wise ops release
+        # the GIL so threads run truly concurrently on separate cores.
+        n_workers = min(os.cpu_count() or 1, n_members)
+        with ThreadPoolExecutor(max_workers=n_workers) as pool:
+            results = list(pool.map(_run_fire_member, member_args))
 
-            # Domain-mean scalars for this member
-            mean_fmc = float(fmc_m.mean())
-            mean_ws  = float(ws_m.mean())
-            mean_wd  = float(wd_m.mean())
-            wd_rad   = np.deg2rad(mean_wd)
+        all_arrival_min = np.stack([r[0] for r in results])  # minutes from ignition
+        all_fmc         = np.stack([r[1] for r in results])
+        all_wind        = np.stack([r[2] for r in results])
 
-            # FMC suppression (Rothermel proxy): lower FMC → faster spread
-            fmc_factor = float(np.clip(np.exp(-6.0 * (mean_fmc - 0.06)), 0.1, 8.0))
-            fuel_mean  = float(fuel_arr.mean())
+        # Convert arrival times to HOURS.  Everything downstream
+        # (compute_sensitivity sentinel, _arrival_rgba, LiveEstimator display)
+        # assumes hours.  The KD-tree distance is in minutes
+        # (metres / (m/min) = min), so divide once here at the source.
+        all_arrival = all_arrival_min / 60.0
 
-            # Spread rate in m/min tuned for 10 km domain, 6-hour horizon.
-            # At R=9 m/min the fire travels ~9*360=3240m ≈ 65 cells from ignition,
-            # covering ~30-50% of the 200-cell domain depending on FMC/wind.
-            R = 3.0 * mean_ws * fmc_factor * fuel_mean  # m/min
-
-            # Ellipse eccentricity: 0 at calm, up to 0.85 at 10 m/s
-            ecc = float(np.clip(0.08 * mean_ws, 0.0, 0.85))
-            R_cross = R * (1.0 - ecc)
-
-            # Wind unit vector (row increases southward → wy = -cos)
-            wx = np.sin(wd_rad)
-            wy = -np.cos(wd_rad)
-
-            # Arrival time: minimum over all ignition cells
-            best = np.full((rows, cols), np.inf, dtype=np.float64)
-            best[ignition] = 0.0
-
-            for ir, ic in zip(ig_r, ig_c):
-                dr = RR - ir * res     # metres
-                dc = CC - ic * res     # metres
-
-                # Project into wind / cross-wind frame
-                along = dr * wy + dc * wx
-                cross = dr * wx - dc * wy
-
-                # Arrival time (minutes): t = sqrt((along/R)² + (cross/R_cross)²)
-                # ignition cell → 0; diverge when R → 0
-                with np.errstate(divide="ignore", invalid="ignore"):
-                    t = np.sqrt((along / max(R, 1e-6)) ** 2
-                                + (cross / max(R_cross, 1e-6)) ** 2)
-                best = np.minimum(best, t)
-
-            # Threshold at horizon
-            best[best > horizon_min] = np.nan
-            all_arrival[m] = best.astype(np.float32)
-
-        # ---- aggregate ----
         burned    = np.isfinite(all_arrival)
         burn_prob = burned.mean(axis=0).astype(np.float32)
-
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", RuntimeWarning)
             mean_arr = np.where(burned.any(axis=0),
@@ -209,12 +235,12 @@ class SimpleFire:
                                 np.nanvar(all_arrival, axis=0), 0.0)
 
         return EnsembleResult(
-            member_arrival_times  = all_arrival,
+            member_arrival_times  = all_arrival,       # hours
             member_fmc_fields     = all_fmc,
             member_wind_fields    = all_wind,
             burn_probability      = burn_prob,
-            mean_arrival_time     = mean_arr.astype(np.float32),
-            arrival_time_variance = var_arr.astype(np.float32),
+            mean_arrival_time     = mean_arr.astype(np.float32),   # hours
+            arrival_time_variance = var_arr.astype(np.float32),    # hours²
             n_members             = n_members,
         )
 
@@ -294,12 +320,8 @@ def main(n_cycles: int = 6, n_drones: int = 5, n_members: int = 30,
     rows, cols = 200, 200          # 10 km × 10 km at 50 m resolution
     terrain = make_terrain(rows, cols)
 
-    # RAWS ring — spaced ~2 km apart across the 10 km domain
-    raws_locs = [
-        (10, 10),  (10, 100),  (10, 190),
-        (100, 5),  (100, 195),
-        (190, 10), (190, 100), (190, 190),
-    ]
+    # Single RAWS station in the NE quadrant, away from the fire origin (SW)
+    raws_locs = [(30, 160)]
     staging_area = (rows - 5, cols // 2)
 
     gp = make_gp(terrain)
@@ -315,11 +337,11 @@ def main(n_cycles: int = 6, n_drones: int = 5, n_members: int = 30,
     )
 
     gp_prior_init = gp.predict((rows, cols))
-    truth = generate_ground_truth(terrain=terrain, seed=42)
+    truth = generate_ground_truth(terrain=terrain, ignition_cell=(150, 40), seed=42)
 
     HORIZON_MIN = 360   # 6-hour simulation horizon (appropriate for 10 km domain)
 
-    runner = SimulationRunner(
+    runner = CycleRunner(
         orchestrator=orchestrator, ground_truth=truth,
         fire_engine=fire_engine,
         strategies=["greedy", "uniform", "fire_front"],
@@ -362,11 +384,9 @@ def main(n_cycles: int = 6, n_drones: int = 5, n_members: int = 30,
     #  info_field itself, which was computed from that prior.)
     info_last = last_report.info_field   # InformationField from runner at cycle N start
 
-    # Rebuild ensemble from first-cycle prior (unfitted GP) — used only for
-    # burn-probability background in plots that need it.  The fire STATE is
-    # taken from the last cycle so the perimeter is realistic.
-    first_ens = fire_engine.run(terrain, gp_prior_init, fire_states[0],
-                                n_members, HORIZON_MIN, np.random.default_rng(0))
+    # Change 3: use the ensemble CycleRunner already computed on cycle 1
+    # (same GP prior + fire state) — avoids one redundant fire engine run.
+    first_ens = runner.first_ensemble
     # Final-cycle ensemble uses gp_final for the fire model; its burn_probability
     # is what appears in the fire-prediction and placement maps.
     final_ens = fire_engine.run(terrain, gp_final, fire_states[-1],
@@ -426,10 +446,10 @@ def main(n_cycles: int = 6, n_drones: int = 5, n_members: int = 30,
         locs = ev.selected_locations if ev else []
         decay = max(0.4, 1.0 - k * 0.12)
         if locs:
-            fi = float(np.mean([abs(float(truth.fmc_field[r, c])
+            fi = float(np.mean([abs(float(truth.fmc[r, c])
                                     - float(gp_final.fmc_mean[r, c]))
                                  for r, c in locs])) * decay
-            wi = float(np.mean([abs(float(truth.wind_speed_field[r, c])
+            wi = float(np.mean([abs(float(truth.wind_speed[r, c])
                                     - float(gp_final.wind_speed_mean[r, c]))
                                  for r, c in locs])) * decay
         else:

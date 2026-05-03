@@ -38,7 +38,7 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Observation thinning (PotentialBugs2 §1)
+# Observation aggregation (replaces thinning, PotentialBugs2 §1)
 # ---------------------------------------------------------------------------
 
 def thin_drone_observations(
@@ -47,25 +47,125 @@ def thin_drone_observations(
     resolution_m: float = GRID_RESOLUTION_M,
 ) -> list[DroneObservation]:
     """
-    Reduce dense swath observations before assimilation.
-    Keeps the lowest-noise observation when multiple fall within min_spacing_m.
-    Reduces ~1000 raw cells to ~50 for stable EnKF matrix inversion.
+    Kept for backward compatibility — delegates to aggregate_drone_observations.
+    """
+    return aggregate_drone_observations(
+        observations,
+        spacing_m=GP_CORRELATION_LENGTH_FMC_M,   # full correlation length
+        resolution_m=resolution_m,
+    )
+
+
+def aggregate_drone_observations(
+    observations: list[DroneObservation],
+    spacing_m: float = GP_CORRELATION_LENGTH_FMC_M,
+    resolution_m: float = GRID_RESOLUTION_M,
+) -> list[DroneObservation]:
+    """
+    Aggregate spatially dense observations into one representative observation per
+    spatial cell (radius = spacing_m).
+
+    Instead of keeping only the best observation per cell (thinning), this averages
+    ALL observations within each cell using inverse-variance weighting.  The
+    resulting aggregate has:
+
+        fmc_agg   = Σ(fmc_i / σ_i²) / Σ(1 / σ_i²)          [precision-weighted mean]
+        σ_agg     = 1 / √Σ(1 / σ_i²)                         [combined precision → std]
+
+    This prevents the GP from being over-constrained by hundreds of correlated
+    individual footprint readings (which collapse `gp_var` to ~1e-6 and make the
+    information field uniformly black).  With aggregation:
+
+        - ~22 raw obs/cycle → ~3–5 aggregate obs/cycle
+        - σ_agg ≈ σ_raw / √n  (correctly reflects reduced uncertainty from averaging)
+        - GP sees well-separated, genuinely informative training points
+        - min(gp_var) stays above ~0.001 → info field remains meaningful
+
+    Spatial cells are assigned greedily: the first un-assigned observation seeds
+    each cell; all remaining observations within spacing_m are merged into it.
+
+    Wind speed / direction use the same precision-weighted aggregation, but only
+    among nadir-only observations that carry valid wind readings.
     """
     if not observations:
         return []
-    sorted_obs = sorted(observations, key=lambda o: o.fmc_sigma)
-    kept: list[DroneObservation] = []
-    min_cells_sq = (min_spacing_m / resolution_m) ** 2
-    for obs in sorted_obs:
-        r, c = obs.location
-        too_close = any(
-            (r - k.location[0]) ** 2 + (c - k.location[1]) ** 2 < min_cells_sq
-            for k in kept
-        )
-        if not too_close:
-            kept.append(obs)
-    logger.debug("Observation thinning: %d → %d", len(observations), len(kept))
-    return kept
+
+    min_cells_sq = (spacing_m / resolution_m) ** 2
+    remaining   = list(observations)
+    aggregated: list[DroneObservation] = []
+
+    while remaining:
+        seed = remaining.pop(0)
+        sr, sc = seed.location
+
+        # Collect all obs (including seed) within spacing_m of the seed
+        group   = [seed]
+        outside = []
+        for obs in remaining:
+            dr = obs.location[0] - sr
+            dc = obs.location[1] - sc
+            if dr * dr + dc * dc < min_cells_sq:
+                group.append(obs)
+            else:
+                outside.append(obs)
+        remaining = outside
+
+        # ── FMC: precision-weighted mean ─────────────────────────────────────
+        fmc_weights  = np.array([1.0 / (o.fmc_sigma ** 2) for o in group])
+        fmc_wsum     = fmc_weights.sum()
+        fmc_agg      = float(np.dot(fmc_weights, [o.fmc for o in group]) / fmc_wsum)
+        sigma_fmc    = float(1.0 / np.sqrt(fmc_wsum))
+
+        # Centroid location (rounded to nearest cell)
+        r_agg = int(round(float(np.mean([o.location[0] for o in group]))))
+        c_agg = int(round(float(np.mean([o.location[1] for o in group]))))
+
+        # ── Wind speed: precision-weighted mean (nadir obs only) ─────────────
+        ws_group = [o for o in group
+                    if o.wind_speed is not None and np.isfinite(o.wind_speed)
+                    and o.wind_speed_sigma is not None and np.isfinite(o.wind_speed_sigma)
+                    and o.wind_speed_sigma > 0]
+        if ws_group:
+            ws_weights = np.array([1.0 / (o.wind_speed_sigma ** 2) for o in ws_group])
+            ws_wsum    = ws_weights.sum()
+            ws_agg     = float(np.dot(ws_weights, [o.wind_speed for o in ws_group]) / ws_wsum)
+            sigma_ws   = float(1.0 / np.sqrt(ws_wsum))
+        else:
+            ws_agg   = None
+            sigma_ws = None
+
+        # ── Wind direction: circular precision-weighted mean ──────────────────
+        wd_group = [o for o in ws_group
+                    if o.wind_dir is not None and np.isfinite(o.wind_dir)]
+        if wd_group:
+            wd_weights = np.array([1.0 / ((o.wind_dir_sigma or 10.0) ** 2) for o in wd_group])
+            wd_wsum    = wd_weights.sum()
+            dirs_rad   = np.deg2rad([o.wind_dir for o in wd_group])
+            sin_mean   = float(np.dot(wd_weights, np.sin(dirs_rad)) / wd_wsum)
+            cos_mean   = float(np.dot(wd_weights, np.cos(dirs_rad)) / wd_wsum)
+            wd_agg     = float(np.rad2deg(np.arctan2(sin_mean, cos_mean)) % 360.0)
+            sigma_wd   = float(1.0 / np.sqrt(wd_wsum))
+        else:
+            wd_agg   = None
+            sigma_wd = None
+
+        aggregated.append(DroneObservation(
+            location         = (r_agg, c_agg),
+            fmc              = fmc_agg,
+            fmc_sigma        = sigma_fmc,
+            wind_speed       = ws_agg,
+            wind_speed_sigma = sigma_ws,
+            wind_dir         = wd_agg,
+            wind_dir_sigma   = sigma_wd,
+            timestamp        = seed.timestamp,
+            drone_id         = seed.drone_id,
+        ))
+
+    logger.debug(
+        "Observation aggregation: %d → %d (spacing=%.0f m)",
+        len(observations), len(aggregated), spacing_m,
+    )
+    return aggregated
 
 
 # ---------------------------------------------------------------------------
@@ -170,7 +270,11 @@ def assimilate_observations(
       'replan_flags' dict[str, bool]
       'n_obs_used'   int — number of observations after thinning
     """
-    thinned = thin_drone_observations(observations, resolution_m=resolution_m)
+    thinned = aggregate_drone_observations(
+        observations,
+        spacing_m=GP_CORRELATION_LENGTH_FMC_M,
+        resolution_m=resolution_m,
+    )
     N = ensemble.n_members
 
     if not thinned:
@@ -182,11 +286,26 @@ def assimilate_observations(
             "n_obs_used":   0,
         }
 
-    locs      = [o.location for o in thinned]
-    fmc_vals  = [o.fmc for o in thinned]
-    fmc_sigs  = [o.fmc_sigma for o in thinned]
-    ws_vals   = [o.wind_speed for o in thinned]
-    ws_sigs   = [o.wind_speed_sigma for o in thinned]
+    locs     = [o.location for o in thinned]
+    fmc_vals = [o.fmc for o in thinned]
+    fmc_sigs = [o.fmc_sigma for o in thinned]
+
+    # Off-centre footprint cells carry FMC only — wind obs are nadir-only.
+    # Separate wind-valid observations so NaNs never reach the GP or EnKF.
+    wind_obs  = [o for o in thinned
+                 if o.wind_speed is not None and np.isfinite(o.wind_speed)
+                 and o.wind_speed_sigma is not None and np.isfinite(o.wind_speed_sigma)]
+    ws_locs   = [o.location     for o in wind_obs]
+    ws_vals   = [o.wind_speed   for o in wind_obs]
+    ws_sigs   = [o.wind_speed_sigma for o in wind_obs]
+
+    # Wind direction — also nadir-only; same obs that carry wind speed.
+    dir_obs   = [o for o in wind_obs
+                 if o.wind_dir is not None and np.isfinite(o.wind_dir)]
+    wd_locs   = [o.location        for o in dir_obs]
+    wd_vals   = [o.wind_dir        for o in dir_obs]
+    wd_sigs   = [o.wind_dir_sigma if o.wind_dir_sigma is not None else 10.0
+                 for o in dir_obs]
 
     # Outlier check — log but assimilate anyway (localization limits damage)
     fmc_arr = np.array(fmc_vals)
@@ -202,11 +321,18 @@ def assimilate_observations(
             n_outliers, ENKF_OUTLIER_THRESHOLD,
         )
 
-    # GP update: add observations to conditioning set (triggers refit on next predict)
-    gp.add_observations(locs, fmc_vals, fmc_sigs, ws_vals, ws_sigs)
+    # GP update: FMC from all thinned cells; wind speed + direction from nadir cells
+    gp.add_observations(locs, fmc_vals, fmc_sigs,
+                        ws_vals=ws_vals or None,
+                        ws_sigmas=ws_sigs or None,
+                        ws_locs=ws_locs or None,
+                        wd_vals=wd_vals or None,
+                        wd_sigmas=wd_sigs or None,
+                        wd_locs=wd_locs or None)
 
-    # EnKF updates — separate pass per variable
-    obs_idx = [r * shape[1] + c for r, c in locs]
+    # EnKF updates — separate pass per variable, wind uses its own location subset
+    obs_idx    = [r * shape[1] + c for r, c in locs]
+    ws_obs_idx = [r * shape[1] + c for r, c in ws_locs]
 
     fmc_X = ensemble.member_fmc_fields.reshape(N, -1).astype(np.float64)
     fmc_X = enkf_update(
@@ -215,10 +341,11 @@ def assimilate_observations(
     )
 
     ws_X = ensemble.member_wind_fields.reshape(N, -1).astype(np.float64)
-    ws_X = enkf_update(
-        ws_X, np.array(ws_vals), obs_idx, np.array(ws_sigs),
-        shape, locs, resolution_m, localization_radius_m, inflation_factor, rng,
-    )
+    if ws_vals:
+        ws_X = enkf_update(
+            ws_X, np.array(ws_vals), ws_obs_idx, np.array(ws_sigs),
+            shape, ws_locs, resolution_m, localization_radius_m, inflation_factor, rng,
+        )
 
     # Replan flags
     var_drop_flag  = False
