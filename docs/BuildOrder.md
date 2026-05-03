@@ -70,24 +70,45 @@ Everything here consumes the information field.
 **Deliverable:** Four SelectionResult objects per cycle, ready for comparison.
 
 ---
-
-## Phase 4: Evaluation + Assimilation (0.5-1 day)
-
-Close the loop.
-
-1. **Simulated observer.** Generate synthetic observations from hidden ground truth at selected locations. Add calibrated noise. Include observation thinning. ~30 lines.
-    
-2. **Counterfactual evaluator.** For each strategy's selections, simulate GP variance reduction and compute entropy metrics. ~40 lines. **Test:** targeted strategies show higher entropy reduction than uniform.
-    
-3. **EnKF.** Implement the update with localization and inflation. ~60 lines. **Test:** observe FMC at one cell, verify variance drops at correlated neighbors and is unchanged at distant/dissimilar cells.
-    
-4. **GP update.** Add observations to GP conditioning set. ~5 lines.
-    
-5. **Orchestrator.** Wire everything together. Run full cycle: GP → ensemble → info field → selectors → evaluate → observe → assimilate → repeat. ~80 lines. **Test:** run 5 cycles, verify entropy decreases across cycles for targeted strategies.
-    
-
+### Phase 4a: Core Assimilation (0.5 day)
+ 
+These components are part of the deployed system. In a real deployment with real drones, you ship this code.
+ 
+Lives in `ignis/assimilation.py` and `ignis/orchestrator.py`.
+ 
+1. **EnKF.** Implement the update with localization and inflation. Accepts `list[DroneObservation]` from any source (real or simulated — it doesn't know or care). ~60 lines. **Test:** observe FMC at one cell, verify variance drops at correlated neighbors and is unchanged at distant/dissimilar cells.
+2. **GP update.** Add observations to GP conditioning set. Recompute posterior variance. ~5 lines. **Test:** variance drops near observed location, unchanged far away.
+3. **Observation thinning.** Reduce dense swath observations to one per correlation length before passing to EnKF. ~15 lines.
+4. **Core orchestrator.** The operational cycle: GP → ensemble → info field → select → assimilate incoming observations → repeat. Accepts observations as input, does not generate them. ~60 lines. **Test:** given a list of synthetic observations passed in manually, run one full cycle.
+```python
+# Core orchestrator interface — observation-source agnostic
+queue, situation = orchestrator.run_cycle(observations=drone_data)
+```
+ 
+**Deliverable:** `orchestrator.run_cycle(observations) → MissionQueue` works end-to-end with manually provided test observations.
+ 
+### Phase 4b: Simulation Harness (0.5 day)
+ 
+These components exist only for the hackathon. They substitute for real drones and enable the four-way strategy comparison. In a real deployment, none of this ships.
+ 
+Lives in `ignis/simulation/`.
+ 
+1. **Ground truth manager.** Generate and hold the hidden "true" FMC and wind fields that the simulated observer samples from. ~20 lines.
+2. **Simulated observer.** Generate synthetic observations at specified locations by sampling ground truth + calibrated noise. Implements the same `ObservationSource` interface that real drone telemetry would. ~30 lines.
+3. **Counterfactual evaluator.** For each strategy's selections, simulate what observations would have been collected and how much GP variance would have decreased. Computes PERR and entropy metrics. ~40 lines. **Test:** targeted strategies show higher entropy reduction than uniform.
+4. **Simulation runner.** Wraps the core orchestrator with the simulated observer and comparison logic. Runs all four strategies counterfactually each cycle, but only the primary strategy's observations feed into the real state update. ~30 lines.
+```python
+# Simulation wrapper — hackathon evaluation
+from ignis.simulation import SimulationRunner
+runner = SimulationRunner(orchestrator, ground_truth, strategies=["greedy", "qubo", "uniform", "fire_front"])
+results = runner.run_comparison(n_cycles=10)
+```
+ 
 **Deliverable:** Multi-cycle comparison data. PERR numbers for all four strategies.
-
+ 
+**The test for which folder a file belongs in:** would you ship it with real drones? EnKF → yes → `ignis/`. Simulated observer → no → `ignis/simulation/`.
+ 
+---
 ---
 
 ## Phase 5: Polish (0.5-1 day)
