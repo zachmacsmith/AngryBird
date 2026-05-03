@@ -67,40 +67,136 @@ REPLAN_VARIANCE_REDUCTION_THRESHOLD: float = 0.20  # 20% drop → flag
 REPLAN_WIND_SHIFT_THRESHOLD_DEG: float = 30.0       # 30° shift → immediate replan
 
 # ---------------------------------------------------------------------------
-# Anderson 13 fuel model parameters (Andrews 2018, RMRS-GTR-371)
-# Keys: fuel model ID 1-13
-# Values: load (kg/m²), sav (1/m), depth (m), mx (fraction), h (kJ/kg)
-#   load  = total 1-hr fuel load
-#   sav   = surface-area-to-volume ratio
-#   depth = fuel bed depth
-#   mx    = moisture of extinction
-#   h     = dead fuel heat content
+# Scott & Burgan 40 fuel model parameters (Andrews 2012, RMRS-GTR-265)
+#
+# Keys: SB40 fuel model codes (integers)
+# Values:
+#   load   — total 1-hr dead fuel load, kg/m²
+#   sav    — surface-area-to-volume ratio of 1-hr fuel, 1/m
+#   depth  — fuel bed depth, m
+#   mx     — dead fuel moisture of extinction, fraction
+#   h      — dead fuel heat content, kJ/kg
+#   cbh    — default canopy base height, m (0 = surface fuel only)
+#   cbd    — default canopy bulk density, kg/m³ (0 = no canopy)
+#   cc     — default canopy cover, fraction (0 = open)
+#   ch     — default canopy height, m (0 = no canopy)
+#
+# Non-burnable codes (91-99) are included with zero load so the lookup
+# never raises KeyError for cells ELMFIRE skips anyway.
 # ---------------------------------------------------------------------------
 
 FUEL_PARAMS: dict[int, dict[str, float]] = {
-    1:  {"load": 0.034, "sav": 11483, "depth": 0.305, "mx": 0.12, "h": 18608},
-    2:  {"load": 0.092, "sav":  9843, "depth": 0.305, "mx": 0.15, "h": 18608},
-    3:  {"load": 0.230, "sav":  4921, "depth": 0.762, "mx": 0.25, "h": 18608},
-    4:  {"load": 0.230, "sav":  6562, "depth": 1.829, "mx": 0.20, "h": 18608},
-    5:  {"load": 0.046, "sav":  6562, "depth": 0.610, "mx": 0.20, "h": 18608},
-    6:  {"load": 0.069, "sav":  5741, "depth": 0.762, "mx": 0.25, "h": 18608},
-    7:  {"load": 0.052, "sav":  5741, "depth": 0.762, "mx": 0.40, "h": 18608},
-    8:  {"load": 0.069, "sav":  6562, "depth": 0.061, "mx": 0.30, "h": 18608},
-    9:  {"load": 0.134, "sav":  8202, "depth": 0.061, "mx": 0.25, "h": 18608},
-    10: {"load": 0.138, "sav":  6562, "depth": 0.305, "mx": 0.25, "h": 18608},
-    11: {"load": 0.069, "sav":  4921, "depth": 0.305, "mx": 0.15, "h": 18608},
-    12: {"load": 0.184, "sav":  4921, "depth": 0.701, "mx": 0.20, "h": 18608},
-    13: {"load": 0.322, "sav":  4921, "depth": 0.914, "mx": 0.25, "h": 18608},
+    # --- Grass (GR) ---
+    101: {"load": 0.045, "sav": 11483, "depth": 0.305, "mx": 0.15, "h": 18608,
+          "cbh": 0.0, "cbd": 0.000, "cc": 0.00, "ch": 0.0},
+    102: {"load": 0.045, "sav": 11483, "depth": 0.305, "mx": 0.15, "h": 18608,
+          "cbh": 0.0, "cbd": 0.000, "cc": 0.00, "ch": 0.0},
+    103: {"load": 0.057, "sav":  9840, "depth": 0.762, "mx": 0.25, "h": 18608,
+          "cbh": 0.0, "cbd": 0.000, "cc": 0.00, "ch": 0.0},
+    104: {"load": 0.114, "sav":  9840, "depth": 2.134, "mx": 0.15, "h": 18608,
+          "cbh": 0.0, "cbd": 0.000, "cc": 0.00, "ch": 0.0},
+    105: {"load": 0.114, "sav": 11483, "depth": 1.829, "mx": 0.40, "h": 18608,
+          "cbh": 0.0, "cbd": 0.000, "cc": 0.00, "ch": 0.0},
+    106: {"load": 0.319, "sav":  7546, "depth": 1.829, "mx": 0.40, "h": 18608,
+          "cbh": 0.0, "cbd": 0.000, "cc": 0.00, "ch": 0.0},
+    107: {"load": 0.479, "sav":  7546, "depth": 1.829, "mx": 0.15, "h": 18608,
+          "cbh": 0.0, "cbd": 0.000, "cc": 0.00, "ch": 0.0},
+    108: {"load": 0.785, "sav":  7546, "depth": 1.524, "mx": 0.30, "h": 18608,
+          "cbh": 0.0, "cbd": 0.000, "cc": 0.00, "ch": 0.0},
+    109: {"load": 1.046, "sav":  7546, "depth": 1.524, "mx": 0.40, "h": 18608,
+          "cbh": 0.0, "cbd": 0.000, "cc": 0.00, "ch": 0.0},
+    # --- Grass-Shrub (GS) ---
+    121: {"load": 0.045, "sav":  6890, "depth": 0.610, "mx": 0.15, "h": 18608,
+          "cbh": 0.0, "cbd": 0.000, "cc": 0.10, "ch": 0.6},
+    122: {"load": 0.114, "sav":  6890, "depth": 0.915, "mx": 0.15, "h": 18608,
+          "cbh": 0.0, "cbd": 0.000, "cc": 0.20, "ch": 0.6},
+    123: {"load": 0.114, "sav":  6890, "depth": 1.829, "mx": 0.40, "h": 18608,
+          "cbh": 0.0, "cbd": 0.000, "cc": 0.30, "ch": 1.2},
+    124: {"load": 0.239, "sav":  6890, "depth": 1.829, "mx": 0.40, "h": 18608,
+          "cbh": 0.0, "cbd": 0.000, "cc": 0.40, "ch": 1.8},
+    # --- Shrub (SH) ---
+    141: {"load": 0.034, "sav":  5249, "depth": 0.610, "mx": 0.15, "h": 18608,
+          "cbh": 0.0, "cbd": 0.000, "cc": 0.20, "ch": 0.6},
+    142: {"load": 0.114, "sav":  4593, "depth": 1.219, "mx": 0.15, "h": 18608,
+          "cbh": 0.0, "cbd": 0.000, "cc": 0.30, "ch": 1.0},
+    143: {"load": 0.068, "sav":  4921, "depth": 1.219, "mx": 0.40, "h": 18608,
+          "cbh": 0.0, "cbd": 0.000, "cc": 0.20, "ch": 1.2},
+    144: {"load": 0.239, "sav":  4921, "depth": 2.438, "mx": 0.40, "h": 18608,
+          "cbh": 0.0, "cbd": 0.000, "cc": 0.50, "ch": 2.0},
+    145: {"load": 0.182, "sav":  4921, "depth": 1.829, "mx": 0.15, "h": 18608,
+          "cbh": 0.0, "cbd": 0.000, "cc": 0.30, "ch": 1.5},
+    146: {"load": 0.568, "sav":  4921, "depth": 1.829, "mx": 0.30, "h": 18608,
+          "cbh": 0.0, "cbd": 0.000, "cc": 0.60, "ch": 2.0},
+    147: {"load": 0.739, "sav":  4593, "depth": 1.524, "mx": 0.15, "h": 18608,
+          "cbh": 0.0, "cbd": 0.000, "cc": 0.50, "ch": 1.8},
+    149: {"load": 1.046, "sav":  4593, "depth": 1.524, "mx": 0.40, "h": 18608,
+          "cbh": 0.0, "cbd": 0.000, "cc": 0.70, "ch": 2.4},
+    # --- Timber Understory (TU) ---
+    161: {"load": 0.045, "sav":  6562, "depth": 0.305, "mx": 0.20, "h": 18608,
+          "cbh": 0.5, "cbd": 0.020, "cc": 0.20, "ch": 5.0},
+    162: {"load": 0.091, "sav":  6890, "depth": 0.305, "mx": 0.30, "h": 18608,
+          "cbh": 0.5, "cbd": 0.040, "cc": 0.30, "ch": 8.0},
+    163: {"load": 0.136, "sav":  4921, "depth": 0.305, "mx": 0.30, "h": 18608,
+          "cbh": 0.3, "cbd": 0.030, "cc": 0.30, "ch": 10.0},
+    164: {"load": 0.205, "sav":  4921, "depth": 0.610, "mx": 0.12, "h": 18608,
+          "cbh": 0.5, "cbd": 0.060, "cc": 0.40, "ch": 12.0},
+    165: {"load": 0.182, "sav":  4921, "depth": 0.914, "mx": 0.25, "h": 18608,
+          "cbh": 0.5, "cbd": 0.050, "cc": 0.70, "ch": 15.0},
+    # --- Timber Litter (TL) ---
+    181: {"load": 0.068, "sav":  6562, "depth": 0.061, "mx": 0.30, "h": 18608,
+          "cbh": 1.0, "cbd": 0.050, "cc": 0.60, "ch": 15.0},
+    182: {"load": 0.136, "sav":  6562, "depth": 0.061, "mx": 0.25, "h": 18608,
+          "cbh": 1.0, "cbd": 0.060, "cc": 0.60, "ch": 15.0},
+    183: {"load": 0.205, "sav":  4921, "depth": 0.061, "mx": 0.20, "h": 18608,
+          "cbh": 0.5, "cbd": 0.070, "cc": 0.60, "ch": 15.0},
+    184: {"load": 0.273, "sav":  4921, "depth": 0.061, "mx": 0.25, "h": 18608,
+          "cbh": 1.5, "cbd": 0.080, "cc": 0.80, "ch": 20.0},
+    185: {"load": 0.318, "sav":  4921, "depth": 0.122, "mx": 0.25, "h": 18608,
+          "cbh": 1.0, "cbd": 0.070, "cc": 0.70, "ch": 20.0},
+    186: {"load": 0.375, "sav":  4921, "depth": 0.061, "mx": 0.25, "h": 18608,
+          "cbh": 1.5, "cbd": 0.090, "cc": 0.70, "ch": 22.0},
+    187: {"load": 0.568, "sav":  4921, "depth": 0.061, "mx": 0.25, "h": 18608,
+          "cbh": 2.0, "cbd": 0.100, "cc": 0.80, "ch": 25.0},
+    188: {"load": 0.909, "sav":  4921, "depth": 0.061, "mx": 0.35, "h": 18608,
+          "cbh": 0.5, "cbd": 0.080, "cc": 0.50, "ch": 12.0},
+    189: {"load": 0.136, "sav":  4921, "depth": 0.061, "mx": 0.35, "h": 18608,
+          "cbh": 1.0, "cbd": 0.040, "cc": 0.60, "ch": 15.0},
+    # --- Slash-Blowdown (SB) ---
+    201: {"load": 0.682, "sav":  4921, "depth": 0.914, "mx": 0.25, "h": 18608,
+          "cbh": 0.0, "cbd": 0.000, "cc": 0.00, "ch": 0.0},
+    202: {"load": 1.364, "sav":  4921, "depth": 0.914, "mx": 0.25, "h": 18608,
+          "cbh": 0.0, "cbd": 0.000, "cc": 0.00, "ch": 0.0},
+    203: {"load": 1.364, "sav":  4921, "depth": 1.219, "mx": 0.25, "h": 18608,
+          "cbh": 0.0, "cbd": 0.000, "cc": 0.00, "ch": 0.0},
+    204: {"load": 2.728, "sav":  4921, "depth": 2.743, "mx": 0.25, "h": 18608,
+          "cbh": 0.0, "cbd": 0.000, "cc": 0.00, "ch": 0.0},
+    # --- Non-burnable ---
+    91:  {"load": 0.000, "sav":     0, "depth": 0.000, "mx": 0.00, "h":     0,
+          "cbh": 0.0, "cbd": 0.000, "cc": 0.00, "ch": 0.0},  # Urban
+    92:  {"load": 0.000, "sav":     0, "depth": 0.000, "mx": 0.00, "h":     0,
+          "cbh": 0.0, "cbd": 0.000, "cc": 0.00, "ch": 0.0},  # Snow/Ice
+    93:  {"load": 0.000, "sav":     0, "depth": 0.000, "mx": 0.00, "h":     0,
+          "cbh": 0.0, "cbd": 0.000, "cc": 0.00, "ch": 0.0},  # Agriculture
+    98:  {"load": 0.000, "sav":     0, "depth": 0.000, "mx": 0.00, "h":     0,
+          "cbh": 0.0, "cbd": 0.000, "cc": 0.00, "ch": 0.0},  # Water
+    99:  {"load": 0.000, "sav":     0, "depth": 0.000, "mx": 0.00, "h":     0,
+          "cbh": 0.0, "cbd": 0.000, "cc": 0.00, "ch": 0.0},  # Bare ground
 }
 
-# Packing ratio (relative bulk density) per fuel model — approximate from Anderson (1982)
+# Packing ratio per SB40 model — derived from load/depth/particle_density
+# β = load / (depth × particle_density), particle_density = 512 kg/m³
 FUEL_PACKING_RATIO: dict[int, float] = {
-    1: 0.00154, 2: 0.00307, 3: 0.00307, 4: 0.00615, 5: 0.00154,
-    6: 0.00231, 7: 0.00231, 8: 0.00154, 9: 0.00231, 10: 0.00308,
-    11: 0.00154, 12: 0.00308, 13: 0.00385,
+    fid: p["load"] / max(p["depth"] * 512.0, 1e-6)
+    for fid, p in FUEL_PARAMS.items()
 }
 
-# Mineral content (silica-free) — standard Rothermel value
+# Mineral content — standard Rothermel values (unchanged from Anderson-13)
 FUEL_MINERAL_CONTENT: float = 0.0555
 FUEL_MINERAL_SILICA_FREE: float = 0.0100
 FUEL_PARTICLE_DENSITY: float = 512.0  # kg/m³
+
+# Canopy cover fraction per SB40 model — extracted from FUEL_PARAMS for
+# fast vectorised lookup in ground_truth.py
+SB40_CANOPY_COVER: dict[int, float] = {
+    fid: p["cc"] for fid, p in FUEL_PARAMS.items()
+}

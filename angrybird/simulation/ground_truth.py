@@ -20,7 +20,7 @@ from dataclasses import dataclass
 import numpy as np
 from scipy.ndimage import uniform_filter
 
-from ..config import GRID_RESOLUTION_M
+from ..config import GRID_RESOLUTION_M, SB40_CANOPY_COVER
 from ..types import TerrainData
 
 
@@ -50,19 +50,16 @@ def _draw_correlated_field(
     return (field / std).astype(np.float32)
 
 
-# Proxy canopy cover fraction per Anderson-13 fuel model
-# Grass (1-3): open; Shrub/brush (4-7): partial; Timber (8-13): closed.
-_CANOPY_COVER: dict[int, float] = {
-    1: 0.00, 2: 0.10, 3: 0.05,
-    4: 0.30, 5: 0.40, 6: 0.20, 7: 0.20,
-    8: 0.80, 9: 0.75, 10: 0.70, 11: 0.50, 12: 0.40, 13: 0.30,
-}
-
-
 def _canopy_from_fuel(fuel_model: np.ndarray) -> np.ndarray:
-    """Vectorised canopy-cover lookup from Anderson-13 fuel model IDs."""
+    """
+    Vectorised canopy-cover lookup from Scott & Burgan 40 fuel model codes.
+
+    Uses SB40_CANOPY_COVER from config.py.  Unknown codes default to 0.0
+    (open canopy) — safe for non-burnable cells (91-99) and any codes
+    not explicitly listed.
+    """
     out = np.zeros(fuel_model.shape, dtype=np.float32)
-    for fid, cc in _CANOPY_COVER.items():
+    for fid, cc in SB40_CANOPY_COVER.items():
         out[fuel_model == fid] = cc
     return out
 
@@ -84,24 +81,19 @@ def _generate_fmc_field(
     Smooth correlated random field (~500 m) captures weather micro-patterns
     and soil variation between sampling points.
     """
-    aspect_effect = -0.03 * np.cos(np.radians(terrain.aspect))
-
-    elev = terrain.elevation
-    elev_norm = (elev - elev.mean()) / (elev.std() + 1e-6)
+    aspect_effect    = -0.03 * np.cos(np.radians(terrain.aspect))
+    elev             = terrain.elevation
+    elev_norm        = (elev - elev.mean()) / (elev.std() + 1e-6)
     elevation_effect = 0.02 * elev_norm
-
-    tpi = elev - uniform_filter(elev, size=20)
-    tpi_effect = -0.01 * np.clip(tpi / (tpi.std() + 1e-6), -2.0, 2.0)
-
-    canopy_effect = 0.02 * _canopy_from_fuel(terrain.fuel_model)
+    tpi              = elev - uniform_filter(elev, size=20)
+    tpi_effect       = -0.01 * np.clip(tpi / (tpi.std() + 1e-6), -2.0, 2.0)
+    canopy_effect    = 0.02 * _canopy_from_fuel(terrain.fuel_model)
 
     fmc_terrain = base_fmc + aspect_effect + elevation_effect + tpi_effect + canopy_effect
-
     noise = _draw_correlated_field(
         terrain.shape, correlation_length=500.0,
         resolution_m=terrain.resolution_m, rng=rng,
     )
-
     return np.clip(fmc_terrain + 0.015 * noise, 0.02, 0.40).astype(np.float32)
 
 
@@ -120,12 +112,12 @@ def _generate_wind_fields(
     Direction: prevailing direction plus smooth ~2 km-scale perturbation
     (valley channelling, mesoscale variation).  ±15° typical deviation.
     """
-    elev = terrain.elevation
-    tpi = elev - uniform_filter(elev, size=20)
+    elev     = terrain.elevation
+    tpi      = elev - uniform_filter(elev, size=20)
     tpi_norm = tpi / (tpi.std() + 1e-6)
-    ws_terrain = base_ws * (1.0 + 0.3 * np.clip(tpi_norm, -1.0, 2.0))
 
-    ws_noise = _draw_correlated_field(
+    ws_terrain = base_ws * (1.0 + 0.3 * np.clip(tpi_norm, -1.0, 2.0))
+    ws_noise   = _draw_correlated_field(
         terrain.shape, correlation_length=1000.0,
         resolution_m=terrain.resolution_m, rng=rng,
     )
@@ -146,7 +138,7 @@ class GroundTruth:
     fmc_field:        np.ndarray   # float32[rows, cols]
     wind_speed_field: np.ndarray   # float32[rows, cols], m/s
     wind_dir_field:   np.ndarray   # float32[rows, cols], degrees from north
-    shape: tuple[int, int]
+    shape:            tuple[int, int]
 
 
 def generate_ground_truth(
