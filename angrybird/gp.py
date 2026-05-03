@@ -200,6 +200,31 @@ class IGNISGPPrior:
         self._cached_shape: Optional[tuple[int, int]] = None
         self._cached_X_grid: Optional[np.ndarray] = None
 
+        # Nelson (2000) physics-informed FMC prior mean.
+        # When set, FMC obs are fitted as residuals from this field and
+        # predictions add it back — GP corrects Nelson where data disagrees.
+        self._nelson_mean: Optional[np.ndarray] = None
+
+    # ------------------------------------------------------------------
+    # Nelson mean function
+    # ------------------------------------------------------------------
+
+    def set_nelson_mean(self, field: np.ndarray) -> None:
+        """
+        Set the Nelson (2000) terrain-aware FMC field as the GP prior mean.
+
+        After this call, RAWS/drone FMC observations are fitted as residuals
+        (observed - Nelson).  Predictions add Nelson back, so gp.predict()
+        returns physics-corrected FMC estimates everywhere — not just near
+        stations.  The GP variance field is unaffected (still reflects distance
+        from observations).
+
+        Call once per IGNIS cycle before gp.predict(), passing the Nelson
+        field recomputed for the current hour / temperature / humidity.
+        """
+        self._nelson_mean = np.asarray(field, dtype=np.float32).copy()
+        self._dirty = True   # residuals changed → refit on next predict()
+
     # ------------------------------------------------------------------
     # Observation ingestion
     # ------------------------------------------------------------------
@@ -339,8 +364,18 @@ class IGNISGPPrior:
 
     def fit(self) -> None:
         """Fit GPs to all current observations."""
+        # FMC: fit residuals from Nelson prior mean so the GP corrects the
+        # physics model rather than interpolating raw values.
+        fmc_vals = self._fmc_vals
+        if self._nelson_mean is not None and self._fmc_locs:
+            ri = [int(r) for r, _ in self._fmc_locs]
+            ci = [int(c) for _, c in self._fmc_locs]
+            nelson_at_obs = self._nelson_mean[ri, ci].astype(np.float64)
+            fmc_vals = [float(v) - float(n)
+                        for v, n in zip(self._fmc_vals, nelson_at_obs)]
+
         self._gp_fmc = self._fit_variable(
-            self._fmc_locs, self._fmc_vals, self._fmc_sigmas,
+            self._fmc_locs, fmc_vals, self._fmc_sigmas,
             self.length_scale_fmc, self.noise_fmc,
             previous_gp=self._gp_fmc,
         )
@@ -396,11 +431,20 @@ class IGNISGPPrior:
 
         X_grid = self._get_grid_features(shape)
 
+        # When Nelson is active, GP predicts residuals; add Nelson mean back.
+        # default_mean=0 → no-obs fallback is pure Nelson (residual = 0).
+        # Without Nelson, fall back to 0.10 flat prior.
+        _nelson = (self._nelson_mean
+                   if self._nelson_mean is not None
+                   and self._nelson_mean.shape == tuple(shape)
+                   else None)
         fmc_mean, fmc_var = self._predict_variable(
             self._gp_fmc, X_grid, shape,
-            default_mean=0.10,    # 10% FMC fallback prior mean
-            default_variance=0.04,  # ±20% std fallback
+            default_mean=0.0 if _nelson is not None else 0.10,
+            default_variance=0.04,
         )
+        if _nelson is not None:
+            fmc_mean = np.clip(fmc_mean + _nelson, 0.02, 0.40).astype(np.float32)
         ws_mean, ws_var = self._predict_variable(
             self._gp_ws, X_grid, shape,
             default_mean=5.0,    # 5 m/s fallback

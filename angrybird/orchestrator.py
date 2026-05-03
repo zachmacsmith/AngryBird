@@ -105,6 +105,8 @@ class IGNISOrchestrator:
         staging_area: tuple[int, int] = (0, 0),
         resolution_m: float = GRID_RESOLUTION_M,
         base_seed: int = 0,
+        bimodal_alpha: float = 0.5,
+        bimodal_beta: float = 0.3,
     ) -> None:
         self.terrain          = terrain
         self.gp               = gp
@@ -117,6 +119,8 @@ class IGNISOrchestrator:
         self.staging_area     = staging_area
         self.resolution_m     = resolution_m
         self.base_seed        = base_seed
+        self.bimodal_alpha    = bimodal_alpha
+        self.bimodal_beta     = bimodal_beta
         self.cycle_count      = 0
         self._previous_selections: list[tuple[int, int]] = []
 
@@ -185,6 +189,8 @@ class IGNISOrchestrator:
             horizon_minutes=self.horizon_min,
             priority_weight_field=priority_weight_field,
             exclusion_mask=exclusion_mask,
+            bimodal_alpha=self.bimodal_alpha,
+            bimodal_beta=self.bimodal_beta,
         )
 
         # 6. Primary strategy selection

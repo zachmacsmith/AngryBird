@@ -41,6 +41,7 @@ from ..config import (
     SIMULATION_HORIZON_MIN,
 )
 from ..information import compute_information_field
+from ..nelson import nelson_fmc_field
 from ..orchestrator import IGNISOrchestrator, FireEngineProtocol
 from ..path_planner import plan_paths
 from ..selectors import registry as _default_registry
@@ -63,6 +64,8 @@ from .drone_sim import (
 from .evaluator import CounterfactualEvaluator
 from .ground_truth import GroundTruth, compute_wind_field
 from .observation_buffer import ObservationBuffer, thin_observations
+from ..assimilation import aggregate_drone_observations
+from ..config import GP_CORRELATION_LENGTH_FMC_M
 from .observer import ObservationSource, SimulatedObserver
 from .renderer import FrameRenderer
 
@@ -209,22 +212,24 @@ class LiveEstimator:
             None if no fire engine is available.
         """
         if self._has_obs:
-            # Thin the buffer's raw contents without consuming them (non-destructive).
-            # thin_observations() is O(n) via coarse-bin dict — fast even with
-            # thousands of raw footprint obs accumulated in a 20-min cycle.
-            thinned = thin_observations(
+            # Aggregate the buffer's raw obs at the full GP correlation length.
+            # This mirrors the IGNIS cycle assimilation path and prevents the
+            # live estimate from showing spiky artifacts between cycle boundaries
+            # (the old thin_observations used only 200 m spacing, dumping dozens
+            # of barely-separated obs into the already-fitted GP copy).
+            aggregated = aggregate_drone_observations(
                 self._obs_buffer._buffer,
-                self._obs_buffer._min_spacing,
-                self._obs_buffer._resolution_m,
+                spacing_m=GP_CORRELATION_LENGTH_FMC_M,
+                resolution_m=self._obs_buffer._resolution_m,
             )
-            if thinned:
+            if aggregated:
                 work_gp    = copy.deepcopy(self._live_gp)
-                locs       = [o.location  for o in thinned]
-                fmc_vals   = [o.fmc       for o in thinned]
-                fmc_sigmas = [o.fmc_sigma for o in thinned]
+                locs       = [o.location  for o in aggregated]
+                fmc_vals   = [o.fmc       for o in aggregated]
+                fmc_sigmas = [o.fmc_sigma for o in aggregated]
 
                 # Wind speed — nadir cells only (off-centre footprint obs have NaN)
-                ws_obs     = [o for o in thinned
+                ws_obs     = [o for o in aggregated
                               if o.wind_speed is not None
                               and np.isfinite(o.wind_speed)
                               and o.wind_speed_sigma is not None
@@ -320,6 +325,11 @@ class CycleRunner:
         n_members: int = ENSEMBLE_SIZE,
         resolution_m: float = GRID_RESOLUTION_M,
         obs_source: Optional[ObservationSource] = None,
+        bimodal_alpha: float = 0.5,
+        bimodal_beta: float = 0.3,
+        nelson_T_C: float = 28.0,
+        nelson_RH: float = 0.20,
+        nelson_hour: float = 14.0,
     ) -> None:
         self.orchestrator     = orchestrator
         self.ground_truth     = ground_truth
@@ -333,6 +343,11 @@ class CycleRunner:
         self.resolution_m     = resolution_m
         self.obs_source       = obs_source or SimulatedObserver(ground_truth)
         self.evaluator        = CounterfactualEvaluator(self.obs_source, orchestrator.gp)
+        self.bimodal_alpha    = bimodal_alpha
+        self.bimodal_beta     = bimodal_beta
+        self.nelson_T_C       = nelson_T_C
+        self.nelson_RH        = nelson_RH
+        self.nelson_hour      = nelson_hour
 
         self._pending_observations: list[DroneObservation] = []
 
@@ -365,6 +380,18 @@ class CycleRunner:
         shape = self.orchestrator.terrain.shape
         rng   = np.random.default_rng(cycle_seed)
 
+        # Push Nelson FMC prior mean before GP prediction so the GP fits
+        # residuals from the physics model rather than raw values.
+        lat = float(self.orchestrator.terrain.origin[0])
+        nelson_field = nelson_fmc_field(
+            self.orchestrator.terrain,
+            T_C=self.nelson_T_C,
+            RH=self.nelson_RH,
+            hour_of_day=self.nelson_hour,
+            latitude_deg=lat,
+        )
+        self.orchestrator.gp.set_nelson_mean(nelson_field)
+
         gp_prior = self.orchestrator.gp.predict(shape)
 
         ensemble = self.fire_engine.run(
@@ -382,6 +409,8 @@ class CycleRunner:
             ensemble, gp_prior,
             resolution_m=self.resolution_m,
             horizon_minutes=self.horizon_min,
+            bimodal_alpha=self.bimodal_alpha,
+            bimodal_beta=self.bimodal_beta,
         )
 
         selection_results: dict[str, SelectionResult] = {}
@@ -705,6 +734,19 @@ class SimulationRunner:
         observations = self.obs_buffer.flush_thinned()
 
         fire_state = self.truth.fire.fire_state  # current burn mask (float32)
+
+        # Update Nelson FMC prior mean for current time of day.
+        # Simulation clock starts at 06:00 local solar time by convention.
+        hour_of_day = (6.0 + self.current_time / 3600.0) % 24.0
+        lat = float(self.terrain.origin[0])
+        nelson_field = nelson_fmc_field(
+            self.terrain,
+            T_C=28.0,
+            RH=0.20,
+            hour_of_day=hour_of_day,
+            latitude_deg=lat,
+        )
+        self.orchestrator.gp.set_nelson_mean(nelson_field)
 
         mission_queue, cycle_report = self.orchestrator.run_cycle(
             fire_state=fire_state,

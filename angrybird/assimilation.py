@@ -27,6 +27,9 @@ from .config import (
     ENKF_OUTLIER_THRESHOLD,
     GP_CORRELATION_LENGTH_FMC_M,
     GRID_RESOLUTION_M,
+    OBS_FMC_SIGMA,
+    OBS_WIND_DIR_SIGMA,
+    OBS_WIND_SPEED_SIGMA,
     REPLAN_VARIANCE_REDUCTION_THRESHOLD,
     REPLAN_WIND_SHIFT_THRESHOLD_DEG,
 )
@@ -47,13 +50,28 @@ def thin_drone_observations(
     resolution_m: float = GRID_RESOLUTION_M,
 ) -> list[DroneObservation]:
     """
-    Kept for backward compatibility — delegates to aggregate_drone_observations.
+    Greedy thinning: keep at most one observation per min_spacing_m radius.
+
+    Observations are sorted by fmc_sigma ascending so the lowest-noise
+    observation wins when two are too close together.
     """
-    return aggregate_drone_observations(
-        observations,
-        spacing_m=GP_CORRELATION_LENGTH_FMC_M,   # full correlation length
-        resolution_m=resolution_m,
-    )
+    if not observations:
+        return []
+
+    min_cells_sq = (min_spacing_m / resolution_m) ** 2
+    sorted_obs = sorted(observations, key=lambda o: o.fmc_sigma)
+    kept: list[DroneObservation] = []
+
+    for obs in sorted_obs:
+        r, c = obs.location
+        too_close = any(
+            (r - kr) ** 2 + (c - kc) ** 2 < min_cells_sq
+            for kr, kc in (k.location for k in kept)
+        )
+        if not too_close:
+            kept.append(obs)
+
+    return kept
 
 
 def aggregate_drone_observations(
@@ -114,7 +132,10 @@ def aggregate_drone_observations(
         fmc_weights  = np.array([1.0 / (o.fmc_sigma ** 2) for o in group])
         fmc_wsum     = fmc_weights.sum()
         fmc_agg      = float(np.dot(fmc_weights, [o.fmc for o in group]) / fmc_wsum)
-        sigma_fmc    = float(1.0 / np.sqrt(fmc_wsum))
+        # Floor at half the individual sensor sigma — prevents averaging many
+        # readings from collapsing sigma to near-zero and over-constraining the GP
+        # (which drives info_field.w → 0 everywhere after the first cycle).
+        sigma_fmc    = max(float(1.0 / np.sqrt(fmc_wsum)), OBS_FMC_SIGMA / 2.0)
 
         # Centroid location (rounded to nearest cell)
         r_agg = int(round(float(np.mean([o.location[0] for o in group]))))
@@ -129,7 +150,7 @@ def aggregate_drone_observations(
             ws_weights = np.array([1.0 / (o.wind_speed_sigma ** 2) for o in ws_group])
             ws_wsum    = ws_weights.sum()
             ws_agg     = float(np.dot(ws_weights, [o.wind_speed for o in ws_group]) / ws_wsum)
-            sigma_ws   = float(1.0 / np.sqrt(ws_wsum))
+            sigma_ws   = max(float(1.0 / np.sqrt(ws_wsum)), OBS_WIND_SPEED_SIGMA / 2.0)
         else:
             ws_agg   = None
             sigma_ws = None
@@ -144,7 +165,7 @@ def aggregate_drone_observations(
             sin_mean   = float(np.dot(wd_weights, np.sin(dirs_rad)) / wd_wsum)
             cos_mean   = float(np.dot(wd_weights, np.cos(dirs_rad)) / wd_wsum)
             wd_agg     = float(np.rad2deg(np.arctan2(sin_mean, cos_mean)) % 360.0)
-            sigma_wd   = float(1.0 / np.sqrt(wd_wsum))
+            sigma_wd   = max(float(1.0 / np.sqrt(wd_wsum)), OBS_WIND_DIR_SIGMA / 2.0)
         else:
             wd_agg   = None
             sigma_wd = None
