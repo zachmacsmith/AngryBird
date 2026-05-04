@@ -23,13 +23,6 @@ class TerrainData:
     resolution_m: float                                    # meters per cell
     origin_latlon: Optional[Tuple[float, float]] = None   # (lat, lon) of NW corner
 
-    @property
-    def origin(self):
-        if self.origin_latlon is not None:
-            return self.origin_latlon
-
-        return (37.5, -119.5)
-
 @dataclass(frozen=True)
 class GPPrior:
     fmc_mean: np.ndarray              # float32[rows, cols]
