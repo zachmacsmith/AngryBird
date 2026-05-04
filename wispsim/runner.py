@@ -133,12 +133,13 @@ class SimulationConfig:
     n_raws: int = 1
     raws_locations: list = field(default_factory=list)
     enable_mesh_network: bool = True
-    mesh_range_m: float = 1200.0
-    mesh_max_link_age_s: float = 30.0
-    mesh_min_link_quality: float = 0.20
+
+    mesh_range_m: float = 2000.0
+    mesh_max_link_age_s: float = 60.0
+    mesh_min_link_quality: float = 0.10
     mesh_ping_interval_s: float = 10.0
-    mesh_packets_per_tick: int = 3
-    mesh_packet_loss_probability: float = 0.02
+    mesh_packets_per_tick: int = 10
+    mesh_packet_loss_probability: float = 0.01
 
 # ---------------------------------------------------------------------------
 # LiveEstimator
@@ -657,6 +658,7 @@ class SimulationRunner:
                 ping_interval_s=config.mesh_ping_interval_s,
                 max_packets_per_drone_per_tick=config.mesh_packets_per_tick,
                 background_packet_loss_probability=config.mesh_packet_loss_probability,
+                max_packet_age_s=300.0,
             ),
             rng=np.random.default_rng(777),
         )

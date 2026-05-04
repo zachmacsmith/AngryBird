@@ -152,6 +152,8 @@ class MeshNetworkConfig:
     # Link-quality smoothing. Higher = trust old value more.
     quality_smoothing_alpha: float = 0.70
 
+    max_packet_age_s: float = 300.0
+
     # Optional relay support. Keep disabled if relay is not part of the core design.
     relay_id: Optional[str] = None
     relay_range_m: Optional[float] = None
@@ -342,6 +344,7 @@ class PingMeshNetwork:
             self.last_connected_drones.add(drone_id)
 
             delivered_packet_ids: set[str] = set()
+            self._drop_stale_packets(drone_id, current_time)
             candidates = self.buffers[drone_id].get_send_candidates(
                 self.config.max_packets_per_drone_per_tick
             )
@@ -654,6 +657,23 @@ class PingMeshNetwork:
 
     def get_connected_drones(self) -> set[str]:
         return set(self.last_connected_drones)
+
+    def _drop_stale_packets(self, drone_id: str, current_time: float) -> None:
+        if drone_id not in self.buffers:
+            return
+
+        fresh_packets = []
+
+        for i in range(len(self.buffers[drone_id].packets)):
+            packet = self.buffers[drone_id].packets[i]
+            age_s = current_time - packet.created_time
+
+            if packet.priority == 1:
+                fresh_packets.append(packet)
+            elif age_s <= self.config.max_packet_age_s:
+                fresh_packets.append(packet)
+
+        self.buffers[drone_id].packets = fresh_packets
 
 
 def assign_packet_priority(observations: list[DroneObservation]) -> int:
