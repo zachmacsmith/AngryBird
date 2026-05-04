@@ -45,9 +45,13 @@ def _canopy_arrays(
         cbd[mask] = CANOPY_CBD_KGM3[fid]
         cc[mask]  = CANOPY_COVER_FRACTION[fid]
     j = rng.uniform(1.0 - jitter, 1.0 + jitter, fuel_model.shape).astype(np.float32)
-    return (np.clip(cbh * j, 0.0, None),
-            np.clip(cbd * j, 0.0, None),
-            np.clip(cc  * j, 0.0, 1.0))
+    cbh = np.clip(cbh * j, 0.0, None)
+    cbd = np.clip(cbd * j, 0.0, None)
+    cc = np.clip(cc * j, 0.0, 1.0)
+
+    canopy_height = np.where(cc > 0.0, cbh + 8.0, 0.0).astype(np.float32)
+
+    return cbh.astype(np.float32), cbd.astype(np.float32), cc.astype(np.float32), canopy_height
 
 
 # ---------------------------------------------------------------------------
@@ -75,11 +79,19 @@ def _hilly_terrain(rows: int = 200, cols: int = 200,
     fuel = np.where(slope > 10, 3,
            np.where(elevation < 110, 7, 5)).astype(np.int8)
 
-    cbh, cbd, cc = _canopy_arrays(fuel, rng)
+    cbh, cbd, cc, ch = _canopy_arrays(fuel, rng)
     return TerrainData(
-        elevation=elevation, slope=slope, aspect=aspect, fuel_model=fuel,
-        resolution_m=resolution_m, origin=(37.5, -119.5), shape=(rows, cols),
-        canopy_base_height=cbh, canopy_bulk_density=cbd, canopy_cover=cc,
+        elevation=elevation,
+        slope=slope,
+        aspect=aspect,
+        fuel_model=fuel,
+        canopy_cover=cc,
+        canopy_height=ch,
+        canopy_base_height=cbh,
+        canopy_bulk_density=cbd,
+        shape=(rows, cols),
+        resolution_m=resolution_m,
+        origin_latlon=(37.5, -119.5),
     )
 
 
@@ -92,11 +104,19 @@ def _flat_terrain(rows: int = 200, cols: int = 200,
     aspect = np.full((rows, cols), 180.0, dtype=np.float32)
     fuel   = np.full((rows, cols), 3, dtype=np.int8)
 
-    cbh, cbd, cc = _canopy_arrays(fuel, rng)
+    cbh, cbd, cc, ch = _canopy_arrays(fuel, rng)
     return TerrainData(
-        elevation=elevation, slope=slope, aspect=aspect, fuel_model=fuel,
-        resolution_m=resolution_m, origin=(37.5, -119.5), shape=(rows, cols),
-        canopy_base_height=cbh, canopy_bulk_density=cbd, canopy_cover=cc,
+        elevation=elevation,
+        slope=slope,
+        aspect=aspect,
+        fuel_model=fuel,
+        canopy_cover=cc,
+        canopy_height=ch,
+        canopy_base_height=cbh,
+        canopy_bulk_density=cbd,
+        shape=(rows, cols),
+        resolution_m=resolution_m,
+        origin_latlon=(37.5, -119.5),
     )
 
 
@@ -126,13 +146,22 @@ def _timber_terrain(rows: int = 200, cols: int = 200,
 
     # Deliberately lower CBH for a narrow crown fire initiation margin:
     # reduce proxy CBH by 30% so FMC perturbation determines whether crown fire triggers
-    cbh_raw, cbd, cc = _canopy_arrays(fuel, rng, jitter=0.05)
-    cbh = (cbh_raw * 0.70).astype(np.float32)   # lower CBH → lower I_crit
+    cbh_raw, cbd, cc, ch = _canopy_arrays(fuel, rng, jitter=0.05)
+    cbh = (cbh_raw * 0.70).astype(np.float32)
+    ch = np.where(cc > 0.0, cbh + 8.0, 0.0).astype(np.float32)
 
     return TerrainData(
-        elevation=elevation, slope=slope, aspect=aspect, fuel_model=fuel,
-        resolution_m=resolution_m, origin=(37.5, -119.5), shape=(rows, cols),
-        canopy_base_height=cbh, canopy_bulk_density=cbd, canopy_cover=cc,
+        elevation=elevation,
+        slope=slope,
+        aspect=aspect,
+        fuel_model=fuel,
+        canopy_cover=cc,
+        canopy_height=ch,
+        canopy_base_height=cbh,
+        canopy_bulk_density=cbd,
+        shape=(rows, cols),
+        resolution_m=resolution_m,
+        origin_latlon=(37.5, -119.5),
     )
 
 

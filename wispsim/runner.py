@@ -98,6 +98,11 @@ from angrybird.observations import (
     VariableType,
 )
 from angrybird.raws import RAWSObserver, RAWSStation, place_raws_stations
+from .network import (
+    MeshNetworkConfig,
+    PingMeshNetwork,
+    assign_packet_priority,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -124,7 +129,13 @@ class SimulationConfig:
     # RAWS stations — 1 randomly placed by default; pass raws_locations to fix positions
     n_raws: int = 1
     raws_locations: list = field(default_factory=list)
-
+    enable_mesh_network: bool = True
+    mesh_range_m: float = 1200.0
+    mesh_max_link_age_s: float = 30.0
+    mesh_min_link_quality: float = 0.20
+    mesh_ping_interval_s: float = 10.0
+    mesh_packets_per_tick: int = 3
+    mesh_packet_loss_probability: float = 0.02
 
 # ---------------------------------------------------------------------------
 # LiveEstimator
@@ -406,7 +417,10 @@ class CycleRunner:
 
         # Push Nelson FMC prior mean before GP prediction so the GP fits
         # residuals from the physics model rather than raw values.
-        lat = float(self.orchestrator.terrain.origin[0])
+        if self.orchestrator.terrain.origin_latlon is not None:
+            lat = float(self.orchestrator.terrain.origin_latlon[0])
+        else:
+            lat = 37.5
         nelson_field = nelson_fmc_field(
             self.orchestrator.terrain,
             T_C=self.nelson_T_C,
@@ -625,6 +639,25 @@ class SimulationRunner:
             for i in range(config.n_drones)
         ]
 
+        drone_ids = []
+
+        for i in range(len(self.drones)):
+            drone_ids.append(self.drones[i].drone_id)
+
+        self.network = PingMeshNetwork(
+            ground_station_position=base_pos.copy(),
+            drone_ids=drone_ids,
+            config=MeshNetworkConfig(
+                mesh_range_m=config.mesh_range_m,
+                max_link_age_s=config.mesh_max_link_age_s,
+                min_link_quality=config.mesh_min_link_quality,
+                ping_interval_s=config.mesh_ping_interval_s,
+                max_packets_per_drone_per_tick=config.mesh_packets_per_tick,
+                background_packet_loss_probability=config.mesh_packet_loss_probability,
+            ),
+            rng=np.random.default_rng(777),
+        )
+
         # Build RAWS stations and seed the GP from their initial observations.
         # The provider is a SimulatedObserver with lower noise than drone sensors
         # (fixed ground station quality).  In production, swap the provider for a
@@ -755,8 +788,6 @@ class SimulationRunner:
                 self.truth.fmc,
             )
 
-            # 3. Move drones + collect observations
-            new_obs_this_step: list[DroneObservation] = []
             for drone in self.drones:
                 move_drone(drone, self.config.dt)
                 self._refuel_if_home(drone)
@@ -774,13 +805,33 @@ class SimulationRunner:
                         fire_arrival_times=self.truth.fire.arrival_times,
                         rng=rng,
                     )
-                    self.obs_buffer.add(obs)
-                    new_obs_this_step.extend(obs)
 
-            # 4. Feed new observations to the live estimator
-            #    (GP dirty-flag means refit is deferred to next predict() call)
-            if new_obs_this_step:
-                self._live_est.add_observations(new_obs_this_step)
+                    if self.config.enable_mesh_network:
+                        self.network.buffer_observations(
+                            drone_id=drone.drone_id,
+                            current_time=self.current_time,
+                            observations=obs,
+                            priority=assign_packet_priority(obs),
+                        )
+                    else:
+                        self.obs_buffer.add(obs)
+                        self._live_est.add_observations(obs)
+
+            if self.config.enable_mesh_network:
+                drone_positions = {}
+
+                for i in range(len(self.drones)):
+                    drone = self.drones[i]
+                    drone_positions[drone.drone_id] = drone.position
+
+                received_obs_this_step = self.network.step(
+                    drone_positions=drone_positions,
+                    current_time=self.current_time,
+                )
+
+                if received_obs_this_step:
+                    self.obs_buffer.add(received_obs_this_step)
+                    self._live_est.add_observations(received_obs_this_step)
 
             # 5. WISP cycle when due
             if (self.current_time - self._last_cycle_time
@@ -823,6 +874,11 @@ class SimulationRunner:
             len(self.cycle_reports),
             self.renderer._frame_count,
         )
+
+        if self.config.enable_mesh_network:
+            logger.info("Mesh network metrics: %s", self.network.get_metrics())
+            logger.info("Final drone buffer sizes: %s", self.network.get_buffer_sizes())
+
         return self.cycle_reports
 
     # ------------------------------------------------------------------
@@ -842,7 +898,10 @@ class SimulationRunner:
         # Update Nelson FMC prior mean for current time of day.
         # Simulation clock starts at 06:00 local solar time by convention.
         hour_of_day = (6.0 + self.current_time / 3600.0) % 24.0
-        lat = float(self.terrain.origin[0])
+        if self.terrain.origin_latlon is not None:
+            lat = float(self.terrain.origin_latlon[0])
+        else:
+            lat = 37.5
         nelson_field = nelson_fmc_field(
             self.terrain,
             T_C=NELSON_DEFAULT_T_C,

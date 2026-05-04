@@ -60,7 +60,16 @@ def make_gp(terrain: TerrainData) -> tuple[IGNISGPPrior, ObservationStore]:
         ObservationType.WIND_SPEED:     TAU_WIND_SPEED_S,
         ObservationType.WIND_DIRECTION: TAU_WIND_DIR_S,
     }
-    obs_store = ObservationStore(decay_config)
+    try:
+        obs_store = ObservationStore(decay_config)
+    except TypeError:
+        obs_store = ObservationStore()
+
+        if not hasattr(obs_store, "_decay_config"):
+            obs_store._decay_config = decay_config
+        else:
+            obs_store._decay_config = decay_config
+
     gp = IGNISGPPrior(obs_store, terrain=terrain, resolution_m=terrain.resolution_m)
     return gp, obs_store
 
