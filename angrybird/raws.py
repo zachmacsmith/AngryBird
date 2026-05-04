@@ -7,7 +7,8 @@ Designed for easy production wire-in:
                                                fmc_sigma=RAWS_FMC_SIGMA, ...)
     Production  → provider = <your real-time telemetry client>
     Both        → obs = RAWSObserver(stations, provider).observe_all()
-                  gp.add_raws(...)   # identical call either way
+                  # Convert to RAWSObservation objects and add to ObservationStore
+                  obs_store.add_raws(station_id, raws_obs_list)
 
 RAWSDataProvider satisfies the same Protocol as ObservationSource so any
 existing observer (SimulatedObserver, real API client) can be dropped in
@@ -69,12 +70,9 @@ class RAWSObserver:
 
         observer = RAWSObserver(stations, provider)
         obs = observer.observe_all()   # list[DroneObservation], one per station
-        gp.add_raws(
-            [o.location for o in obs],
-            [o.fmc for o in obs],
-            [o.wind_speed for o in obs],
-            [o.wind_dir for o in obs],
-        )
+        for station, o in zip(observer.stations, obs):
+            raws_obs = [RAWSObservation(location=o.location, ...), ...]
+            obs_store.add_raws(station.station_id, raws_obs)
     """
 
     def __init__(

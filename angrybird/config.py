@@ -24,6 +24,109 @@ GP_NOISE_FMC: float = 0.05                    # RAWS FMC observation noise std d
 GP_NOISE_WIND_SPEED: float = 1.0              # RAWS wind speed noise std dev (m/s)
 GP_NOISE_WIND_DIR: float = 10.0               # RAWS wind dir noise std dev (degrees)
 
+# Uninformed prior means — used when no physics model (Nelson/NWP) has been set
+# and the GP has no observations to fit.  Also used as neutral-ensemble fill values.
+GP_DEFAULT_FMC_MEAN: float = 0.10             # fraction
+GP_DEFAULT_WIND_SPEED_MEAN: float = 5.0       # m/s
+GP_DEFAULT_WIND_DIR_MEAN: float = 270.0       # degrees (westerly)
+
+# Prior variances — reflect full uninformed uncertainty before any observations.
+GP_DEFAULT_FMC_VARIANCE: float = 0.04         # std ≈ 0.20 fraction
+GP_DEFAULT_WIND_SPEED_VARIANCE: float = 4.0   # std ≈ 2 m/s
+GP_DEFAULT_WIND_DIR_VARIANCE: float = 900.0   # std ≈ 30°
+
+# ---------------------------------------------------------------------------
+# Physical bounds (applied as clipping limits throughout the codebase)
+# ---------------------------------------------------------------------------
+
+FMC_MIN_FRACTION: float = 0.02    # minimum plausible dead fuel moisture
+FMC_MAX_FRACTION: float = 0.40    # maximum plausible dead fuel moisture
+WIND_SPEED_MIN_MS: float = 0.5    # minimum plausible wind speed (calm)
+WIND_SPEED_MAX_MS: float = 25.0   # maximum plausible wind speed (near-hurricane)
+
+# ---------------------------------------------------------------------------
+# Ground truth generation parameters
+# ---------------------------------------------------------------------------
+
+TPI_FILTER_SIZE_CELLS: int = 20               # uniform filter size for Terrain Position Index
+WIND_TPI_MODULATION: float = 0.3              # fractional WS change per unit normalized TPI
+WIND_TURBULENCE_SIGMA_MS: float = 0.3         # small-scale wind speed turbulence std dev (m/s)
+WIND_TURBULENCE_SIGMA_DEG: float = 3.0        # small-scale wind direction turbulence std dev (°)
+WIND_DRIFT_RATE_DEG_PER_HR: float = 5.0       # synoptic wind drift rate (° per hour)
+
+FMC_ASPECT_WEIGHT: float = 0.03               # south-facing aspect drying effect on FMC
+FMC_ELEVATION_WEIGHT: float = 0.02            # elevation drying effect on FMC
+FMC_TPI_WEIGHT: float = 0.01                  # topographic position effect on FMC
+FMC_CANOPY_WEIGHT: float = 0.02               # canopy shading effect on FMC
+FMC_NOISE_SCALE: float = 0.015                # amplitude of spatially correlated FMC noise
+FMC_TERRAIN_CORR_LENGTH_M: float = 500.0      # correlation length for FMC terrain noise
+
+WIND_SPEED_TERRAIN_CORR_LENGTH_M: float = 1000.0   # correlation length for WS terrain noise
+WIND_SPEED_TERRAIN_NOISE_SCALE: float = 1.0         # amplitude of spatially correlated WS noise
+WIND_DIR_TERRAIN_CORR_LENGTH_M: float = 2000.0     # correlation length for WD terrain noise
+WIND_DIR_TERRAIN_NOISE_SCALE_DEG: float = 15.0     # amplitude of spatially correlated WD noise (°)
+
+# ---------------------------------------------------------------------------
+# Information field thresholds
+# ---------------------------------------------------------------------------
+
+BIMODAL_UNBURNED_FACTOR: float = 0.9          # arrival < factor*sentinel → treated as burned
+FIRE_PERIMETER_LO_PROB: float = 0.1           # lower burn probability bound for active perimeter
+FIRE_PERIMETER_HI_PROB: float = 0.9           # upper burn probability bound for active perimeter
+BURNED_PROBABILITY_THRESHOLD: float = 0.95    # above this → cell fully burned (zero info value)
+
+# ---------------------------------------------------------------------------
+# Drone simulator
+# ---------------------------------------------------------------------------
+
+CAMERA_FOOTPRINT_M: float = 100.0             # FMC observation footprint radius (metres)
+OBS_FIRE_DEGRADATION_FACTOR: float = 3.0      # sensor sigma multiplier near active fire front
+CAMERA_FOOTPRINT_EDGE_NOISE_FACTOR: float = 0.5  # edge noise relative to centre noise
+
+# ---------------------------------------------------------------------------
+# Observation pipeline
+# ---------------------------------------------------------------------------
+
+OBSERVATION_THINNING_SPACING_M: float = 200.0  # minimum spacing for spatial thinning / buffering
+
+# ---------------------------------------------------------------------------
+# Simulation defaults
+# ---------------------------------------------------------------------------
+
+DRONE_ENDURANCE_S: float = 1800.0             # default drone flight endurance per sortie (30 min)
+SIM_TOTAL_TIME_S: float = 21600.0             # default total simulation duration (6 hours)
+CYCLE_INTERVAL_S: float = CYCLE_INTERVAL_MIN * 60.0  # IGNIS cycle interval in seconds
+
+# ---------------------------------------------------------------------------
+# Nelson FMC model parameters
+# ---------------------------------------------------------------------------
+
+NELSON_EMC_MIN: float = 0.01                  # lower clip for Fosberg EMC output
+NELSON_EMC_MAX: float = 0.50                  # upper clip for Fosberg EMC output
+NELSON_LAPSE_RATE_C_PER_M: float = 0.0065    # temperature lapse rate with elevation (°C/m)
+NELSON_ELEV_MOISTURE_FACTOR: float = 0.0001  # elevation moisture correction scale
+NELSON_ELEV_FACTOR_MIN: float = 0.85          # lower clip for elevation moisture factor
+NELSON_ELEV_FACTOR_MAX: float = 1.20          # upper clip for elevation moisture factor
+NELSON_SOLAR_WEIGHT: float = 0.25             # solar radiation drying correction weight
+NELSON_CANOPY_ATTENUATION: float = 2.5        # Beer-Lambert canopy attenuation exponent
+NELSON_DEFAULT_T_C: float = 28.0              # default ambient temperature for Nelson model (°C)
+NELSON_DEFAULT_RH: float = 0.20               # default relative humidity for Nelson model
+
+# ---------------------------------------------------------------------------
+# QUBO solver parameters
+# ---------------------------------------------------------------------------
+
+QUBO_LAMBDA_INFLATION: float = 1.5           # λ inflation for cardinality constraint robustness
+QUBO_SA_NUM_READS: int = 1000                # simulated annealing number of reads
+QUBO_DWAVE_NUM_READS: int = 100              # D-Wave QPU number of reads
+
+# ---------------------------------------------------------------------------
+# Fire front selector thresholds
+# ---------------------------------------------------------------------------
+
+FIRE_FRONT_LO_PROB: float = 0.2              # lower burn probability bound for fire front selection
+FIRE_FRONT_HI_PROB: float = 0.8              # upper burn probability bound for fire front selection
+
 # ---------------------------------------------------------------------------
 # Drone / sensor parameters
 # ---------------------------------------------------------------------------

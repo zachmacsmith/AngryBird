@@ -23,7 +23,19 @@ from typing import Optional
 
 import numpy as np
 
-from .config import CANOPY_COVER_FRACTION
+from .config import (
+    CANOPY_COVER_FRACTION,
+    FMC_MAX_FRACTION,
+    FMC_MIN_FRACTION,
+    NELSON_CANOPY_ATTENUATION,
+    NELSON_ELEV_FACTOR_MAX,
+    NELSON_ELEV_FACTOR_MIN,
+    NELSON_ELEV_MOISTURE_FACTOR,
+    NELSON_EMC_MAX,
+    NELSON_EMC_MIN,
+    NELSON_LAPSE_RATE_C_PER_M,
+    NELSON_SOLAR_WEIGHT,
+)
 from .types import TerrainData
 
 
@@ -47,7 +59,7 @@ def nelson_emc(T_C: "float | np.ndarray", RH: "float | np.ndarray") -> np.ndarra
             21.0606 + 0.005565 * H ** 2 - 0.00035 * H * T - 0.00199 * T,
         ),
     )
-    return np.clip(emc_pct / 100.0, 0.01, 0.50).astype(np.float32)
+    return np.clip(emc_pct / 100.0, NELSON_EMC_MIN, NELSON_EMC_MAX).astype(np.float32)
 
 
 def solar_correction_factor(
@@ -117,7 +129,7 @@ def solar_correction_factor(
 
     # Canopy attenuation: dense canopy blocks most direct radiation (Beer-Lambert proxy)
     cc = np.asarray(canopy_cover, dtype=np.float64)
-    transmittance = np.exp(-2.5 * cc)   # T≈1 at cc=0, T≈0.08 at cc=1
+    transmittance = np.exp(-NELSON_CANOPY_ATTENUATION * cc)   # T≈1 at cc=0, T≈0.08 at cc=1
 
     return (cos_inc * transmittance).astype(np.float32)
 
@@ -153,22 +165,22 @@ def nelson_fmc_field(
         ref_elevation = float(terrain.elevation.mean())
 
     # Elevation lapse: -0.65 °C / 100 m → higher sites are cooler → higher EMC
-    T_local = T_arr - 0.0065 * (terrain.elevation.astype(np.float64) - ref_elevation)
+    T_local = T_arr - NELSON_LAPSE_RATE_C_PER_M * (terrain.elevation.astype(np.float64) - ref_elevation)
 
     # Base EMC from Fosberg three-segment equation
     emc = nelson_emc(T_local, RH_arr).astype(np.float64)
 
     # Elevation moisture correction: simple multiplicative boost per doc spec
-    elev_factor = 1.0 + 0.0001 * (terrain.elevation.astype(np.float64) - ref_elevation)
-    emc = emc * np.clip(elev_factor, 0.85, 1.20)
+    elev_factor = 1.0 + NELSON_ELEV_MOISTURE_FACTOR * (terrain.elevation.astype(np.float64) - ref_elevation)
+    emc = emc * np.clip(elev_factor, NELSON_ELEV_FACTOR_MIN, NELSON_ELEV_FACTOR_MAX)
 
     # Solar radiation drying correction
     cc = (terrain.canopy_cover if terrain.canopy_cover is not None
           else _canopy_cover_from_fuel(terrain.fuel_model))
     solar = solar_correction_factor(terrain.slope, terrain.aspect, cc, hour_of_day, latitude_deg)
-    emc = emc * (1.0 - 0.25 * solar.astype(np.float64))
+    emc = emc * (1.0 - NELSON_SOLAR_WEIGHT * solar.astype(np.float64))
 
-    return np.clip(emc, 0.02, 0.40).astype(np.float32)
+    return np.clip(emc, FMC_MIN_FRACTION, FMC_MAX_FRACTION).astype(np.float32)
 
 
 def _canopy_cover_from_fuel(fuel_model: np.ndarray) -> np.ndarray:

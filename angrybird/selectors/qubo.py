@@ -23,9 +23,13 @@ from typing import Optional
 import numpy as np
 
 from ..config import (
+    BURNED_PROBABILITY_THRESHOLD,
     GRID_RESOLUTION_M,
     MIN_SELECTION_SPACING_M,
+    QUBO_DWAVE_NUM_READS,
+    QUBO_LAMBDA_INFLATION,
     QUBO_MAX_CANDIDATES,
+    QUBO_SA_NUM_READS,
 )
 from ..gp import IGNISGPPrior
 from ..types import EnsembleResult, InformationField, SelectionResult
@@ -135,7 +139,7 @@ def build_qubo(
     # Assemble QUBO (upper triangular, minimisation convention)
     lam = float(np.max(np.abs(w_cand))) if w_cand.max() > 0 else 1.0
     # Slightly inflate λ to make cardinality constraint robust
-    lam *= 1.5
+    lam *= QUBO_LAMBDA_INFLATION
 
     Q = np.zeros((M, M), dtype=np.float64)
     for i in range(M):
@@ -187,7 +191,7 @@ def solve_qubo(
     Q: np.ndarray,
     w_cand: np.ndarray,
     k: int,
-    n_sa_reads: int = 1000,
+    n_sa_reads: int = QUBO_SA_NUM_READS,
 ) -> tuple[list[int], str, float]:
     """
     Try the solver fallback chain. Returns (selected_indices, solver_name, energy).
@@ -203,7 +207,7 @@ def solve_qubo(
     try:
         from dwave.system import DWaveSampler, EmbeddingComposite  # type: ignore
         sampler = EmbeddingComposite(DWaveSampler())
-        response = sampler.sample_qubo(Q_dict, num_reads=100, label="ignis")
+        response = sampler.sample_qubo(Q_dict, num_reads=QUBO_DWAVE_NUM_READS, label="ignis")
         best = response.first
         selected = _repair_to_k(dict(best.sample), k, w_cand)
         logger.info("QUBO solved on D-Wave QPU (energy=%.4f, chain_breaks=%s)",

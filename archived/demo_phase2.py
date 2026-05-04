@@ -22,11 +22,23 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from angrybird.config import (
     ENSEMBLE_SIZE,
     GP_CORRELATION_LENGTH_FMC_M,
+    GP_NOISE_FMC,
+    GP_NOISE_WIND_DIR,
+    GP_NOISE_WIND_SPEED,
     GRID_RESOLUTION_M,
     SIMULATION_HORIZON_MIN,
+    TAU_FMC_S,
+    TAU_WIND_DIR_S,
+    TAU_WIND_SPEED_S,
 )
 from angrybird.gp import IGNISGPPrior, draw_gp_scaled_field
 from angrybird.information import compute_information_field
+from angrybird.observations import (
+    ObservationSource,
+    ObservationStore,
+    ObservationType,
+    RAWSObservation,
+)
 from angrybird.types import EnsembleResult
 from angrybird.visualization import plot_phase2_summary, save_or_show
 
@@ -61,9 +73,35 @@ DEMO_TARGETS = [(40, 20), (70, 35), (55, 60), (25, 45), (85, 50)]
 # ---------------------------------------------------------------------------
 
 def build_gp_prior() -> IGNISGPPrior:
-    gp = IGNISGPPrior(terrain=None, resolution_m=RES_M)
-    gp.add_raws(RAWS_LOCS, RAWS_FMC, RAWS_WS, RAWS_WD)
-    return gp
+    decay_config = {
+        ObservationType.FMC:            TAU_FMC_S,
+        ObservationType.WIND_SPEED:     TAU_WIND_SPEED_S,
+        ObservationType.WIND_DIRECTION: TAU_WIND_DIR_S,
+    }
+    obs_store = ObservationStore(decay_config)
+    for i, (loc, fmc, ws, wd) in enumerate(
+        zip(RAWS_LOCS, RAWS_FMC, RAWS_WS, RAWS_WD)
+    ):
+        sid = f"RAWS_{i}"
+        station_obs = [
+            RAWSObservation(
+                location=loc, obs_type=ObservationType.FMC,
+                source=ObservationSource.RAWS, value=fmc, sigma=GP_NOISE_FMC,
+                timestamp=0.0, source_id=sid,
+            ),
+            RAWSObservation(
+                location=loc, obs_type=ObservationType.WIND_SPEED,
+                source=ObservationSource.RAWS, value=ws, sigma=GP_NOISE_WIND_SPEED,
+                timestamp=0.0, source_id=sid,
+            ),
+            RAWSObservation(
+                location=loc, obs_type=ObservationType.WIND_DIRECTION,
+                source=ObservationSource.RAWS, value=wd, sigma=GP_NOISE_WIND_DIR,
+                timestamp=0.0, source_id=sid,
+            ),
+        ]
+        obs_store.add_raws(sid, station_obs)
+    return IGNISGPPrior(obs_store, terrain=None, resolution_m=RES_M)
 
 
 # ---------------------------------------------------------------------------

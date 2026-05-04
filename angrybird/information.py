@@ -19,7 +19,11 @@ import numpy as np
 from scipy.ndimage import distance_transform_edt
 
 from .config import (
+    BIMODAL_UNBURNED_FACTOR,
+    BURNED_PROBABILITY_THRESHOLD,
     FIRE_DEGRADATION_RADIUS_M,
+    FIRE_PERIMETER_HI_PROB,
+    FIRE_PERIMETER_LO_PROB,
     GRID_RESOLUTION_M,
     SENSOR_FMC_R2,
     SENSOR_WIND_ACCURACY,
@@ -59,7 +63,7 @@ def detect_bimodality(
         burn_fraction  : float32[rows, cols] — fraction of members that burned
         bimodal_score  : float32[rows, cols] — 0=consensus, 1=50/50 split
     """
-    burns          = member_arrival_times < (max_arrival * 0.9)  # (N, rows, cols)
+    burns          = member_arrival_times < (max_arrival * BIMODAL_UNBURNED_FACTOR)  # (N, rows, cols)
     burn_fraction  = burns.mean(axis=0).astype(np.float32)       # (rows, cols)
     bimodal_score  = (1.0 - 2.0 * np.abs(burn_fraction - 0.5)).astype(np.float32)
     return burn_fraction, bimodal_score
@@ -186,7 +190,7 @@ def compute_observability(
     # Degrade near the ACTIVE FIRE PERIMETER (0.1 < p < 0.9) — not the full burned area.
     # Drones fly ahead of the fire; cells far ahead have full observability.
     # Cells close to where fire is actively burning get reduced accuracy (smoke, turbulence).
-    perimeter_mask = (ensemble.burn_probability > 0.1) & (ensemble.burn_probability < 0.9)
+    perimeter_mask = (ensemble.burn_probability > FIRE_PERIMETER_LO_PROB) & (ensemble.burn_probability < FIRE_PERIMETER_HI_PROB)
     source_mask = ensemble.burn_probability > 0.5   # fallback: use full burned area if no perimeter
     active_mask = perimeter_mask if perimeter_mask.any() else source_mask
     if active_mask.any():
@@ -214,14 +218,17 @@ def compute_information_field(
     exclusion_mask: Optional[np.ndarray] = None,
     bimodal_alpha: float = 0.0,
     bimodal_beta: float = 0.0,
+    fire_state_alpha: float = 0.0,
+    fire_state_burn_prob: Optional[np.ndarray] = None,
 ) -> InformationField:
     """
     Compute the information value w at every grid cell.
 
         w = gp_variance_fmc   * |sensitivity_fmc|   * D_fmc
           + gp_variance_wind  * |sensitivity_wind|  * D_wind
-          + bimodal_alpha     * H_binary(burn_fraction)       [optional]
-          + bimodal_beta      * H_binary(crown_fraction)      [optional]
+          + bimodal_alpha     * H_binary(burn_fraction)            [optional]
+          + bimodal_beta      * H_binary(crown_fraction)           [optional]
+          + fire_state_alpha  * H_binary(fire_state_burn_prob)     [optional]
 
     Args:
         ensemble:              EnsembleResult from fire engine
@@ -233,6 +240,12 @@ def compute_information_field(
         bimodal_alpha:         weight for binary burn-probability entropy (0 = disabled)
         bimodal_beta:          weight for crown fire regime entropy (0 = disabled;
                                requires ensemble.member_fire_types to be set)
+        fire_state_alpha:      weight for fire location uncertainty entropy (0 = disabled).
+                               When > 0, fire_state_burn_prob must be supplied.
+        fire_state_burn_prob:  float32[rows,cols] — P(cell currently burning) derived
+                               from EnsembleFireState at cycle start.  Cells at the
+                               uncertain fire perimeter have high binary entropy and
+                               attract drones to confirm fire position.
 
     Returns:
         InformationField with total w and per-variable breakdowns.
@@ -276,8 +289,15 @@ def compute_information_field(
         crown_frac, _ = detect_regime_split(ensemble.member_fire_types)
         w = (w + bimodal_beta * _binary_entropy(crown_frac)).astype(np.float32)
 
+    # Fire location uncertainty (from EnsembleFireState per-member fronts)
+    # High entropy at cells where members disagree about current fire position.
+    # Drives drones to confirm fire perimeter when location is the key uncertainty.
+    if fire_state_alpha > 0.0 and fire_state_burn_prob is not None:
+        w_fire_state = (fire_state_alpha * _binary_entropy(fire_state_burn_prob)).astype(np.float32)
+        w = (w + w_fire_state).astype(np.float32)
+
     # Cells already burned have zero information value (fire won't spread back)
-    burned = ensemble.burn_probability > 0.95
+    burned = ensemble.burn_probability > BURNED_PROBABILITY_THRESHOLD
     w[burned] = 0.0
     w_fmc[burned] = 0.0
     w_wind[burned] = 0.0

@@ -11,7 +11,7 @@ import time
 
 import numpy as np
 
-from ..config import GRID_RESOLUTION_M, MIN_SELECTION_SPACING_M
+from ..config import FIRE_FRONT_HI_PROB, FIRE_FRONT_LO_PROB, GRID_RESOLUTION_M, MIN_SELECTION_SPACING_M
 from ..gp import IGNISGPPrior
 from ..types import EnsembleResult, InformationField, SelectionResult
 from .base import spacing_mask
@@ -73,8 +73,8 @@ class FireFrontSelector:
 
     def __init__(
         self,
-        lo_thresh: float = 0.2,
-        hi_thresh: float = 0.8,
+        lo_thresh: float = FIRE_FRONT_LO_PROB,
+        hi_thresh: float = FIRE_FRONT_HI_PROB,
         min_spacing_m: float = MIN_SELECTION_SPACING_M,
         resolution_m: float = GRID_RESOLUTION_M,
     ) -> None:

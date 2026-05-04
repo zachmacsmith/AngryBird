@@ -35,6 +35,7 @@ from .config import (
     REPLAN_WIND_SHIFT_THRESHOLD_DEG,
 )
 from .gp import IGNISGPPrior
+from .observations import Observation, ObservationSource, ObservationStore, ObservationType
 from .types import DroneObservation, EnsembleResult, GPPrior
 from .utils import angular_diff_deg, distance_grid, gaspari_cohn
 
@@ -274,9 +275,10 @@ def enkf_update(
 
 def assimilate_observations(
     gp: IGNISGPPrior,
-    ensemble: EnsembleResult,
-    observations: list[DroneObservation],
-    shape: tuple[int, int],
+    obs_store_or_ensemble,  # ObservationStore (new API) or EnsembleResult (old API)
+    ensemble,               # EnsembleResult (new API) or list[DroneObservation] (old API)
+    observations,           # list[DroneObservation] (new API) or tuple[int,int] shape (old API)
+    shape=None,             # tuple[int, int] (new API) or None when old API used
     resolution_m: float = GRID_RESOLUTION_M,
     gp_prior: Optional[GPPrior] = None,
     rng: Optional[np.random.Generator] = None,
@@ -284,7 +286,11 @@ def assimilate_observations(
     inflation_factor: float = ENKF_INFLATION_FACTOR,
 ) -> dict:
     """
-    Full assimilation pipeline: thin → outlier check → GP update → EnKF → replan flags.
+    Full assimilation pipeline: thin → outlier check → store update → GP refit → EnKF → replan flags.
+
+    Supports two calling conventions:
+      New: assimilate_observations(gp, obs_store, ensemble, observations, shape, ...)
+      Old: assimilate_observations(gp, ensemble, observations, shape, ...)
 
     Returns dict:
       'fmc_states'   float32[N, rows, cols] updated FMC member fields
@@ -292,6 +298,23 @@ def assimilate_observations(
       'replan_flags' dict[str, bool]
       'n_obs_used'   int — number of observations after thinning
     """
+    # Detect calling convention by inspecting arg types
+    if isinstance(obs_store_or_ensemble, ObservationStore):
+        obs_store  = obs_store_or_ensemble
+        # ensemble, observations, shape already bound correctly
+        _ensemble    = ensemble
+        _observations = observations
+        _shape       = shape
+    else:
+        # Old API: (gp, ensemble, observations, shape, ...)
+        obs_store    = gp._store
+        _ensemble    = obs_store_or_ensemble
+        _observations = ensemble
+        _shape       = observations  # type: ignore[assignment]
+    ensemble     = _ensemble
+    observations = _observations
+    shape        = _shape
+
     thinned = aggregate_drone_observations(
         observations,
         spacing_m=GP_CORRELATION_LENGTH_FMC_M,
@@ -343,20 +366,46 @@ def assimilate_observations(
             n_outliers, ENKF_OUTLIER_THRESHOLD,
         )
 
-    # GP update: FMC from all thinned cells; wind speed + direction from nadir cells
+    # Store update: convert aggregated DroneObservations to Observation objects
+    # and add them to the ObservationStore. The GP reads from the store on
+    # its next predict() call, so no separate gp.add_observations() is needed.
     fmc_times = [o.timestamp if o.timestamp is not None else 0.0 for o in thinned]
     ws_times  = [o.timestamp if o.timestamp is not None else 0.0 for o in wind_obs]
     wd_times  = [o.timestamp if o.timestamp is not None else 0.0 for o in dir_obs]
-    gp.add_observations(locs, fmc_vals, fmc_sigs,
-                        obs_times=fmc_times,
-                        ws_vals=ws_vals or None,
-                        ws_sigmas=ws_sigs or None,
-                        ws_locs=ws_locs or None,
-                        ws_times=ws_times or None,
-                        wd_vals=wd_vals or None,
-                        wd_sigmas=wd_sigs or None,
-                        wd_locs=wd_locs or None,
-                        wd_times=wd_times or None)
+
+    new_obs: list[Observation] = []
+    for obs, t in zip(thinned, fmc_times):
+        new_obs.append(Observation(
+            location  = obs.location,
+            obs_type  = ObservationType.FMC,
+            source    = ObservationSource.DRONE_MULTISPECTRAL,
+            value     = obs.fmc,
+            sigma     = obs.fmc_sigma,
+            timestamp = t,
+            source_id = obs.drone_id or "drone",
+        ))
+    for obs, t in zip(wind_obs, ws_times):
+        new_obs.append(Observation(
+            location  = obs.location,
+            obs_type  = ObservationType.WIND_SPEED,
+            source    = ObservationSource.DRONE_ANEMOMETER,
+            value     = obs.wind_speed,
+            sigma     = obs.wind_speed_sigma,
+            timestamp = t,
+            source_id = obs.drone_id or "drone",
+        ))
+    for obs, t in zip(dir_obs, wd_times):
+        new_obs.append(Observation(
+            location  = obs.location,
+            obs_type  = ObservationType.WIND_DIRECTION,
+            source    = ObservationSource.DRONE_ANEMOMETER,
+            value     = obs.wind_dir,
+            sigma     = obs.wind_dir_sigma if obs.wind_dir_sigma is not None else 10.0,
+            timestamp = t,
+            source_id = obs.drone_id or "drone",
+        ))
+    if new_obs:
+        obs_store.add_drone_observations(new_obs)
 
     # EnKF updates — separate pass per variable, wind uses its own location subset
     obs_idx    = [r * shape[1] + c for r, c in locs]

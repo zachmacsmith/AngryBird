@@ -37,6 +37,8 @@ from angrybird.types import (
     DroneObservation, CycleReport, InformationField,
 )
 from angrybird.gp import IGNISGPPrior
+from angrybird.observations import ObservationStore, ObservationType
+from angrybird.config import TAU_FMC_S, TAU_WIND_SPEED_S, TAU_WIND_DIR_S
 from angrybird.orchestrator import IGNISOrchestrator
 from angrybird.simulation.ground_truth import generate_ground_truth
 from angrybird.simulation.runner import CycleRunner
@@ -180,6 +182,7 @@ class SimpleFire:
         n_members: int,
         horizon_min: int,
         rng: np.random.Generator,
+        initial_phi: "np.ndarray | None" = None,  # accepted but unused (Huygens engine)
     ) -> EnsembleResult:
         import os
         from concurrent.futures import ThreadPoolExecutor
@@ -272,21 +275,26 @@ def make_fire_states(
 # 4.  GP prior
 # ============================================================
 
-def make_gp(terrain: TerrainData) -> IGNISGPPrior:
+def make_gp(terrain: TerrainData) -> tuple[IGNISGPPrior, ObservationStore]:
     """
-    Return an unfitted IGNISGPPrior.
+    Return an (IGNISGPPrior, ObservationStore) pair backed by the same store.
 
-    No RAWS observations are added up-front so predict() returns the
-    default prior variance (fmc_var=0.04, ws_var=4.0) everywhere —
-    this gives a non-trivial information field from cycle 1.
-    Drone observations accumulate during the simulation.
-
-    RAWS marker positions are kept separately for visualizations.
+    No RAWS observations are added up-front so predict() returns the default
+    prior variance (fmc_var=0.04, ws_var=4.0) everywhere — this gives a
+    non-trivial information field from cycle 1. Drone observations accumulate
+    in the store during the simulation.
 
     On the 10 km domain all production hyperparameters apply as-is:
     FMC correlation length 1.5 km, wind correlation length 5 km.
     """
-    return IGNISGPPrior(terrain=terrain, resolution_m=terrain.resolution_m)
+    decay_config = {
+        ObservationType.FMC:            TAU_FMC_S,
+        ObservationType.WIND_SPEED:     TAU_WIND_SPEED_S,
+        ObservationType.WIND_DIRECTION: TAU_WIND_DIR_S,
+    }
+    obs_store = ObservationStore(decay_config)
+    gp = IGNISGPPrior(obs_store, terrain=terrain, resolution_m=terrain.resolution_m)
+    return gp, obs_store
 
 
 # ============================================================
@@ -328,14 +336,14 @@ def main(n_cycles: int = 6, n_drones: int = 5, n_members: int = 30,
     raws_locs = [(30, 160)]
     staging_area = (rows - 5, cols // 2)
 
-    gp = make_gp(terrain)
+    gp, obs_store = make_gp(terrain)
     log.info("GP prior initialised  (no RAWS — uniform prior variance)")
 
     fire_engine  = SimpleFire()
     fire_states  = make_fire_states((rows, cols), n_cycles)
 
     orchestrator = IGNISOrchestrator(
-        terrain=terrain, gp=gp, fire_engine=fire_engine,
+        terrain=terrain, gp=gp, obs_store=obs_store, fire_engine=fire_engine,
         selector_name="greedy", n_drones=n_drones,
         staging_area=staging_area,
     )

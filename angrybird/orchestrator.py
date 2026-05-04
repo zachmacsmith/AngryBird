@@ -31,6 +31,12 @@ from .config import (
     N_DRONES,
     SIMULATION_HORIZON_MIN,
 )
+from .fire_state import (
+    ConsistencyChecker,
+    EnsembleFireState,
+    FireStateEstimator,
+    particle_filter_fire,
+)
 from .gp import IGNISGPPrior
 from .information import compute_information_field
 from .observations import ObservationStore
@@ -72,6 +78,7 @@ class FireEngineProtocol(Protocol):
         n_members: int,
         horizon_min: int,
         rng: Optional[np.random.Generator] = None,
+        initial_phi: Optional[np.ndarray] = None,
     ) -> EnsembleResult: ...
 
 
@@ -134,8 +141,33 @@ class IGNISOrchestrator:
         self.base_seed        = base_seed
         self.bimodal_alpha    = bimodal_alpha
         self.bimodal_beta     = bimodal_beta
+        self.fire_state_alpha = 0.0   # set > 0 to enable fire location entropy term
         self.cycle_count      = 0
         self._previous_selections: list[tuple[int, int]] = []
+
+        # ── Fire state estimation components ──────────────────────────────
+        # max_arrival sentinel: 2× horizon in seconds (mirrors GPU engine's
+        # 2× horizon_min sentinel, converted to seconds for FireState internals).
+        _max_arrival_s = 2.0 * float(horizon_min) * 60.0
+        self.fire_state_estimator = FireStateEstimator(
+            grid_shape=terrain.shape,
+            dx=resolution_m,
+            max_arrival=_max_arrival_s,
+        )
+        self.ensemble_fire_state = EnsembleFireState(
+            n_members=n_members,
+            grid_shape=terrain.shape,
+            dx=resolution_m,
+            max_arrival=_max_arrival_s,
+        )
+        self.consistency_checker = ConsistencyChecker(
+            disagreement_threshold=0.2,
+            min_observations=5,
+        )
+        # Last simulation time (seconds) at which run_cycle was called.
+        self._last_cycle_time_s: float = 0.0
+        # Last ensemble result — used by ConsistencyChecker next cycle.
+        self._last_ensemble_result: Optional[EnsembleResult] = None
 
     # ------------------------------------------------------------------
     # Main cycle
@@ -177,10 +209,10 @@ class IGNISOrchestrator:
         #    still works (thinned obs will be empty on cycle 1 anyway).
         assim_ensemble = ensemble if ensemble is not None else _neutral_ensemble(shape, self.n_members)
         assim = assimilate_observations(
-            gp=self.gp,
-            obs_store=self.obs_store,
-            ensemble=assim_ensemble,
-            observations=observations,
+            self.gp,
+            self.obs_store,      # obs_store_or_ensemble (new API)
+            assim_ensemble,
+            observations,
             shape=shape,
             resolution_m=self.resolution_m,
             gp_prior=gp_prior_before,
@@ -190,14 +222,73 @@ class IGNISOrchestrator:
         # 3. Updated GP prior (post-assimilation; used for ensemble + info field)
         gp_prior = self.gp.predict(shape)
 
+        # ── Fire state management ─────────────────────────────────────────
+        # Initialise EnsembleFireState on the first cycle from the caller-
+        # supplied burn mask.  Subsequent cycles use per-member carry-forward
+        # or hard-reset from fire observations.
+        if not self.ensemble_fire_state.initialized:
+            self.ensemble_fire_state.initialize_from_fire_state(fire_state)
+
+        # Check for new fire observations and decide: hard reset or continue.
+        initial_phi_for_engine: Optional[np.ndarray] = None
+        fire_obs = self.obs_store.get_fire_detections(
+            since=self._last_cycle_time_s)
+
+        if fire_obs and self._last_ensemble_result is not None:
+            should_reset, disagreement = self.consistency_checker.check(
+                fire_obs, self._last_ensemble_result, start_time)
+
+            if should_reset:
+                arrival_field = self.fire_state_estimator.reconstruct_arrival_time(
+                    fire_obs, start_time, self.terrain, gp_prior)
+                self.ensemble_fire_state.initialize_from_reconstruction(
+                    arrival_field,
+                    self.fire_state_estimator.arrival_uncertainty,
+                    current_time=start_time,
+                )
+                logger.info(
+                    "Cycle %d | fire state HARD RESET | disagreement=%.0f%% | "
+                    "n_obs=%d",
+                    self.cycle_count, disagreement * 100, len(fire_obs),
+                )
+            else:
+                indices, n_eff = particle_filter_fire(
+                    self._last_ensemble_result, fire_obs,
+                    start_time, self.n_members)
+                self.ensemble_fire_state.resample(indices)
+                logger.info(
+                    "Cycle %d | fire state particle filter | "
+                    "disagreement=%.0f%% | N_eff=%.0f",
+                    self.cycle_count, disagreement * 100, n_eff,
+                )
+
+        if self.ensemble_fire_state.initialized:
+            initial_phi_for_engine = self.ensemble_fire_state.get_initial_phi(
+                start_time)
+        # ── End fire state management ─────────────────────────────────────
+
         # 4. Ensemble — use caller-provided or run fire engine
         if ensemble is None:
             ensemble = self.fire_engine.run(
                 self.terrain, gp_prior, fire_state,
                 self.n_members, self.horizon_min, rng,
+                initial_phi=initial_phi_for_engine,
             )
 
+        # Carry forward per-member fire state for next cycle.
+        self.ensemble_fire_state.carry_forward(ensemble.member_arrival_times)
+        self._last_ensemble_result = ensemble
+        self._last_cycle_time_s    = start_time
+
         # 5. Information field
+        # Compute fire location burn probability for the fire entropy term.
+        # P(cell currently burning) from per-member arrival times at cycle start.
+        fire_state_burn_prob: Optional[np.ndarray] = None
+        if self.fire_state_alpha > 0.0 and self.ensemble_fire_state.initialized:
+            mat = self.ensemble_fire_state.member_arrival_times
+            if mat is not None:
+                fire_state_burn_prob = (mat < start_time).mean(axis=0).astype(np.float32)
+
         info_field = compute_information_field(
             ensemble, gp_prior,
             resolution_m=self.resolution_m,
@@ -206,6 +297,8 @@ class IGNISOrchestrator:
             exclusion_mask=exclusion_mask,
             bimodal_alpha=self.bimodal_alpha,
             bimodal_beta=self.bimodal_beta,
+            fire_state_alpha=self.fire_state_alpha,
+            fire_state_burn_prob=fire_state_burn_prob,
         )
 
         # 6. Primary strategy selection
