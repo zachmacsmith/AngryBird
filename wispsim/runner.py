@@ -46,7 +46,6 @@ from angrybird.config import (
     SIMULATION_HORIZON_MIN,
 )
 from angrybird.information import compute_information_field
-from angrybird.nelson import nelson_fmc_field
 from angrybird.orchestrator import IGNISOrchestrator, FireEngineProtocol
 from angrybird.path_planner import plan_paths
 from angrybird.selectors import registry as _default_registry
@@ -404,17 +403,28 @@ class CycleRunner:
         shape = self.orchestrator.terrain.shape
         rng   = np.random.default_rng(cycle_seed)
 
-        # Push Nelson FMC prior mean before GP prediction so the GP fits
-        # residuals from the physics model rather than raw values.
+        # Update dynamic prior (weather → Nelson FMC + wind) before GP
+        # prediction so the GP fits residuals from the physics model.
         lat = float(self.orchestrator.terrain.origin[0])
-        nelson_field = nelson_fmc_field(
-            self.orchestrator.terrain,
-            T_C=self.nelson_T_C,
-            RH=self.nelson_RH,
-            hour_of_day=self.nelson_hour,
-            latitude_deg=lat,
+        _weather = {
+            "temperature": np.full(shape, self.nelson_T_C, dtype=np.float32),
+            "humidity":    np.full(shape, self.nelson_RH,  dtype=np.float32),
+            "source":      "scenario",
+            "latitude":    lat,
+            "hour_local":  self.nelson_hour,
+        }
+        self.orchestrator.dynamic_prior.update_cycle(
+            current_time=0.0,
+            terrain=self.orchestrator.terrain,
+            weather_source=_weather,
         )
-        self.orchestrator.gp.set_nelson_mean(nelson_field)
+        _means = self.orchestrator.dynamic_prior.get_gp_prior_means()
+        if _means["fmc"] is not None:
+            self.orchestrator.gp.set_nelson_mean(_means["fmc"])
+        if _means["wind_speed"] is not None and _means["wind_direction"] is not None:
+            self.orchestrator.gp.set_wind_prior_mean(
+                _means["wind_speed"], _means["wind_direction"]
+            )
 
         gp_prior = self.orchestrator.gp.predict(shape)
 
@@ -676,20 +686,8 @@ class SimulationRunner:
         )
         self.renderer._initial_gp_var_sum = self._prev_gp_var_sum
 
-        # Set a constant uninformed wind prior (5 m/s / 270° westerly) to:
-        #   1. Activate circular arithmetic in fit() for wind direction.
-        #   2. Ensure non-zero GP residuals (RAWS obs - prior ≠ 0) so the kernel
-        #      amplitude optimizer can fit a sensible C rather than collapsing to
-        #      the lower bound.
-        #   3. Give cells far from any training data a neutral fallback (prior).
-        # A prior equal to the RAWS observation gives residual = 0 → C → 1e-3
-        # → GP variance collapses and wind observations get no credit in the
-        # information field.  In production this prior would come from a NWP
-        # model (HRRR/GFS); here we use a fixed uninformed background.
-        orchestrator.gp.set_wind_prior_mean(
-            np.full(terrain.shape, GP_DEFAULT_WIND_SPEED_MEAN, dtype=np.float32),
-            np.full(terrain.shape, GP_DEFAULT_WIND_DIR_MEAN,   dtype=np.float32),
-        )
+        # Wind prior is now set each cycle from ground truth wind via
+        # DynamicPrior.update_cycle() → orchestrator.run_cycle(weather_source=...).
 
         self.current_time: float = 0.0
         # Trigger first WISP cycle immediately at t=0
@@ -839,23 +837,24 @@ class SimulationRunner:
 
         fire_state = self.truth.fire.fire_state  # current burn mask (float32)
 
-        # Update Nelson FMC prior mean for current time of day.
-        # Simulation clock starts at 06:00 local solar time by convention.
-        hour_of_day = (6.0 + self.current_time / 3600.0) % 24.0
+        # Build weather_source from ground truth: T/RH from scenario defaults,
+        # wind from the evolving ground truth field so the dynamic prior tracks
+        # actual wind conditions rather than a fixed uninformed background.
         lat = float(self.terrain.origin[0])
-        nelson_field = nelson_fmc_field(
-            self.terrain,
-            T_C=NELSON_DEFAULT_T_C,
-            RH=NELSON_DEFAULT_RH,
-            hour_of_day=hour_of_day,
-            latitude_deg=lat,
-        )
-        self.orchestrator.gp.set_nelson_mean(nelson_field)
+        _weather_source = {
+            "temperature":   np.full(self.terrain.shape, NELSON_DEFAULT_T_C, dtype=np.float32),
+            "humidity":      np.full(self.terrain.shape, NELSON_DEFAULT_RH,  dtype=np.float32),
+            "wind_speed":    self.truth.wind_speed,
+            "wind_direction": self.truth.wind_direction,
+            "source":        "simulation",
+            "latitude":      lat,
+        }
 
         mission_queue, cycle_report = self.orchestrator.run_cycle(
             fire_state=fire_state,
             observations=observations,
             start_time=self.current_time,
+            weather_source=_weather_source,
         )
 
         # Cache cycle-level outputs for the renderer (info field, targets)
