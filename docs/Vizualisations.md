@@ -116,7 +116,20 @@ Show substitutes as smaller markers with dotted connections to their primary tar
 
 **Audience:** UTM operator. This is the text-based counterpart to the placement map.
 
-### 1.6 Crown Fire Risk Overlay
+### 1.6 Fire State Estimation
+
+**Question:** How confident are we in the current fire location?
+
+**Content:** Three-panel plot showing the outputs of the fast-marching reconstruction:
+
+- **Left:** Reconstructed arrival time isochrones overlaid on terrain.
+- **Center:** Confidence map (0.0 for pure model, 1.0 for direct observation).
+- **Right:** Arrival time uncertainty (seconds), growing with distance/time from observations.
+- **Overlay:** Drone fire/no-fire observations on all panels.
+
+**Audience:** Fire behavior analyst, system operator — to verify the EnKF initialization point.
+
+### 1.7 Crown Fire Risk Overlay
 
 **Question:** Where might the fire blow up?
 
@@ -126,7 +139,7 @@ Show substitutes as smaller markers with dotted connections to their primary tar
 
 **Audience:** Fire behavior analyst, incident commander.
 
-### 1.7 Spotting Risk Overlay
+### 1.8 Spotting Risk Overlay
 
 **Question:** Where might embers land?
 
@@ -332,6 +345,7 @@ All visualizations use consistent colormaps and marker styles. Fire-related quan
 |2.4 Entropy convergence curve|Highest|Low|The primary quantitative result|
 |2.3 Four-way strategy comparison|Highest|Medium|Visual proof of concept|
 |1.1 Fire prediction map|High|Medium|Context for everything else|
+|1.6 Fire state estimation|High|Low|Validates ensemble initialization from observations|
 |2.1 Ensemble spread|High|Low|Explains why ensembles matter|
 |1.4 Drone placement map|High|Low|Shows what the system does|
 |2.5 Drone value curve|Medium|Low|Answers "how many drones"|
@@ -339,8 +353,8 @@ All visualizations use consistent colormaps and marker styles. Fire-related quan
 |1.3 GP uncertainty field|Medium|Low|Shows data assimilation effect|
 |3.1 Observation gap slide|Medium|Low|Opens the presentation|
 |2.2 Arrival time distributions|Medium|Low|Validates bimodal detection|
-|1.6 Crown fire risk overlay|Low|Low|Nice to have with crown fire model|
+|1.7 Crown fire risk overlay|Low|Low|Nice to have with crown fire model|
 |2.6 QUBO vs greedy overlap|Low|Low|For technical reviewers|
 |2.9 Innovation tracking|Low|Low|Model learning diagnostic|
 |2.10 Data-limited test|Low|Medium|Thesis validation if time permits|
-|1.7 Spotting risk overlay|Lowest|Medium|Only if spotting overlay is built|
+|1.8 Spotting risk overlay|Lowest|Medium|Only if spotting overlay is built|

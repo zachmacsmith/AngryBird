@@ -39,6 +39,7 @@ from angrybird.config import (
     GP_DEFAULT_WIND_DIR_MEAN,
     GP_DEFAULT_WIND_SPEED_MEAN,
     GRID_RESOLUTION_M,
+    IGNIS_SELECTOR,
     N_DRONES,
     NELSON_DEFAULT_RH,
     NELSON_DEFAULT_T_C,
@@ -139,6 +140,7 @@ class SimulationConfig:
     mesh_ping_interval_s: float = 10.0
     mesh_packets_per_tick: int = 3
     mesh_packet_loss_probability: float = 0.02
+    selector_name: str = IGNIS_SELECTOR
 
 # ---------------------------------------------------------------------------
 # LiveEstimator
