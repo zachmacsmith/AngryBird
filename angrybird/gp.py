@@ -645,7 +645,13 @@ class IGNISGPPrior:
         gp     = self._gp_fmc
         kernel = gp.kernel_
 
-        y_std = float(getattr(gp, "_y_train_std", 1.0))
+        y_std_raw = getattr(gp, "_y_train_std", 1.0)
+        y_std_arr = np.asarray(y_std_raw, dtype=np.float64).ravel()
+
+        if y_std_arr.size == 0:
+            y_std = 1.0
+        else:
+            y_std = float(y_std_arr[0])
         y_var = y_std ** 2
 
         K_prior_cross_norm = kernel(X_grid, X_new).ravel()
