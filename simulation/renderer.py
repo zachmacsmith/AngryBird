@@ -39,8 +39,8 @@ import matplotlib.colors as mcolors
 import matplotlib.patches as mpatches
 from matplotlib.figure import Figure
 
-from ..types import CycleReport, InformationField, GPPrior
-from ..visualization._style import compute_hillshade, STRATEGY_STYLES
+from angrybird.types import CycleReport, InformationField, GPPrior
+from angrybird.visualization._style import compute_hillshade, STRATEGY_STYLES
 from .drone_sim import DroneState, pos_m_to_cell
 from .ground_truth import GroundTruth
 

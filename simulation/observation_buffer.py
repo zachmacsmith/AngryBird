@@ -11,7 +11,8 @@ does not receive hundreds of near-identical readings from the same cell.
 
 from __future__ import annotations
 
-from ..types import DroneObservation
+from angrybird.config import OBSERVATION_THINNING_SPACING_M
+from angrybird.types import DroneObservation
 
 
 def thin_observations(
@@ -66,7 +67,7 @@ class ObservationBuffer:
         resolution_m:   grid cell size in metres
     """
 
-    def __init__(self, min_spacing_m: float = 200.0, resolution_m: float = 50.0) -> None:
+    def __init__(self, min_spacing_m: float = OBSERVATION_THINNING_SPACING_M, resolution_m: float = 50.0) -> None:
         self._buffer:       list[DroneObservation] = []
         self._min_spacing   = min_spacing_m
         self._resolution_m  = resolution_m

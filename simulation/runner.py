@@ -34,19 +34,24 @@ from typing import Optional
 
 import numpy as np
 
-from ..config import (
+from angrybird.config import (
     ENSEMBLE_SIZE,
+    GP_DEFAULT_WIND_DIR_MEAN,
+    GP_DEFAULT_WIND_SPEED_MEAN,
     GRID_RESOLUTION_M,
     N_DRONES,
+    NELSON_DEFAULT_RH,
+    NELSON_DEFAULT_T_C,
+    OBSERVATION_THINNING_SPACING_M,
     SIMULATION_HORIZON_MIN,
 )
-from ..information import compute_information_field
-from ..nelson import nelson_fmc_field
-from ..orchestrator import IGNISOrchestrator, FireEngineProtocol
-from ..path_planner import plan_paths
-from ..selectors import registry as _default_registry
-from ..selectors.base import SelectorRegistry
-from ..types import (
+from angrybird.information import compute_information_field
+from angrybird.nelson import nelson_fmc_field
+from angrybird.orchestrator import IGNISOrchestrator, FireEngineProtocol
+from angrybird.path_planner import plan_paths
+from angrybird.selectors import registry as _default_registry
+from angrybird.selectors.base import SelectorRegistry
+from angrybird.types import (
     CycleReport,
     DroneObservation,
     GPPrior,
@@ -64,8 +69,8 @@ from .drone_sim import (
 from .evaluator import CounterfactualEvaluator
 from .ground_truth import GroundTruth, compute_wind_field
 from .observation_buffer import ObservationBuffer, thin_observations
-from ..assimilation import aggregate_drone_observations
-from ..config import (
+from angrybird.assimilation import aggregate_drone_observations
+from angrybird.config import (
     CAMERA_FOOTPRINT_M,
     CYCLE_INTERVAL_S,
     DRONE_ENDURANCE_S,
@@ -86,13 +91,13 @@ from ..config import (
 )
 from .observer import ObservationSource, SimulatedObserver
 from .renderer import FrameRenderer
-from ..observations import (
+from angrybird.observations import (
     Observation,
     ObservationSource as ObsSource,
     ObservationType,
     RAWSObservation,
 )
-from ..raws import RAWSObserver, RAWSStation, place_raws_stations
+from angrybird.raws import RAWSObserver, RAWSStation, place_raws_stations
 
 logger = logging.getLogger(__name__)
 
@@ -175,7 +180,7 @@ class LiveEstimator:
         # runner uses before IGNIS cycles.  Raw obs are added here; thinned()
         # view is computed in compute_estimate without consuming the buffer.
         self._obs_buffer = ObservationBuffer(
-            min_spacing_m=200.0,
+            min_spacing_m=OBSERVATION_THINNING_SPACING_M,
             resolution_m=terrain.resolution_m,
         )
         self._has_obs       = False   # True when buffer has new unseen obs
@@ -194,7 +199,7 @@ class LiveEstimator:
         """
         self._live_gp     = copy.deepcopy(self._orchestrator.gp)
         self._obs_buffer  = ObservationBuffer(
-            min_spacing_m=200.0,
+            min_spacing_m=OBSERVATION_THINNING_SPACING_M,
             resolution_m=self._terrain.resolution_m,
         )
         self._has_obs     = False
@@ -365,8 +370,8 @@ class CycleRunner:
         obs_source: Optional[ObservationSource] = None,
         bimodal_alpha: float = 0.5,
         bimodal_beta: float = 0.3,
-        nelson_T_C: float = 28.0,
-        nelson_RH: float = 0.20,
+        nelson_T_C: float = NELSON_DEFAULT_T_C,
+        nelson_RH: float = NELSON_DEFAULT_RH,
         nelson_hour: float = 14.0,
     ) -> None:
         self.orchestrator     = orchestrator
@@ -599,7 +604,7 @@ class SimulationRunner:
         horizon_h = getattr(orchestrator, "horizon_min", SIMULATION_HORIZON_MIN) / 60.0
 
         self.obs_buffer = ObservationBuffer(
-            min_spacing_m=200.0,
+            min_spacing_m=OBSERVATION_THINNING_SPACING_M,
             resolution_m=terrain.resolution_m,
         )
         self.renderer = FrameRenderer(
@@ -721,8 +726,8 @@ class SimulationRunner:
         # information field.  In production this prior would come from a NWP
         # model (HRRR/GFS); here we use a fixed uninformed background.
         orchestrator.gp.set_wind_prior_mean(
-            np.full(terrain.shape, 5.0,   dtype=np.float32),
-            np.full(terrain.shape, 270.0, dtype=np.float32),
+            np.full(terrain.shape, GP_DEFAULT_WIND_SPEED_MEAN, dtype=np.float32),
+            np.full(terrain.shape, GP_DEFAULT_WIND_DIR_MEAN,   dtype=np.float32),
         )
 
         self.current_time: float = 0.0
@@ -878,8 +883,8 @@ class SimulationRunner:
         lat = float(self.terrain.origin[0])
         nelson_field = nelson_fmc_field(
             self.terrain,
-            T_C=28.0,
-            RH=0.20,
+            T_C=NELSON_DEFAULT_T_C,
+            RH=NELSON_DEFAULT_RH,
             hour_of_day=hour_of_day,
             latitude_deg=lat,
         )

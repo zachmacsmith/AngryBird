@@ -19,8 +19,8 @@ from typing import Optional, Protocol, runtime_checkable
 
 import numpy as np
 
-from ..config import OBS_FMC_SIGMA, OBS_WIND_DIR_SIGMA, OBS_WIND_SPEED_SIGMA
-from ..types import DroneObservation
+from angrybird.config import OBS_FMC_SIGMA, OBS_WIND_DIR_SIGMA, OBS_WIND_SPEED_SIGMA
+from angrybird.types import DroneObservation
 from .ground_truth import GroundTruth
 
 

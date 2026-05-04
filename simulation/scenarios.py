@@ -24,8 +24,8 @@ from __future__ import annotations
 
 import numpy as np
 
-from ..config import CANOPY_CBH_M, CANOPY_CBD_KGM3, CANOPY_COVER_FRACTION
-from ..types import TerrainData
+from angrybird.config import CANOPY_CBH_M, CANOPY_CBD_KGM3, CANOPY_COVER_FRACTION
+from angrybird.types import TerrainData
 from .ground_truth import WindEvent, generate_ground_truth, GroundTruth
 from .runner import SimulationConfig
 

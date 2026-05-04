@@ -23,16 +23,19 @@ from typing import Optional
 
 import numpy as np
 
-from ..config import (
+from angrybird.config import (
+    CAMERA_FOOTPRINT_EDGE_NOISE_FACTOR,
+    CAMERA_FOOTPRINT_M,
     DRONE_SPEED_MS,
     FIRE_DEGRADATION_RADIUS_M,
     GRID_RESOLUTION_M,
+    OBS_FIRE_DEGRADATION_FACTOR,
     OBS_FMC_SIGMA,
     OBS_WIND_DIR_SIGMA,
     OBS_WIND_SPEED_SIGMA,
     SENSOR_FMC_R2,
 )
-from ..types import DroneObservation
+from angrybird.types import DroneObservation
 
 
 # ---------------------------------------------------------------------------
@@ -45,10 +48,10 @@ class NoiseConfig:
     fmc_sigma:               float = OBS_FMC_SIGMA
     ws_sigma:                float = OBS_WIND_SPEED_SIGMA
     wd_sigma:                float = OBS_WIND_DIR_SIGMA
-    camera_footprint_m:      float = 100.0    # radius of FMC observation in metres
+    camera_footprint_m:      float = CAMERA_FOOTPRINT_M
     degrade_near_fire:       bool  = True
     fire_degradation_radius_m: float = FIRE_DEGRADATION_RADIUS_M
-    fire_degradation_factor: float = 3.0      # multiply sigma by this near fire front
+    fire_degradation_factor: float = OBS_FIRE_DEGRADATION_FACTOR
 
 
 # ---------------------------------------------------------------------------
@@ -186,7 +189,7 @@ def collect_observations(
                 continue
 
             # Noise increases toward edge of footprint
-            edge_factor = 1.0 + 0.5 * (dist_cells / max(footprint_cells, 1))
+            edge_factor = 1.0 + CAMERA_FOOTPRINT_EDGE_NOISE_FACTOR * (dist_cells / max(footprint_cells, 1))
             fmc_sigma   = noise.fmc_sigma * edge_factor * fire_factor
 
             obs_fmc = float(fmc_field[r, c]) + float(rng.normal(0.0, fmc_sigma))

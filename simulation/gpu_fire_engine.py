@@ -23,16 +23,20 @@ from typing import Optional
 import numpy as np
 from scipy.ndimage import distance_transform_edt
 
-from ..config import (
+from angrybird.config import (
     CANOPY_CBH_M,
     CANOPY_CBD_KGM3,
     CANOPY_COVER_FRACTION,
+    FMC_MAX_FRACTION,
+    FMC_MIN_FRACTION,
     FUEL_MINERAL_CONTENT,
     FUEL_MINERAL_SILICA_FREE,
     FUEL_PARAMS,
     FUEL_PARTICLE_DENSITY,
+    WIND_SPEED_MAX_MS,
+    WIND_SPEED_MIN_MS,
 )
-from ..types import EnsembleResult, GPPrior, TerrainData
+from angrybird.types import EnsembleResult, GPPrior, TerrainData
 
 try:
     import torch
@@ -320,6 +324,7 @@ class GPUFireEngine:
         n_members: int,
         horizon_min: int,
         rng: Optional[np.random.Generator] = None,
+        initial_phi: Optional[np.ndarray] = None,
     ) -> EnsembleResult:
         """
         Run an N-member Rothermel + level-set ensemble.
@@ -330,9 +335,15 @@ class GPUFireEngine:
                       tensors were loaded at construction.
         gp_prior    : GP posterior used to sample per-member FMC/wind fields.
         fire_state  : float32[R, C] — initial burn mask (1=burned, 0=unburned).
+                      Used to compute the SDF when initial_phi is None.
         n_members   : ensemble size N.
         horizon_min : simulation horizon in minutes.
         rng         : numpy Generator for reproducible perturbation sampling.
+        initial_phi : float32[N, R, C] — per-member signed distance field
+                      (metres, negative inside fire) from EnsembleFireState.
+                      When provided, overrides the SDF computed from fire_state
+                      so each ensemble member starts from a different fire front.
+                      When None, the standard single-SDF broadcast is used.
 
         Returns
         -------
@@ -363,11 +374,11 @@ class GPUFireEngine:
 
         fmc_np = np.clip(
             gp_prior.fmc_mean[np.newaxis] + n_fmc * fmc_std[np.newaxis],
-            0.02, 0.40,
+            FMC_MIN_FRACTION, FMC_MAX_FRACTION,
         ).astype(np.float32)
         ws_np = np.clip(
             gp_prior.wind_speed_mean[np.newaxis] + n_ws * ws_std[np.newaxis],
-            0.5, 25.0,
+            WIND_SPEED_MIN_MS, WIND_SPEED_MAX_MS,
         ).astype(np.float32)
         # Wind direction: perturb and wrap to [0, 360). Not used by the scalar
         # level-set (ROS magnitude only), but stored so compute_sensitivity can
@@ -380,19 +391,27 @@ class GPUFireEngine:
         ws  = torch.tensor(ws_np,  dtype=torch.float32, device=self.device)
 
         # ── Level-set initialisation: signed distance in metres ──────────
-        burned_np = (fire_state > 0.5)
-        if not burned_np.any():
-            # No ignition supplied — seed centre of domain
-            burned_np[rows // 2, cols // 2] = True
+        if initial_phi is not None:
+            # Per-member SDF supplied by EnsembleFireState — use directly.
+            # initial_phi: float32[N, rows, cols] (metres, negative inside).
+            phi = torch.tensor(initial_phi, dtype=torch.float32, device=self.device)
+            # Derive burned_np from the ensemble mean for arrival_t seeding.
+            burned_np = (initial_phi < 0).any(axis=0)
+        else:
+            # Legacy path: single burn mask broadcast to all members.
+            burned_np = (fire_state > 0.5)
+            if not burned_np.any():
+                # No ignition supplied — seed centre of domain
+                burned_np[rows // 2, cols // 2] = True
 
-        # SDF: negative inside fire perimeter, positive outside (metres).
-        # d_in:  for burned cells,   distance to nearest unburned edge  (interior)
-        # d_out: for unburned cells, distance to nearest burned cell     (exterior)
-        d_in  = distance_transform_edt(burned_np).astype(np.float32)
-        d_out = distance_transform_edt(~burned_np).astype(np.float32)
-        sdf   = np.where(burned_np, -d_in, d_out) * self.dx
-        phi   = (torch.tensor(sdf, dtype=torch.float32, device=self.device)
-                 .unsqueeze(0).expand(n_members, -1, -1).clone())
+            # SDF: negative inside fire perimeter, positive outside (metres).
+            # d_in:  for burned cells,   distance to nearest unburned edge  (interior)
+            # d_out: for unburned cells, distance to nearest burned cell     (exterior)
+            d_in  = distance_transform_edt(burned_np).astype(np.float32)
+            d_out = distance_transform_edt(~burned_np).astype(np.float32)
+            sdf   = np.where(burned_np, -d_in, d_out) * self.dx
+            phi   = (torch.tensor(sdf, dtype=torch.float32, device=self.device)
+                     .unsqueeze(0).expand(n_members, -1, -1).clone())
 
         arrival_t = torch.full(
             (n_members, rows, cols), sentinel_s,

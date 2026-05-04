@@ -43,15 +43,26 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-# Fire engine + make_gp reused from demo_sim; SimpleFire lives there until
-# it is promoted to a proper angrybird module.
-from demo_sim import SimpleFire, make_gp  # noqa: E402
-
-from angrybird.gp import IGNISGPPrior
-from angrybird.orchestrator import IGNISOrchestrator
 import inspect
-import angrybird.simulation.scenarios as _scenario_module
-from angrybird.simulation import SimulationConfig, SimulationRunner
+from angrybird.config import TAU_FMC_S, TAU_WIND_SPEED_S, TAU_WIND_DIR_S
+from angrybird.gp import IGNISGPPrior
+from angrybird.observations import ObservationStore, ObservationType
+from angrybird.orchestrator import IGNISOrchestrator
+from angrybird.types import TerrainData
+import simulation.scenarios as _scenario_module
+from simulation import SimpleFire, SimulationConfig, SimulationRunner
+
+
+def make_gp(terrain: TerrainData) -> tuple[IGNISGPPrior, ObservationStore]:
+    """Return an (IGNISGPPrior, ObservationStore) pair backed by the same store."""
+    decay_config = {
+        ObservationType.FMC:            TAU_FMC_S,
+        ObservationType.WIND_SPEED:     TAU_WIND_SPEED_S,
+        ObservationType.WIND_DIRECTION: TAU_WIND_DIR_S,
+    }
+    obs_store = ObservationStore(decay_config)
+    gp = IGNISGPPrior(obs_store, terrain=terrain, resolution_m=terrain.resolution_m)
+    return gp, obs_store
 
 logging.basicConfig(level=logging.INFO,
                     format="%(levelname)s | %(name)s | %(message)s")
@@ -81,6 +92,7 @@ def main(
     n_members: int = 30,
     hours: float = 6.0,
     out_dir: str | None = None,
+    frame_interval: int | None = None,
 ) -> None:
 
     t0 = time.time()
@@ -94,6 +106,8 @@ def main(
     config.n_drones     = n_drones
     if out_dir:
         config.output_path = out_dir
+    if frame_interval is not None:
+        config.frame_interval = frame_interval
 
     log.info(
         "=== run_sim | scenario=%s | %.1f h | dt=%.0f s | %d drones | %d members ===",
@@ -101,15 +115,16 @@ def main(
     )
 
     # ── IGNIS components ──────────────────────────────────────────────────
-    gp          = make_gp(terrain)
-    fire_engine = SimpleFire()
+    gp, obs_store = make_gp(terrain)   # make_gp returns (IGNISGPPrior, ObservationStore)
+    fire_engine   = SimpleFire()
 
-    rows, cols  = terrain.shape
+    rows, cols   = terrain.shape
     staging_area = config.base_cell
 
     orchestrator = IGNISOrchestrator(
         terrain=terrain,
         gp=gp,
+        obs_store=obs_store,
         fire_engine=fire_engine,
         selector_name="greedy",
         n_drones=config.n_drones,
@@ -161,6 +176,8 @@ if __name__ == "__main__":
                         help="Simulation duration in hours (default 6)")
     parser.add_argument("--out",     default=None,
                         help="Output directory (overrides scenario default)")
+    parser.add_argument("--frame-interval", type=int, default=None,
+                        help="Override frame_interval (steps between renders; default from scenario config)")
     args = parser.parse_args()
 
     main(
@@ -169,4 +186,5 @@ if __name__ == "__main__":
         n_members=args.members,
         hours=args.hours,
         out_dir=args.out,
+        frame_interval=args.frame_interval,
     )

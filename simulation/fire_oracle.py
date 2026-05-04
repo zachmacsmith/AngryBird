@@ -21,8 +21,8 @@ from typing import Optional
 
 import numpy as np
 
-from ..config import CANOPY_CBH_M, CANOPY_CBD_KGM3, FUEL_PARAMS
-from ..types import TerrainData
+from angrybird.config import CANOPY_CBH_M, CANOPY_CBD_KGM3, FUEL_PARAMS
+from angrybird.types import TerrainData
 
 _SQRT2 = math.sqrt(2.0)
 

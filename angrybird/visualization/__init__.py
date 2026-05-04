@@ -33,11 +33,6 @@ Shared helpers
     STRATEGY_STYLES     — per-strategy color / marker / linestyle
     DRONE_COLORS        — list of up to 10 drone assignment colours
 
-Backward compatibility
-    plot_phase2_summary — original phase-2 summary plot (from _visualization_old)
-    plot_gp_prior       — GP prior heatmaps  (from _visualization_old)
-    plot_ensemble       — ensemble overview   (from _visualization_old)
-    plot_sensitivity    — sensitivity panel   (from _visualization_old)
 """
 
 from __future__ import annotations
@@ -82,20 +77,6 @@ from .presentation import (
 # ---------------------------------------------------------------------------
 from ._style import save_or_show, VIZ_CONFIG, STRATEGY_STYLES, DRONE_COLORS
 
-# ---------------------------------------------------------------------------
-# Backward compatibility — scripts/demo_phase2.py imports these directly
-# from angrybird.visualization
-# ---------------------------------------------------------------------------
-try:
-    from .._visualization_old import (  # type: ignore[import]
-        plot_phase2_summary,
-        plot_gp_prior,
-        plot_ensemble,
-        plot_sensitivity,
-    )
-except Exception:
-    # _visualization_old may not exist in all deployments; degrade gracefully
-    pass
 
 __all__ = [
     # §1
@@ -123,9 +104,4 @@ __all__ = [
     "VIZ_CONFIG",
     "STRATEGY_STYLES",
     "DRONE_COLORS",
-    # backward compat
-    "plot_phase2_summary",
-    "plot_gp_prior",
-    "plot_ensemble",
-    "plot_sensitivity",
 ]

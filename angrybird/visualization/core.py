@@ -8,9 +8,6 @@ These answer operational questions and would exist in a deployed system.
 1.3  plot_gp_uncertainty          — Where do we lack data?
 1.4  plot_drone_placement         — Where are drones going?
 1.5  plot_mission_queue_table     — What should the UTM act on?
-
-Also re-exports the original Phase 2 summary dashboard for backward compat:
-     plot_phase2_summary
 """
 
 from __future__ import annotations
@@ -24,12 +21,6 @@ import matplotlib.cm as cm
 from matplotlib.axes import Axes
 from matplotlib.figure import Figure
 
-from .._visualization_old import (          # backward-compat re-use
-    plot_gp_prior,
-    plot_ensemble,
-    plot_sensitivity,
-    plot_phase2_summary,
-)
 from ..types import (
     DronePlan, EnsembleResult, GPPrior, InformationField,
     MissionQueue, SelectionResult, TerrainData,

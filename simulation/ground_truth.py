@@ -23,8 +23,29 @@ from typing import Optional
 import numpy as np
 from scipy.ndimage import uniform_filter
 
-from ..config import GRID_RESOLUTION_M
-from ..types import TerrainData
+from angrybird.config import (
+    FMC_ASPECT_WEIGHT,
+    FMC_CANOPY_WEIGHT,
+    FMC_ELEVATION_WEIGHT,
+    FMC_MAX_FRACTION,
+    FMC_MIN_FRACTION,
+    FMC_NOISE_SCALE,
+    FMC_TERRAIN_CORR_LENGTH_M,
+    FMC_TPI_WEIGHT,
+    GRID_RESOLUTION_M,
+    TPI_FILTER_SIZE_CELLS,
+    WIND_DIR_TERRAIN_CORR_LENGTH_M,
+    WIND_DIR_TERRAIN_NOISE_SCALE_DEG,
+    WIND_DRIFT_RATE_DEG_PER_HR,
+    WIND_SPEED_MAX_MS,
+    WIND_SPEED_MIN_MS,
+    WIND_SPEED_TERRAIN_CORR_LENGTH_M,
+    WIND_SPEED_TERRAIN_NOISE_SCALE,
+    WIND_TPI_MODULATION,
+    WIND_TURBULENCE_SIGMA_DEG,
+    WIND_TURBULENCE_SIGMA_MS,
+)
+from angrybird.types import TerrainData
 from .fire_oracle import GroundTruthFire
 
 
@@ -73,7 +94,7 @@ def compute_wind_field(
     terrain: TerrainData,
     t: float,
     events: list[WindEvent],
-    drift_rate_deg_per_hr: float = 5.0,
+    drift_rate_deg_per_hr: float = WIND_DRIFT_RATE_DEG_PER_HR,
     rng: Optional[np.random.Generator] = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
@@ -108,15 +129,15 @@ def compute_wind_field(
 
     # Terrain modulation: TPI (ridges windier, valleys calmer)
     elev       = terrain.elevation
-    tpi        = elev - uniform_filter(elev, size=20)
+    tpi        = elev - uniform_filter(elev, size=TPI_FILTER_SIZE_CELLS)
     tpi_norm   = tpi / (tpi.std() + 1e-6)
-    ws_field   = ws_field * (1.0 + 0.3 * np.clip(tpi_norm, -1.0, 2.0))
+    ws_field   = ws_field * (1.0 + WIND_TPI_MODULATION * np.clip(tpi_norm, -1.0, 2.0))
 
     # Small-scale turbulence
-    ws_field  += rng.normal(0.0, 0.3, terrain.shape).astype(np.float32)
-    wd_field  += rng.normal(0.0, 3.0, terrain.shape).astype(np.float32)
+    ws_field  += rng.normal(0.0, WIND_TURBULENCE_SIGMA_MS, terrain.shape).astype(np.float32)
+    wd_field  += rng.normal(0.0, WIND_TURBULENCE_SIGMA_DEG, terrain.shape).astype(np.float32)
 
-    ws_field  = np.clip(ws_field, 0.5, 25.0).astype(np.float32)
+    ws_field  = np.clip(ws_field, WIND_SPEED_MIN_MS, WIND_SPEED_MAX_MS).astype(np.float32)
     wd_field  = (wd_field % 360.0).astype(np.float32)
 
     return ws_field, wd_field
@@ -207,16 +228,16 @@ def _generate_fmc_field(
     # South-facing (180°) are sunnier → drier in the Northern Hemisphere → lower FMC.
     # cos(0°)=+1 → north-facing wetter; cos(180°)=-1 → south-facing drier.
     # The original sign was inverted (bug: made south-facing wetter).
-    aspect_effect    =  0.03 * np.cos(np.radians(terrain.aspect))
+    aspect_effect    =  FMC_ASPECT_WEIGHT * np.cos(np.radians(terrain.aspect))
     elev             = terrain.elevation
     elev_norm        = (elev - elev.mean()) / (elev.std() + 1e-6)
-    elevation_effect = 0.02 * elev_norm
-    tpi              = elev - uniform_filter(elev, size=20)
-    tpi_effect       = -0.01 * np.clip(tpi / (tpi.std() + 1e-6), -2.0, 2.0)
-    canopy_effect    = 0.02 * _canopy_from_fuel(terrain.fuel_model)
+    elevation_effect = FMC_ELEVATION_WEIGHT * elev_norm
+    tpi              = elev - uniform_filter(elev, size=TPI_FILTER_SIZE_CELLS)
+    tpi_effect       = -FMC_TPI_WEIGHT * np.clip(tpi / (tpi.std() + 1e-6), -2.0, 2.0)
+    canopy_effect    = FMC_CANOPY_WEIGHT * _canopy_from_fuel(terrain.fuel_model)
     fmc_terrain      = base_fmc + aspect_effect + elevation_effect + tpi_effect + canopy_effect
-    noise            = _draw_correlated_field(terrain.shape, 500.0, terrain.resolution_m, rng)
-    return np.clip(fmc_terrain + 0.015 * noise, 0.02, 0.40).astype(np.float32)
+    noise            = _draw_correlated_field(terrain.shape, FMC_TERRAIN_CORR_LENGTH_M, terrain.resolution_m, rng)
+    return np.clip(fmc_terrain + FMC_NOISE_SCALE * noise, FMC_MIN_FRACTION, FMC_MAX_FRACTION).astype(np.float32)
 
 
 def _generate_base_wind(
@@ -224,12 +245,12 @@ def _generate_base_wind(
 ) -> tuple[np.ndarray, np.ndarray]:
     """Terrain-structured baseline wind fields (before time-evolution)."""
     elev     = terrain.elevation
-    tpi      = elev - uniform_filter(elev, size=20)
-    ws       = base_ws * (1.0 + 0.3 * np.clip(tpi / (tpi.std() + 1e-6), -1.0, 2.0))
-    ws_noise = _draw_correlated_field(terrain.shape, 1000.0, terrain.resolution_m, rng)
-    ws       = np.clip(ws + 1.0 * ws_noise, 0.5, 25.0).astype(np.float32)
-    wd_noise = _draw_correlated_field(terrain.shape, 2000.0, terrain.resolution_m, rng)
-    wd       = ((base_wd + 15.0 * wd_noise) % 360.0).astype(np.float32)
+    tpi      = elev - uniform_filter(elev, size=TPI_FILTER_SIZE_CELLS)
+    ws       = base_ws * (1.0 + WIND_TPI_MODULATION * np.clip(tpi / (tpi.std() + 1e-6), -1.0, 2.0))
+    ws_noise = _draw_correlated_field(terrain.shape, WIND_SPEED_TERRAIN_CORR_LENGTH_M, terrain.resolution_m, rng)
+    ws       = np.clip(ws + WIND_SPEED_TERRAIN_NOISE_SCALE * ws_noise, WIND_SPEED_MIN_MS, WIND_SPEED_MAX_MS).astype(np.float32)
+    wd_noise = _draw_correlated_field(terrain.shape, WIND_DIR_TERRAIN_CORR_LENGTH_M, terrain.resolution_m, rng)
+    wd       = ((base_wd + WIND_DIR_TERRAIN_NOISE_SCALE_DEG * wd_noise) % 360.0).astype(np.float32)
     return ws, wd
 
 

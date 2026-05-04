@@ -1143,7 +1143,7 @@ def test_ss7_assimilation():
 # ═════════════════════════════════════════════════════════════════════════════
 
 def test_ss8_ground_truth():
-    from angrybird.simulation.ground_truth import generate_ground_truth, GroundTruth
+    from simulation.ground_truth import generate_ground_truth, GroundTruth
     from angrybird.terrain import synthetic_terrain
 
     print("\n── SS8  simulation/ground_truth.py ───────────────────────────")
@@ -1240,8 +1240,8 @@ def test_ss8_ground_truth():
 # ═════════════════════════════════════════════════════════════════════════════
 
 def test_ss9_observer():
-    from angrybird.simulation.observer import SimulatedObserver, ObservationSource
-    from angrybird.simulation.ground_truth import generate_ground_truth
+    from simulation.observer import SimulatedObserver, ObservationSource
+    from simulation.ground_truth import generate_ground_truth
     from angrybird.terrain import synthetic_terrain
 
     print("\n── SS9  simulation/observer.py ───────────────────────────────")

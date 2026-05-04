@@ -24,8 +24,8 @@ import logging
 
 import numpy as np
 
-from ..gp import IGNISGPPrior
-from ..types import (
+from angrybird.gp import IGNISGPPrior
+from angrybird.types import (
     DronePlan,
     GPPrior,
     InformationField,

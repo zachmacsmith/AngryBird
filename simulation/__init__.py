@@ -1,13 +1,14 @@
 """
-Phase 4b — simulation harness for strategy comparison and demo video.
+Simulation harness — runs the angrybird package in a synthetic environment.
 
-These components substitute for real drones at hackathon time and enable the
-four-way PERR comparison and the animated simulation video.  None of this
+This package is separate from angrybird intentionally: it depends on angrybird
+as an external package and substitutes real drones/terrain/weather with
+simulated equivalents for development and evaluation.  Nothing in this package
 ships with the production system.
 
 Quick start (cycle-based strategy comparison):
 
-    from angrybird.simulation import CycleRunner, generate_ground_truth
+    from simulation import CycleRunner, generate_ground_truth
 
     truth  = generate_ground_truth(terrain, ignition_cell=(150, 40), seed=42)
     runner = CycleRunner(
@@ -18,10 +19,7 @@ Quick start (cycle-based strategy comparison):
 
 Quick start (clock-based simulation video):
 
-    from angrybird.simulation import (
-        SimulationRunner, SimulationConfig,
-        hilly_heterogeneous,
-    )
+    from simulation import SimulationRunner, SimulationConfig, hilly_heterogeneous
 
     terrain, truth, config = hilly_heterogeneous()
     runner = SimulationRunner(config, terrain, truth, orchestrator)
@@ -29,6 +27,7 @@ Quick start (clock-based simulation video):
 """
 
 from .drone_sim import DroneState, NoiseConfig
+from .simple_fire import SimpleFire
 from .evaluator import CounterfactualEvaluator
 from .fire_oracle import GroundTruthFire
 from .gpu_fire_engine import GPUFireEngine
@@ -46,6 +45,7 @@ __all__ = [
     "SimulationConfig",
     # fire engines
     "GPUFireEngine",
+    "SimpleFire",
     # ground truth
     "GroundTruth",
     "WindEvent",
