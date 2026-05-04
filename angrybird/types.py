@@ -68,7 +68,19 @@ class SelectionResult:
     cumulative_gain: list[float]               # running total
     strategy_name: str
     compute_time_s: float
+    kind: str = "points"
     solver_metadata: Optional[dict] = None    # QUBO-specific: energy, chain breaks, solver name
+
+
+@dataclass(frozen=True)
+class PathSelectionResult:
+    """Returned by path selectors that skip the point→path step entirely."""
+    kind: str                         # always "paths"
+    drone_plans: list["DronePlan"]
+    strategy_name: str
+    compute_time_s: float
+    total_info: float
+    marginal_gains: list[float]       # per-drone info contribution
 
 
 @dataclass(frozen=True)
@@ -86,16 +98,16 @@ class DroneObservation:
 
 @dataclass(frozen=True)
 class MissionRequest:
-    target: tuple[float, float]                # (lat, lon)
-    information_value: float                   # w_i
-    dominant_variable: str                     # "fmc" | "wind_speed" | "wind_dir"
-    substitutes: list[tuple[float, float]]     # fallback locations if target unreachable
+    drone_id: int                              # which drone executes this path
+    path: list[tuple[float, float]]            # ordered (lat, lon) waypoints
+    information_value: float                   # total w across all waypoints
+    dominant_variable: str                     # most common dominant variable along path
     expiry_minutes: float                      # after this, re-solve needed
 
 
 @dataclass(frozen=True)
 class MissionQueue:
-    requests: list[MissionRequest]  # sorted by information_value descending
+    requests: list[MissionRequest]  # one per drone, sorted by information_value descending
 
 
 @dataclass(frozen=True)
@@ -130,5 +142,5 @@ class CycleReport:
     ensemble_summary: dict
     placement_stability: float        # Jaccard similarity with previous cycle's primary selections
     gp_prior: Optional[GPPrior] = None           # GP posterior used for this cycle's ensemble
-    selection_result: Optional[SelectionResult] = None  # primary strategy selection output
+    selection_result: Optional["SelectionResult | PathSelectionResult"] = None
     start_time: float = 0.0           # simulation clock at cycle start (seconds)

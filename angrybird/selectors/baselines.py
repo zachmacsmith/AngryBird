@@ -21,6 +21,7 @@ class UniformSelector:
     """K locations on a regular grid across the full domain."""
 
     name = "uniform"
+    kind = "points"
 
     def __init__(self, resolution_m: float = GRID_RESOLUTION_M) -> None:
         self.resolution_m = resolution_m
@@ -70,6 +71,7 @@ class FireFrontSelector:
     """
 
     name = "fire_front"
+    kind = "points"
 
     def __init__(
         self,

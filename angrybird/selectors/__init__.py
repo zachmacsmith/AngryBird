@@ -22,6 +22,7 @@ Quick start:
 
 from .base import Selector, SelectorRegistry, spacing_mask
 from .baselines import FireFrontSelector, UniformSelector
+from .correlation_path import CorrelationPathSelector
 from .greedy import GreedySelector
 from .qubo import QUBOSelector, build_qubo, extract_candidates, solve_qubo
 
@@ -31,6 +32,7 @@ registry.register(GreedySelector())
 registry.register(QUBOSelector())
 registry.register(UniformSelector())
 registry.register(FireFrontSelector())
+registry.register(CorrelationPathSelector())
 
 __all__ = [
     "registry",
@@ -40,6 +42,7 @@ __all__ = [
     "QUBOSelector",
     "UniformSelector",
     "FireFrontSelector",
+    "CorrelationPathSelector",
     "build_qubo",
     "extract_candidates",
     "solve_qubo",

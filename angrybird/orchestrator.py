@@ -51,6 +51,7 @@ from .types import (
     GPPrior,
     InformationField,
     MissionQueue,
+    PathSelectionResult,
     SelectionResult,
     TerrainData,
 )
@@ -329,24 +330,34 @@ class IGNISOrchestrator:
         # 6. Primary strategy selection
         primary_result = self.registry.run(
             self.selector_name, info_field, self.gp, ensemble, k=self.n_drones,
+            terrain=self.terrain, staging_area=self.staging_area, resolution_m=self.resolution_m,
         )
 
         # 7. Plan paths + build mission queue
-        drone_plans = plan_paths(
-            primary_result.selected_locations,
-            staging_area=self.staging_area,
-            n_drones=self.n_drones,
-            shape=shape,
-            resolution_m=self.resolution_m,
-        )
+        # Path selectors produce DronePlans directly; point selectors need the extra step.
+        if isinstance(primary_result, PathSelectionResult):
+            drone_plans = primary_result.drone_plans
+            selected_locations = [
+                p.waypoints[1] for p in drone_plans if len(p.waypoints) > 2
+            ]
+        else:
+            drone_plans = plan_paths(
+                primary_result.selected_locations,
+                staging_area=self.staging_area,
+                n_drones=self.n_drones,
+                shape=shape,
+                resolution_m=self.resolution_m,
+            )
+            selected_locations = primary_result.selected_locations
+
         mission_queue = selections_to_mission_queue(
-            primary_result.selected_locations,
+            drone_plans,
             info_field, self.terrain, self.resolution_m,
         )
 
         # 8. Placement stability metric
-        stability = jaccard(primary_result.selected_locations, self._previous_selections)
-        self._previous_selections = primary_result.selected_locations
+        stability = jaccard(selected_locations, self._previous_selections)
+        self._previous_selections = selected_locations
 
         ensemble_summary = {
             "mean_burn_probability":      float(ensemble.burn_probability.mean()),
