@@ -3,24 +3,25 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Tuple, Optional
 import numpy as np
 
 
 @dataclass(frozen=True)
 class TerrainData:
-    elevation: np.ndarray        # float32[rows, cols], meters
-    slope: np.ndarray            # float32[rows, cols], degrees
-    aspect: np.ndarray           # float32[rows, cols], degrees from north
-    fuel_model: np.ndarray       # int8[rows, cols], Anderson 13 fuel model IDs
-    resolution_m: float          # grid cell size in meters (default 50.0)
-    origin: tuple[float, float]  # (lat, lon) of NW corner
-    shape: tuple[int, int]       # (rows, cols)
-    # Optional canopy layers — from LANDFIRE or proxy tables when absent
-    canopy_base_height: Optional[np.ndarray] = field(default=None)   # float32[rows, cols], m
-    canopy_bulk_density: Optional[np.ndarray] = field(default=None)  # float32[rows, cols], kg/m³
-    canopy_cover: Optional[np.ndarray] = field(default=None)          # float32[rows, cols], fraction 0-1
-
+    # Spatial layers — all float32[rows, cols] unless noted
+    elevation:           np.ndarray  # meters
+    slope:               np.ndarray  # degrees
+    aspect:              np.ndarray  # degrees from north
+    fuel_model:          np.ndarray  # int16[rows, cols], SB40 codes (91-204)
+    canopy_cover:        np.ndarray  # fraction 0-1
+    canopy_height:       np.ndarray  # meters
+    canopy_base_height:  np.ndarray  # meters
+    canopy_bulk_density: np.ndarray  # kg/m³
+    # Grid metadata
+    shape:        Tuple[int, int]                          # (rows, cols)
+    resolution_m: float                                    # meters per cell
+    origin_latlon: Optional[Tuple[float, float]] = None   # (lat, lon) of NW corner
 
 @dataclass(frozen=True)
 class GPPrior:

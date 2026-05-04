@@ -91,16 +91,20 @@ def _imshow(
     colorbar_label: str = "",
     alpha: float = 1.0,
     interpolation: str = "nearest",
+    extent: Optional[Sequence[float]] = None,  # [left, right, bottom, top] in km
 ) -> None:
     """Standard imshow with title and colorbar, matching global style."""
     im = ax.imshow(
         data, origin="upper", cmap=cmap,
         vmin=vmin, vmax=vmax,
         alpha=alpha, interpolation=interpolation,
+        extent=extent,
     )
     ax.set_title(title, fontsize=VIZ_CONFIG["font_size"], fontweight="bold")
-    ax.set_xlabel("East →", fontsize=VIZ_CONFIG["label_size"])
-    ax.set_ylabel("↑ North", fontsize=VIZ_CONFIG["label_size"])
+    xlabel = "Easting (km) →" if extent is not None else "Easting (px) →"
+    ylabel = "→ Northing (km)" if extent is not None else "→ Northing (px)"
+    ax.set_xlabel(xlabel, fontsize=VIZ_CONFIG["label_size"])
+    ax.set_ylabel(ylabel, fontsize=VIZ_CONFIG["label_size"])
     ax.tick_params(labelsize=VIZ_CONFIG["tick_size"])
     cb = plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
     cb.set_label(colorbar_label, fontsize=VIZ_CONFIG["label_size"])

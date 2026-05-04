@@ -107,24 +107,21 @@ def synthetic_terrain(
 
     slope, aspect = _slope_aspect(elevation, resolution_m)
 
-    # ── Fuel models by elevation band (vegetation zonation) ───────────────
-    # Low  (<500m):   grassland / chaparral (models 1-3, 6-7)
-    # Mid  (500-900m): shrub / open woodland (models 4-5, 6)
-    # High (>900m):   timber / slash (models 8-11)
-    fuel_model = np.empty(shape, dtype=np.int8)
+    # ── Fuel models by elevation band (SB40 codes, vegetation zonation) ──
+    # Low  (<500m):   grass / grass-shrub  (GR2=102, GR3=103, GS1=121, GS2=122)
+    # Mid  (500-900m): shrub / timber under.(SH1=141, SH2=142, SH5=145, TU1=161)
+    # High (>900m):   timber litter        (TL1=181, TL2=182, TL3=183, TL8=188)
+    fuel_model = np.empty(shape, dtype=np.int16)
     low  = elevation <  500
     mid  = (elevation >= 500) & (elevation < 900)
     high = elevation >= 900
 
-    fuel_model[low]  = rng.choice([1, 2, 3, 6, 7],  size=low.sum())
-    fuel_model[mid]  = rng.choice([4, 5, 6, 7],     size=mid.sum())
-    fuel_model[high] = rng.choice([8, 9, 10, 11],   size=high.sum())
-
-    # Sprinkle non-burnable (model 91/93 — water/urban) is outside Anderson 13,
-    # so just keep everything burnable for the simulation domain.
+    fuel_model[low]  = rng.choice([102, 103, 121, 122], size=low.sum())
+    fuel_model[mid]  = rng.choice([141, 142, 145, 161], size=mid.sum())
+    fuel_model[high] = rng.choice([181, 182, 183, 188], size=high.sum())
 
     # ── Canopy arrays from proxy tables + small spatial jitter ───────────
-    cbh, cbd, cc = _canopy_from_fuel(fuel_model, rng)
+    ch, cbh, cbd, cc = _canopy_from_fuel(fuel_model, rng)
 
     logger.info(
         "Synthetic terrain generated: shape=%s, elev=[%.0f, %.0f] m",
@@ -135,12 +132,13 @@ def synthetic_terrain(
         slope=slope,
         aspect=aspect,
         fuel_model=fuel_model,
-        resolution_m=resolution_m,
-        origin=origin,
-        shape=shape,
+        canopy_cover=cc,
+        canopy_height=ch,
         canopy_base_height=cbh,
         canopy_bulk_density=cbd,
-        canopy_cover=cc,
+        shape=shape,
+        resolution_m=resolution_m,
+        origin_latlon=origin,
     )
 
 
@@ -148,32 +146,52 @@ def synthetic_terrain(
 # Canopy array helpers
 # ---------------------------------------------------------------------------
 
+# SB40 canopy proxy tables (used only by synthetic_terrain)
+_SB40_CH  = {  # canopy height (m)
+    102: 0.0, 103: 0.0, 121: 1.0, 122: 1.5,         # GR, GS
+    141: 2.0, 142: 2.5, 145: 3.0, 161: 8.0,          # SH, TU
+    181: 15.0, 182: 18.0, 183: 20.0, 188: 12.0,       # TL
+}
+_SB40_CBH = {102: 0.0, 103: 0.0, 121: 0.5, 122: 0.8,
+             141: 1.0, 142: 1.2, 145: 1.5, 161: 3.0,
+             181: 5.0, 182: 6.0, 183: 7.0, 188: 4.0}
+_SB40_CBD = {102: 0.00, 103: 0.00, 121: 0.02, 122: 0.03,
+             141: 0.05, 142: 0.05, 145: 0.06, 161: 0.10,
+             181: 0.12, 182: 0.14, 183: 0.15, 188: 0.10}
+_SB40_CC  = {102: 0.0, 103: 0.05, 121: 0.10, 122: 0.15,
+             141: 0.20, 142: 0.25, 145: 0.30, 161: 0.55,
+             181: 0.70, 182: 0.75, 183: 0.80, 188: 0.65}
+
+
 def _canopy_from_fuel(
     fuel_model: np.ndarray,
     rng: Optional[np.random.Generator] = None,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
-    Generate CBH, CBD, and canopy cover arrays from fuel model proxy tables.
+    Generate CH, CBH, CBD, and canopy cover arrays from SB40 proxy tables.
     Adds ±10% multiplicative jitter (when rng is provided) for spatial realism.
 
-    Returns (cbh, cbd, cc) all as float32[rows, cols].
+    Returns (ch, cbh, cbd, cc) all as float32[rows, cols].
     """
+    ch  = np.zeros(fuel_model.shape, dtype=np.float32)
     cbh = np.zeros(fuel_model.shape, dtype=np.float32)
     cbd = np.zeros(fuel_model.shape, dtype=np.float32)
     cc  = np.zeros(fuel_model.shape, dtype=np.float32)
-    for fid in CANOPY_CBH_M:
+    for fid in _SB40_CH:
         mask = fuel_model == fid
-        cbh[mask] = CANOPY_CBH_M[fid]
-        cbd[mask] = CANOPY_CBD_KGM3[fid]
-        cc[mask]  = CANOPY_COVER_FRACTION[fid]
+        ch[mask]  = _SB40_CH[fid]
+        cbh[mask] = _SB40_CBH[fid]
+        cbd[mask] = _SB40_CBD[fid]
+        cc[mask]  = _SB40_CC[fid]
 
     if rng is not None:
         jitter = rng.uniform(0.9, 1.1, fuel_model.shape).astype(np.float32)
+        ch  = np.clip(ch  * jitter, 0.0, None)
         cbh = np.clip(cbh * jitter, 0.0, None)
         cbd = np.clip(cbd * jitter, 0.0, None)
         cc  = np.clip(cc  * jitter, 0.0, 1.0)
 
-    return cbh, cbd, cc
+    return ch, cbh, cbd, cc
 
 
 # ---------------------------------------------------------------------------

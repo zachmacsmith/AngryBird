@@ -38,6 +38,11 @@ Shared helpers
 from __future__ import annotations
 
 # ---------------------------------------------------------------------------
+# §0 terrain
+# ---------------------------------------------------------------------------
+from .terrain import plot_terrain_overview, plot_terrain_elevation
+
+# ---------------------------------------------------------------------------
 # §1 operational
 # ---------------------------------------------------------------------------
 from .core import (
@@ -79,6 +84,9 @@ from ._style import save_or_show, VIZ_CONFIG, STRATEGY_STYLES, DRONE_COLORS
 
 
 __all__ = [
+    # §0
+    "plot_terrain_overview",
+    "plot_terrain_elevation",
     # §1
     "plot_fire_prediction_map",
     "plot_information_field",
