@@ -24,12 +24,16 @@ import numpy as np
 from .assimilation import assimilate_observations
 from .config import (
     ENSEMBLE_SIZE,
+    GP_DEFAULT_FMC_MEAN,
+    GP_DEFAULT_WIND_DIR_MEAN,
+    GP_DEFAULT_WIND_SPEED_MEAN,
     GRID_RESOLUTION_M,
     N_DRONES,
     SIMULATION_HORIZON_MIN,
 )
 from .gp import IGNISGPPrior
 from .information import compute_information_field
+from .observations import ObservationStore
 from .path_planner import plan_paths, selections_to_mission_queue
 from .selectors import registry as _default_registry
 from .selectors.base import SelectorRegistry
@@ -40,6 +44,7 @@ from .types import (
     GPPrior,
     InformationField,
     MissionQueue,
+    SelectionResult,
     TerrainData,
 )
 from .utils import jaccard
@@ -78,9 +83,15 @@ class IGNISOrchestrator:
     """
     Sequences the full IGNIS pipeline for one or many cycles.
 
+    obs_store owns all observations. Call obs_store.update_time() and
+    obs_store.add_raws() / add_drone_observations() externally before each
+    cycle. run_cycle() passes the store to assimilation so drone observations
+    collected this cycle are added to the store and the GP refits from it.
+
     Args:
         terrain:           static TerrainData (loaded once, never mutated)
-        gp:                IGNISGPPrior — mutated by add_observations each cycle
+        gp:                IGNISGPPrior backed by obs_store
+        obs_store:         centralized observation store (shared with gp)
         fire_engine:       implements FireEngineProtocol
         selector_name:     which strategy drives the live mission queue
         selector_registry: plug-and-play registry of all strategies
@@ -96,6 +107,7 @@ class IGNISOrchestrator:
         self,
         terrain: TerrainData,
         gp: IGNISGPPrior,
+        obs_store: ObservationStore,
         fire_engine: FireEngineProtocol,
         selector_name: str = "greedy",
         selector_registry: SelectorRegistry = _default_registry,
@@ -110,6 +122,7 @@ class IGNISOrchestrator:
     ) -> None:
         self.terrain          = terrain
         self.gp               = gp
+        self.obs_store        = obs_store
         self.fire_engine      = fire_engine
         self.selector_name    = selector_name
         self.registry         = selector_registry
@@ -135,6 +148,7 @@ class IGNISOrchestrator:
         ensemble: Optional[EnsembleResult] = None,
         priority_weight_field: Optional[np.ndarray] = None,
         exclusion_mask: Optional[np.ndarray] = None,
+        start_time: float = 0.0,
     ) -> tuple[MissionQueue, CycleReport]:
         """
         Execute one full IGNIS cycle.
@@ -164,6 +178,7 @@ class IGNISOrchestrator:
         assim_ensemble = ensemble if ensemble is not None else _neutral_ensemble(shape, self.n_members)
         assim = assimilate_observations(
             gp=self.gp,
+            obs_store=self.obs_store,
             ensemble=assim_ensemble,
             observations=observations,
             shape=shape,
@@ -229,6 +244,9 @@ class IGNISOrchestrator:
             evaluations={},          # filled by SimulationRunner (Phase 4b)
             ensemble_summary=ensemble_summary,
             placement_stability=stability,
+            gp_prior=gp_prior,
+            selection_result=primary_result,
+            start_time=start_time,
         )
 
         logger.info(
@@ -253,9 +271,9 @@ def _neutral_ensemble(shape: tuple[int, int], n_members: int) -> EnsembleResult:
     zero = np.zeros((rows, cols), dtype=np.float32)
     return EnsembleResult(
         member_arrival_times=np.full((n_members, rows, cols), np.nan, dtype=np.float32),
-        member_fmc_fields=np.full((n_members, rows, cols), 0.10,  dtype=np.float32),
-        member_wind_fields=np.full((n_members, rows, cols), 5.0,   dtype=np.float32),
-        member_wind_dir_fields=np.full((n_members, rows, cols), 270.0, dtype=np.float32),
+        member_fmc_fields=np.full((n_members, rows, cols), GP_DEFAULT_FMC_MEAN,        dtype=np.float32),
+        member_wind_fields=np.full((n_members, rows, cols), GP_DEFAULT_WIND_SPEED_MEAN, dtype=np.float32),
+        member_wind_dir_fields=np.full((n_members, rows, cols), GP_DEFAULT_WIND_DIR_MEAN, dtype=np.float32),
         burn_probability=zero,
         mean_arrival_time=zero,
         arrival_time_variance=zero,

@@ -66,13 +66,32 @@ from .ground_truth import GroundTruth, compute_wind_field
 from .observation_buffer import ObservationBuffer, thin_observations
 from ..assimilation import aggregate_drone_observations
 from ..config import (
+    CAMERA_FOOTPRINT_M,
+    CYCLE_INTERVAL_S,
+    DRONE_ENDURANCE_S,
+    DRONE_SPEED_MS,
     GP_CORRELATION_LENGTH_FMC_M,
+    GP_DEFAULT_FMC_VARIANCE,
+    GP_DEFAULT_WIND_DIR_MEAN,
+    GP_DEFAULT_WIND_SPEED_MEAN,
+    GP_DEFAULT_WIND_SPEED_VARIANCE,
+    N_DRONES,
+    NELSON_DEFAULT_RH,
+    NELSON_DEFAULT_T_C,
+    OBSERVATION_THINNING_SPACING_M,
     RAWS_FMC_SIGMA,
-    RAWS_WIND_SPEED_SIGMA,
     RAWS_WIND_DIR_SIGMA,
+    RAWS_WIND_SPEED_SIGMA,
+    SIM_TOTAL_TIME_S,
 )
 from .observer import ObservationSource, SimulatedObserver
 from .renderer import FrameRenderer
+from ..observations import (
+    Observation,
+    ObservationSource as ObsSource,
+    ObservationType,
+    RAWSObservation,
+)
 from ..raws import RAWSObserver, RAWSStation, place_raws_stations
 
 logger = logging.getLogger(__name__)
@@ -85,13 +104,13 @@ logger = logging.getLogger(__name__)
 @dataclass
 class SimulationConfig:
     """Configuration for the clock-based SimulationRunner."""
-    dt: float = 10.0                        # simulation timestep (seconds)
-    total_time_s: float = 21600.0           # 6 hours
-    ignis_cycle_interval_s: float = 1200.0  # IGNIS runs every 20 minutes
-    n_drones: int = 5
-    drone_speed_ms: float = 15.0            # m/s cruise speed
-    drone_endurance_s: float = 1800.0       # 30 minutes per sortie
-    camera_footprint_m: float = 100.0       # FMC observation footprint radius
+    dt: float = 10.0                                   # simulation timestep (seconds)
+    total_time_s: float = SIM_TOTAL_TIME_S             # total simulation duration
+    ignis_cycle_interval_s: float = CYCLE_INTERVAL_S   # IGNIS cycle interval
+    n_drones: int = N_DRONES
+    drone_speed_ms: float = DRONE_SPEED_MS             # m/s cruise speed
+    drone_endurance_s: float = DRONE_ENDURANCE_S       # flight endurance per sortie
+    camera_footprint_m: float = CAMERA_FOOTPRINT_M     # FMC observation footprint radius
     base_cell: tuple[int, int] = (195, 100) # (row, col) drone home location
     frame_interval: int = 6                 # render one frame every N sim steps
     fps: int = 10                           # video frames per second
@@ -222,59 +241,63 @@ class LiveEstimator:
         """
         if self._has_obs:
             # Aggregate the buffer's raw obs at the full GP correlation length.
-            # This mirrors the IGNIS cycle assimilation path and prevents the
-            # live estimate from showing spiky artifacts between cycle boundaries
-            # (the old thin_observations used only 200 m spacing, dumping dozens
-            # of barely-separated obs into the already-fitted GP copy).
             aggregated = aggregate_drone_observations(
                 self._obs_buffer._buffer,
                 spacing_m=GP_CORRELATION_LENGTH_FMC_M,
                 resolution_m=self._obs_buffer._resolution_m,
             )
             if aggregated:
+                # Fork the live GP's store so we can add new obs without touching
+                # the main store. The deep-copied GP points to the forked store.
+                work_store = self._live_gp._store.fork()
                 work_gp    = copy.deepcopy(self._live_gp)
-                locs       = [o.location  for o in aggregated]
-                fmc_vals   = [o.fmc       for o in aggregated]
-                fmc_sigmas = [o.fmc_sigma for o in aggregated]
+                work_gp._store = work_store
 
-                # Wind speed — nadir cells only (off-centre footprint obs have NaN)
-                ws_obs     = [o for o in aggregated
-                              if o.wind_speed is not None
-                              and np.isfinite(o.wind_speed)
-                              and o.wind_speed_sigma is not None
-                              and np.isfinite(o.wind_speed_sigma)]
-                ws_locs    = [o.location         for o in ws_obs]
-                ws_vals    = [o.wind_speed        for o in ws_obs]
-                ws_sigmas  = [o.wind_speed_sigma  for o in ws_obs]
+                new_obs: list[Observation] = []
+                for o in aggregated:
+                    t = o.timestamp or 0.0
+                    new_obs.append(Observation(
+                        location  = o.location,
+                        obs_type  = ObservationType.FMC,
+                        source    = ObsSource.DRONE_MULTISPECTRAL,
+                        value     = o.fmc,
+                        sigma     = o.fmc_sigma,
+                        timestamp = t,
+                        source_id = o.drone_id or "drone",
+                    ))
+                ws_obs = [o for o in aggregated
+                          if o.wind_speed is not None
+                          and np.isfinite(o.wind_speed)
+                          and o.wind_speed_sigma is not None
+                          and np.isfinite(o.wind_speed_sigma)]
+                for o in ws_obs:
+                    new_obs.append(Observation(
+                        location  = o.location,
+                        obs_type  = ObservationType.WIND_SPEED,
+                        source    = ObsSource.DRONE_ANEMOMETER,
+                        value     = o.wind_speed,
+                        sigma     = o.wind_speed_sigma,
+                        timestamp = o.timestamp or 0.0,
+                        source_id = o.drone_id or "drone",
+                    ))
+                wd_obs = [o for o in ws_obs
+                          if o.wind_dir is not None
+                          and np.isfinite(o.wind_dir)]
+                for o in wd_obs:
+                    new_obs.append(Observation(
+                        location  = o.location,
+                        obs_type  = ObservationType.WIND_DIRECTION,
+                        source    = ObsSource.DRONE_ANEMOMETER,
+                        value     = o.wind_dir,
+                        sigma     = o.wind_dir_sigma if o.wind_dir_sigma is not None else 10.0,
+                        timestamp = o.timestamp or 0.0,
+                        source_id = o.drone_id or "drone",
+                    ))
 
-                # Wind direction — same nadir cells (also carry wind_dir)
-                wd_obs     = [o for o in ws_obs
-                              if o.wind_dir is not None
-                              and np.isfinite(o.wind_dir)]
-                wd_locs    = [o.location   for o in wd_obs]
-                wd_vals    = [o.wind_dir   for o in wd_obs]
-                wd_sigmas  = [o.wind_dir_sigma
-                              if o.wind_dir_sigma is not None else 10.0
-                              for o in wd_obs]
-
-                obs_times = [o.timestamp if o.timestamp is not None else 0.0 for o in aggregated]
-                ws_times  = [o.timestamp if o.timestamp is not None else 0.0 for o in ws_obs]
-                wd_times  = [o.timestamp if o.timestamp is not None else 0.0 for o in wd_obs]
-                work_gp.add_observations(
-                    locs, fmc_vals, fmc_sigmas,
-                    obs_times=obs_times,
-                    ws_vals=ws_vals or None,
-                    ws_sigmas=ws_sigmas or None,
-                    ws_locs=ws_locs or None,
-                    ws_times=ws_times or None,
-                    wd_vals=wd_vals or None,
-                    wd_sigmas=wd_sigmas or None,
-                    wd_locs=wd_locs or None,
-                    wd_times=wd_times or None,
-                )
+                if new_obs:
+                    work_store.add_drone_observations(new_obs)
                 self._cached_prior = work_gp.predict(shape)
-            # Always reset so we don't redo the expensive deepcopy/predict unless
-            # add_observations() brings in new data between render frames.
+            # Reset so we don't redo the expensive fork/predict unless new obs arrive.
             self._has_obs = False
 
         prior = self._cached_prior if self._cached_prior is not None \
@@ -486,6 +509,8 @@ class CycleRunner:
             evaluations=evaluations,
             ensemble_summary=cycle_report.ensemble_summary,
             placement_stability=cycle_report.placement_stability,
+            gp_prior=gp_prior,
+            selection_result=selection_results.get(self.primary_strategy),
         )
 
         logger.info(
@@ -596,7 +621,7 @@ class SimulationRunner:
         # Initialized from the no-observations default so cycle 1 captures the RAWS
         # seeding contribution. Monotonically decreasing (more obs → lower variance).
         _n = terrain.shape[0] * terrain.shape[1]
-        self._prev_gp_var_sum: float = (0.04 + 4.0) * _n  # FMC + wind-speed defaults
+        self._prev_gp_var_sum: float = (GP_DEFAULT_FMC_VARIANCE + GP_DEFAULT_WIND_SPEED_VARIANCE) * _n
 
         base_pos = cell_to_pos_m(config.base_cell, terrain.resolution_m)
         self.drones = [
@@ -641,15 +666,38 @@ class SimulationRunner:
         self.renderer._raws_locations = self.raws_observer.locations
 
         raws_obs = self.raws_observer.observe_all()
-        orchestrator.gp.add_raws(
-            locations=[o.location for o in raws_obs],
-            fmc_vals=[o.fmc for o in raws_obs],
-            ws_vals=[o.wind_speed for o in raws_obs],
-            wd_vals=[o.wind_dir for o in raws_obs],
-            fmc_sigmas=[o.fmc_sigma for o in raws_obs],
-            ws_sigmas=[o.wind_speed_sigma for o in raws_obs],
-            wd_sigmas=[o.wind_dir_sigma for o in raws_obs],
-        )
+        for station, obs in zip(self.raws_observer.stations, raws_obs):
+            sid = station.station_id
+            station_obs = [
+                RAWSObservation(
+                    location  = obs.location,
+                    obs_type  = ObservationType.FMC,
+                    source    = ObsSource.RAWS,
+                    value     = obs.fmc,
+                    sigma     = obs.fmc_sigma,
+                    timestamp = 0.0,
+                    source_id = sid,
+                ),
+                RAWSObservation(
+                    location  = obs.location,
+                    obs_type  = ObservationType.WIND_SPEED,
+                    source    = ObsSource.RAWS,
+                    value     = obs.wind_speed,
+                    sigma     = obs.wind_speed_sigma,
+                    timestamp = 0.0,
+                    source_id = sid,
+                ),
+                RAWSObservation(
+                    location  = obs.location,
+                    obs_type  = ObservationType.WIND_DIRECTION,
+                    source    = ObsSource.RAWS,
+                    value     = obs.wind_dir,
+                    sigma     = obs.wind_dir_sigma,
+                    timestamp = 0.0,
+                    source_id = sid,
+                ),
+            ]
+            orchestrator.obs_store.add_raws(sid, station_obs)
 
         # Snapshot RAWS-only GP variance (before any drone observations).
         # Deep-copy so the main GP's fitted state is not disturbed; the predict()
@@ -819,9 +867,8 @@ class SimulationRunner:
         """Flush observation buffer, run orchestrator, dispatch drones."""
         observations = self.obs_buffer.flush_thinned()
 
-        # Advance the GP clock so temporal decay and stale-observation pruning
-        # reflect the current simulation time before the cycle fits new data.
-        self.orchestrator.gp.update_time(self.current_time)
+        # Advance the store clock so temporal decay reflects the current sim time.
+        self.orchestrator.obs_store.update_time(self.current_time)
 
         fire_state = self.truth.fire.fire_state  # current burn mask (float32)
 
@@ -841,6 +888,7 @@ class SimulationRunner:
         mission_queue, cycle_report = self.orchestrator.run_cycle(
             fire_state=fire_state,
             observations=observations,
+            start_time=self.current_time,
         )
 
         # Cache cycle-level outputs for the renderer (info field, targets)

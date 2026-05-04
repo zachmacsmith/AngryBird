@@ -120,4 +120,7 @@ class CycleReport:
     info_field: InformationField
     evaluations: dict[str, StrategyEvaluation]
     ensemble_summary: dict
-    placement_stability: float   # Jaccard similarity with previous cycle's primary selections
+    placement_stability: float        # Jaccard similarity with previous cycle's primary selections
+    gp_prior: Optional[GPPrior] = None           # GP posterior used for this cycle's ensemble
+    selection_result: Optional[SelectionResult] = None  # primary strategy selection output
+    start_time: float = 0.0           # simulation clock at cycle start (seconds)
