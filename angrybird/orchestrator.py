@@ -22,6 +22,7 @@ from typing import Optional, Protocol, runtime_checkable
 import numpy as np
 
 from .assimilation import assimilate_observations
+from .prior import DynamicPrior
 from .config import (
     ENSEMBLE_SIZE,
     GP_DEFAULT_FMC_MEAN,
@@ -145,6 +146,12 @@ class IGNISOrchestrator:
         self.cycle_count      = 0
         self._previous_selections: list[tuple[int, int]] = []
 
+        # ── Dynamic prior ─────────────────────────────────────────────
+        self.dynamic_prior = DynamicPrior(
+            grid_shape=terrain.shape,
+            resolution_m=resolution_m,
+        )
+
         # ── Fire state estimation components ──────────────────────────────
         # max_arrival sentinel: 2× horizon in seconds (mirrors GPU engine's
         # 2× horizon_min sentinel, converted to seconds for FireState internals).
@@ -181,6 +188,7 @@ class IGNISOrchestrator:
         priority_weight_field: Optional[np.ndarray] = None,
         exclusion_mask: Optional[np.ndarray] = None,
         start_time: float = 0.0,
+        weather_source: Optional[dict] = None,
     ) -> tuple[MissionQueue, CycleReport]:
         """
         Execute one full IGNIS cycle.
@@ -200,6 +208,21 @@ class IGNISOrchestrator:
         self.cycle_count += 1
         rng   = np.random.default_rng(self.base_seed + self.cycle_count)
         shape = self.terrain.shape
+
+        # 0. Update dynamic prior from weather + last cycle's ensemble, then
+        #    push derived fields into the GP as prior means.
+        if weather_source is not None:
+            self.dynamic_prior.update_cycle(
+                current_time=start_time,
+                terrain=self.terrain,
+                weather_source=weather_source,
+                ensemble_result=self._last_ensemble_result,
+            )
+            means = self.dynamic_prior.get_gp_prior_means()
+            if means["fmc"] is not None:
+                self.gp.set_nelson_mean(means["fmc"])
+            if means["wind_speed"] is not None and means["wind_direction"] is not None:
+                self.gp.set_wind_prior_mean(means["wind_speed"], means["wind_direction"])
 
         # 1. Snapshot GP prior before assimilation (used for replan-flag comparison)
         self.gp.fit(start_time)

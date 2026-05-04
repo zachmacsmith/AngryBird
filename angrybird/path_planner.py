@@ -163,7 +163,7 @@ def selections_to_mission_queue(
     Converts to (lat, lon) using the terrain's NW corner origin.
     Sorted by information value descending.
     """
-    origin_lat, origin_lon = terrain.origin
+    origin_lat, origin_lon = terrain.origin_latlon
     requests: list[MissionRequest] = []
 
     for r, c in selected_locations:
