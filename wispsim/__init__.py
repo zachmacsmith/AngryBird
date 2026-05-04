@@ -1,14 +1,15 @@
 """
-Simulation harness — runs the angrybird package in a synthetic environment.
+WISPsim — WISP Simulated Internal Model.
 
-This package is separate from angrybird intentionally: it depends on angrybird
-as an external package and substitutes real drones/terrain/weather with
-simulated equivalents for development and evaluation.  Nothing in this package
-ships with the production system.
+Simulation harness for the WISP system (Wildfire Intelligence Surveillance
+Package).  Runs the angrybird (AB Protocol) package in a synthetic environment,
+substituting real drones, terrain, and weather with simulated equivalents for
+development and evaluation.  Nothing in this package ships with the production
+system.
 
 Quick start (cycle-based strategy comparison):
 
-    from simulation import CycleRunner, generate_ground_truth
+    from wispsim import CycleRunner, generate_ground_truth
 
     truth  = generate_ground_truth(terrain, ignition_cell=(150, 40), seed=42)
     runner = CycleRunner(
@@ -19,7 +20,7 @@ Quick start (cycle-based strategy comparison):
 
 Quick start (clock-based simulation video):
 
-    from simulation import SimulationRunner, SimulationConfig, hilly_heterogeneous
+    from wispsim import SimulationRunner, SimulationConfig, hilly_heterogeneous
 
     terrain, truth, config = hilly_heterogeneous()
     runner = SimulationRunner(config, terrain, truth, orchestrator)

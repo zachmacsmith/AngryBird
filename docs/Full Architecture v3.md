@@ -1,10 +1,10 @@
-# IGNIS: Comprehensive System Design
+# WISP: Comprehensive System Design
 
 ---
 
 ## 1. What the System Does
 
-IGNIS takes the data currently available to fire managers (sparse weather stations, satellite imagery, terrain maps), quantifies exactly where and why fire predictions are uncertain, and directs drones to the locations where measurement most reduces that uncertainty. It then assimilates the drone observations and repeats — each cycle sharpening the prediction in the regions that matter most.
+WISP takes the data currently available to fire managers (sparse weather stations, satellite imagery, terrain maps), quantifies exactly where and why fire predictions are uncertain, and directs drones to the locations where measurement most reduces that uncertainty. It then assimilates the drone observations and repeats — each cycle sharpening the prediction in the regions that matter most.
 
 The system answers three questions every ~20 minutes:
 
@@ -17,7 +17,7 @@ The system answers three questions every ~20 minutes:
 ## 2. Data Flow Overview
 
 ```
-    EXTERNAL DATA                      IGNIS PIPELINE
+    EXTERNAL DATA                      WISP PIPELINE
     
     LANDFIRE (30m)                 ┌──────────────────┐
     ├─ Elevation/Slope/Aspect      │  1. TERRAIN       │
@@ -714,7 +714,7 @@ class Orchestrator:
 
 ## 4. External Interface
 
-### IGNIS → UTM (Mission Queue)
+### WISP → UTM (Mission Queue)
 
 ```python
 @dataclass(frozen=True)
@@ -729,7 +729,7 @@ class MissionQueue:
     requests: list[MissionRequest]     # sorted by info value, descending
 ```
 
-### UTM → IGNIS
+### UTM → WISP
 
 ```python
 def ingest_observation(obs: DroneObservation) -> Optional[MissionQueue]:
@@ -781,7 +781,7 @@ def add_priority_region(polygon, weight) -> None:
 
 **Strong result:** The above, plus: QUBO and greedy select measurably different locations with QUBO slightly outperforming on at least some scenarios. The drone value curve shows a clear knee. The comparison holds across 2-3 fire scenarios with different terrain complexity.
 
-**Exceptional result:** The above, plus: a less accurate fire model with IGNIS-targeted data outpredicts a more accurate fire model with only RAWS data. This validates the thesis that wildfire prediction is data-limited, not model-limited.
+**Exceptional result:** The above, plus: a less accurate fire model with WISP-targeted data outpredicts a more accurate fire model with only RAWS data. This validates the thesis that wildfire prediction is data-limited, not model-limited.
 
 ---
 

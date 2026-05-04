@@ -1,4 +1,4 @@
-# IGNIS: Visualization Design Specification
+# WISP: Visualization Design Specification
 
 ---
 
@@ -265,7 +265,7 @@ If innovations remain high, the model is either wrong (systematic bias) or the f
 
 **Content:** If implemented — comparison plot showing prediction accuracy (vs ground truth) for:
 
-- Simple CA model + IGNIS-targeted observations (5 drones)
+- Simple CA model + WISP-targeted observations (5 drones)
 - Simple CA model + RAWS-only data (no drones)
 
 If the first line is below the second, wildfire prediction is data-limited. This is a single plot that validates the entire thesis.

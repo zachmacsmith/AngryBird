@@ -176,7 +176,7 @@ def hilly_heterogeneous(
     config = SimulationConfig(
         dt=10.0,
         total_time_s=21600.0,          # 6 hours
-        ignis_cycle_interval_s=1200.0, # IGNIS every 20 min
+        ignis_cycle_interval_s=1200.0, # WISP every 20 min
         n_drones=5,
         drone_speed_ms=15.0,
         drone_endurance_s=1800.0,
@@ -322,7 +322,7 @@ def dual_ignition(
     config = SimulationConfig(
         dt=10.0,
         total_time_s=3600.0,           # 1 hour
-        ignis_cycle_interval_s=1200.0, # 3 IGNIS cycles in the hour
+        ignis_cycle_interval_s=1200.0, # 3 WISP cycles in the hour
         n_drones=5,
         drone_speed_ms=15.0,
         drone_endurance_s=1800.0,

@@ -1,4 +1,4 @@
-# IGNIS: Implementation Considerations
+# WISP: Implementation Considerations
 
 Companion to the comprehensive design document. Covers pitfalls that will cause silent bugs if not addressed.
 

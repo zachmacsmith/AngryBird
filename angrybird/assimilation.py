@@ -35,7 +35,7 @@ from .config import (
     REPLAN_WIND_SHIFT_THRESHOLD_DEG,
 )
 from .gp import IGNISGPPrior
-from .observations import Observation, ObservationSource, ObservationStore, ObservationType
+from .observations import DroneObservation as DroneObs, ObservationStore, VariableType
 from .types import DroneObservation, EnsembleResult, GPPrior
 from .utils import angular_diff_deg, distance_grid, gaspari_cohn
 
@@ -366,46 +366,30 @@ def assimilate_observations(
             n_outliers, ENKF_OUTLIER_THRESHOLD,
         )
 
-    # Store update: convert aggregated DroneObservations to Observation objects
-    # and add them to the ObservationStore. The GP reads from the store on
-    # its next predict() call, so no separate gp.add_observations() is needed.
-    fmc_times = [o.timestamp if o.timestamp is not None else 0.0 for o in thinned]
-    ws_times  = [o.timestamp if o.timestamp is not None else 0.0 for o in wind_obs]
-    wd_times  = [o.timestamp if o.timestamp is not None else 0.0 for o in dir_obs]
-
-    new_obs: list[Observation] = []
-    for obs, t in zip(thinned, fmc_times):
-        new_obs.append(Observation(
-            location  = obs.location,
-            obs_type  = ObservationType.FMC,
-            source    = ObservationSource.DRONE_MULTISPECTRAL,
-            value     = obs.fmc,
-            sigma     = obs.fmc_sigma,
-            timestamp = t,
-            source_id = obs.drone_id or "drone",
-        ))
-    for obs, t in zip(wind_obs, ws_times):
-        new_obs.append(Observation(
-            location  = obs.location,
-            obs_type  = ObservationType.WIND_SPEED,
-            source    = ObservationSource.DRONE_ANEMOMETER,
-            value     = obs.wind_speed,
-            sigma     = obs.wind_speed_sigma,
-            timestamp = t,
-            source_id = obs.drone_id or "drone",
-        ))
-    for obs, t in zip(dir_obs, wd_times):
-        new_obs.append(Observation(
-            location  = obs.location,
-            obs_type  = ObservationType.WIND_DIRECTION,
-            source    = ObservationSource.DRONE_ANEMOMETER,
-            value     = obs.wind_dir,
-            sigma     = obs.wind_dir_sigma if obs.wind_dir_sigma is not None else 10.0,
-            timestamp = t,
-            source_id = obs.drone_id or "drone",
+    # Store update: one DroneObs per thinned telemetry location.
+    # Multi-variable observations collapse into a single store object; the
+    # GP unwraps them via to_data_points() at query time.
+    new_obs: list[DroneObs] = []
+    wind_by_loc = {o.location: o for o in wind_obs}
+    dir_by_loc  = {o.location: o for o in dir_obs}
+    for obs in thinned:
+        t  = obs.timestamp if obs.timestamp is not None else 0.0
+        wo = wind_by_loc.get(obs.location)
+        do = dir_by_loc.get(obs.location)
+        new_obs.append(DroneObs(
+            _source_id           = obs.drone_id or "drone",
+            _timestamp           = t,
+            location             = obs.location,
+            fmc                  = obs.fmc,
+            fmc_sigma            = obs.fmc_sigma,
+            wind_speed           = wo.wind_speed if wo else None,
+            wind_speed_sigma     = wo.wind_speed_sigma if wo else None,
+            wind_direction       = do.wind_dir if do else None,
+            wind_direction_sigma = (do.wind_dir_sigma if do and do.wind_dir_sigma is not None
+                                    else (10.0 if do else None)),
         ))
     if new_obs:
-        obs_store.add_drone_observations(new_obs)
+        obs_store.add_batch(new_obs)
 
     # EnKF updates — separate pass per variable, wind uses its own location subset
     obs_idx    = [r * shape[1] + c for r, c in locs]

@@ -1,5 +1,5 @@
 """
-IGNIS Subsystem Unit Tests + Diagnostic Visualisations
+WISP Subsystem Unit Tests + Diagnostic Visualisations
 =======================================================
 
 Covers every non-visualization core subsystem:
@@ -1143,7 +1143,7 @@ def test_ss7_assimilation():
 # ═════════════════════════════════════════════════════════════════════════════
 
 def test_ss8_ground_truth():
-    from simulation.ground_truth import generate_ground_truth, GroundTruth
+    from wispsim.ground_truth import generate_ground_truth, GroundTruth
     from angrybird.terrain import synthetic_terrain
 
     print("\n── SS8  simulation/ground_truth.py ───────────────────────────")
@@ -1240,8 +1240,8 @@ def test_ss8_ground_truth():
 # ═════════════════════════════════════════════════════════════════════════════
 
 def test_ss9_observer():
-    from simulation.observer import SimulatedObserver, ObservationSource
-    from simulation.ground_truth import generate_ground_truth
+    from wispsim.observer import SimulatedObserver, ObservationSource
+    from wispsim.ground_truth import generate_ground_truth
     from angrybird.terrain import synthetic_terrain
 
     print("\n── SS9  simulation/observer.py ───────────────────────────────")
@@ -1366,7 +1366,7 @@ def _print_summary():
     failed = total - passed
 
     print("\n" + "═" * 72)
-    print(f"  IGNIS SUBSYSTEM TEST SUMMARY  —  {passed}/{total} passed")
+    print(f"  WISP SUBSYSTEM TEST SUMMARY  —  {passed}/{total} passed")
     print("═" * 72)
 
     # Group by subsystem
@@ -1436,7 +1436,7 @@ def _make_summary_plot(passed: int, failed: int):
     ax.invert_yaxis()
 
     total = len(RESULTS)
-    title = f"IGNIS Subsystem Tests — {passed}/{total} passed"
+    title = f"WISP Subsystem Tests — {passed}/{total} passed"
     fig.suptitle(title, fontsize=14, fontweight="bold",
                  color="white", y=0.98)
 
@@ -1453,7 +1453,7 @@ def _make_summary_plot(passed: int, failed: int):
 if __name__ == "__main__":
     t0_total = time.perf_counter()
     print("=" * 72)
-    print("  IGNIS Subsystem Tests + Diagnostic Visualisations")
+    print("  WISP Subsystem Tests + Diagnostic Visualisations")
     print(f"  Output: {OUT}")
     print("=" * 72)
 

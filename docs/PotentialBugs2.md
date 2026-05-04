@@ -1,4 +1,4 @@
-# IGNIS: Implementation Addendum
+# WISP: Implementation Addendum
 
 Three items not adequately covered in existing documentation.
 

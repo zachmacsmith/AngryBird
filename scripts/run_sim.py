@@ -1,12 +1,12 @@
 """
-run_sim.py — Clock-based IGNIS simulation with animated video output.
+run_sim.py — Clock-based WISPsim simulation with animated video output.
 
 PRIMARY DEMO SCRIPT. Runs the full SimulationRunner:
   - Unified simulation clock (dt=10 s, 6 h total by default)
   - Dynamic wind evolution + scheduled wind-shift events (wind_shift scenario)
   - CA-based ground truth fire advancing every timestep
   - Simulated drone fleet: movement, FMC + wind sensor collection
-  - IGNIS cycles every 20 minutes (ensemble → info field → selection → assimilation)
+  - WISP cycles every 20 minutes (ensemble → info field → selection → assimilation)
   - 6-panel frame renderer → PNG sequence + MP4 video
 
 Scenarios (auto-discovered from scenarios.py — add a function there to register it)
@@ -19,7 +19,7 @@ Scenarios (auto-discovered from scenarios.py — add a function there to registe
 
 Usage
 -----
-    cd /path/to/AngryBird
+    cd /path/to/Wisp
     python scripts/run_sim.py                                        # hilly_heterogeneous, 6 h
     python scripts/run_sim.py --scenario wind_shift                  # wind-shift stress test
     python scripts/run_sim.py --scenario dual_ignition --hours 1     # dual-ignition, 1 h
@@ -49,8 +49,8 @@ from angrybird.gp import IGNISGPPrior
 from angrybird.observations import ObservationStore, ObservationType
 from angrybird.orchestrator import IGNISOrchestrator
 from angrybird.types import TerrainData
-import simulation.scenarios as _scenario_module
-from simulation import SimpleFire, SimulationConfig, SimulationRunner
+import wispsim.scenarios as _scenario_module
+from wispsim import SimpleFire, SimulationConfig, SimulationRunner
 
 
 def make_gp(terrain: TerrainData) -> tuple[IGNISGPPrior, ObservationStore]:
@@ -114,7 +114,7 @@ def main(
         scenario, hours, config.dt, config.n_drones, n_members,
     )
 
-    # ── IGNIS components ──────────────────────────────────────────────────
+    # ── WISP components (AB Protocol) ─────────────────────────────────────
     gp, obs_store = make_gp(terrain)   # make_gp returns (IGNISGPPrior, ObservationStore)
     fire_engine   = SimpleFire()
 
@@ -149,7 +149,7 @@ def main(
     cycles = len(reports)
 
     log.info(
-        "Done. %d IGNIS cycles | %d frames | %.1f s wall-clock | output: %s",
+        "Done. %d WISP cycles | %d frames | %.1f s wall-clock | output: %s",
         cycles, frames, elapsed, out.resolve(),
     )
 
@@ -163,7 +163,7 @@ def main(
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="IGNIS clock-based simulation")
+    parser = argparse.ArgumentParser(description="WISPsim clock-based simulation")
     parser.add_argument(
         "--scenario", choices=list(_SCENARIOS), default="hilly_heterogeneous",
         help=f"Scenario name — auto-discovered from scenarios.py: {sorted(_SCENARIOS)}",

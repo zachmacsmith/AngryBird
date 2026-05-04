@@ -90,10 +90,10 @@ class IGNISOrchestrator:
     """
     Sequences the full IGNIS pipeline for one or many cycles.
 
-    obs_store owns all observations. Call obs_store.update_time() and
-    obs_store.add_raws() / add_drone_observations() externally before each
-    cycle. run_cycle() passes the store to assimilation so drone observations
-    collected this cycle are added to the store and the GP refits from it.
+    obs_store owns all observations. Call obs_store.add_raws() / add() /
+    add_batch() externally before each cycle. run_cycle() passes the store
+    to assimilation so drone observations collected this cycle are added to
+    the store and the GP refits from it.
 
     Args:
         terrain:           static TerrainData (loaded once, never mutated)
@@ -202,6 +202,7 @@ class IGNISOrchestrator:
         shape = self.terrain.shape
 
         # 1. Snapshot GP prior before assimilation (used for replan-flag comparison)
+        self.gp.fit(start_time)
         gp_prior_before = self.gp.predict(shape)
 
         # 2. Assimilate previous cycle's observations
@@ -220,6 +221,7 @@ class IGNISOrchestrator:
         )
 
         # 3. Updated GP prior (post-assimilation; used for ensemble + info field)
+        self.gp.fit(start_time)
         gp_prior = self.gp.predict(shape)
 
         # ── Fire state management ─────────────────────────────────────────

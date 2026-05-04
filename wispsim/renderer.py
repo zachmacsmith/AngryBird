@@ -8,16 +8,16 @@ Layout (7-panel + header):
   ┌───────────────────────────────────────────────────────────────────┐
   │  SIMULATION TIME  |  CYCLE  |  OBSERVATIONS  |  LIVE UPDATES ▲   │
   ├──────────────┬──────────────┬─────────────────┬───────────────────┤
-  │ GROUND TRUTH │ IGNIS LIVE   │ EST. ARRIVAL    │ INFORMATION FIELD │
+  │ GROUND TRUTH │ WISP LIVE   │ EST. ARRIVAL    │ INFORMATION FIELD │
   │ True FMC     │ Est. FMC     │ TIME            │ GP uncertainty    │
   │ True wind    │ Est. wind    │ (single-member  │ + drone targets   │
-  │ True fire    │ (per-obs)    │  per-obs)       │ (per IGNIS cycle) │
+  │ True fire    │ (per-obs)    │  per-obs)       │ (per WISP cycle) │
   ├──────────────┴──────────────┴─────────────────┴───────────────────┤
   │  ENTROPY CONVERGENCE  (running plot, all strategies)              │
   └───────────────────────────────────────────────────────────────────┘
 
 Panels 2 and 3 update live: every render frame reflects the latest drone
-observations, NOT just the 20-minute IGNIS cycle boundary.  Panel 4 still
+observations, NOT just the 20-minute WISP cycle boundary.  Panel 4 still
 shows the per-cycle info field since it requires the full ensemble.
 
 Video output uses matplotlib FFMpegWriter when ffmpeg is available,
@@ -339,11 +339,11 @@ class FrameRenderer:
 
     Four map panels (top row):
       1. Ground Truth   — true FMC, true wind, true fire boundary
-      2. IGNIS Estimate — GP-posterior FMC + wind, updated LIVE per observation
+      2. WISP Estimate — GP-posterior FMC + wind, updated LIVE per observation
       3. Arrival Time   — single-member estimated time-to-fire, updated LIVE
-      4. Info Field     — GP uncertainty × sensitivity, updated per IGNIS cycle
+      4. Info Field     — GP uncertainty × sensitivity, updated per WISP cycle
 
-    Panels 2 & 3 update between IGNIS cycles because they only need
+    Panels 2 & 3 update between WISP cycles because they only need
     a GP predict() call + one fire member, not the full 30-member ensemble.
 
     Args:
@@ -399,7 +399,7 @@ class FrameRenderer:
 
         self.panels = {
             "truth":   MapPanel(ax_truth,   terrain, "Ground Truth: FMC + Wind + Fire"),
-            "est":     MapPanel(ax_est,     terrain, "IGNIS Estimate: FMC + Wind  ▲live"),
+            "est":     MapPanel(ax_est,     terrain, "WISP Estimate: FMC + Wind  ▲live"),
             "arrival": MapPanel(ax_arrival, terrain, "Estimated Arrival Time  ▲live"),
             "info":    MapPanel(ax_info,    terrain, "Information Field + Drone Targets"),
         }
@@ -422,11 +422,11 @@ class FrameRenderer:
         Render one frame if step % frame_interval == 0.
 
         Args:
-            gp_prior:             GP posterior from last IGNIS cycle (for info field)
+            gp_prior:             GP posterior from last WISP cycle (for info field)
             live_gp_prior:        GP posterior updated per-observation (FMC + wind panels)
             live_arrival_times_h: single-member arrival time estimate in hours,
                                   NaN for cells not reached within the horizon;
-                                  updated per-observation between IGNIS cycles
+                                  updated per-observation between WISP cycles
         """
         self._step_count = step
         if step % self.frame_interval != 0:
@@ -465,7 +465,7 @@ class FrameRenderer:
             raws_locations=rl,
         )
 
-        # ── Panel 2: Live IGNIS estimate — FMC + wind ─────────────────────
+        # ── Panel 2: Live WISP estimate — FMC + wind ─────────────────────
         self.panels["est"].update(
             fmc=est_prior.fmc_mean if est_prior is not None else None,
             wind_speed=(est_prior.wind_speed_mean if est_prior is not None else None),
@@ -486,7 +486,7 @@ class FrameRenderer:
             _draw_arrival_colorbar(self.panels["arrival"].ax, self.horizon_h)
             self._cb_drawn = True
 
-        # ── Panel 4: Information field (per IGNIS cycle) ──────────────────
+        # ── Panel 4: Information field (per WISP cycle) ──────────────────
         self.panels["info"].update(
             uncertainty=info_field.w if info_field is not None else None,
             drone_targets=mission_targets or [],
@@ -510,7 +510,7 @@ class FrameRenderer:
             "Cumulative GP Variance Reduction — Full Model vs RAWS-Only Baseline",
             fontsize=8, fontweight="bold",
         )
-        ax.set_xlabel("IGNIS Cycle", fontsize=7)
+        ax.set_xlabel("WISP Cycle", fontsize=7)
         ax.set_ylabel("Cumulative GP Variance Reduction (FMC + wind)", fontsize=7)
         ax.tick_params(labelsize=6)
         ax.grid(True, alpha=0.3)

@@ -1,16 +1,18 @@
-# IGNIS — Intelligent Guidance for Networked Information Systems
+# WISP — Wildfire Intelligence Surveillance Package
 
-Autonomous drone fleet planning for wildfire situational awareness. IGNIS quantifies where fire models are most uncertain, directs drones to resolve those uncertainties, and assimilates observations every ~20 minutes to sharpen predictions in real time.
+Autonomous drone fleet planning for wildfire situational awareness. WISP quantifies where fire models are most uncertain, directs drones to resolve those uncertainties, and assimilates observations every ~20 minutes to sharpen predictions in real time.
+
+The core drone routing and planning algorithm is the **AB Protocol** (AngryBird), implemented in the `angrybird` package.
 
 ---
 
 ## What it does
 
-Every IGNIS cycle:
+Every WISP cycle:
 1. **GP Prior** — fuses RAWS station readings, drone observations, and Nelson FMC physics into spatially varying estimates of fuel moisture and wind (with uncertainty).
 2. **Fire Ensemble** — runs N perturbed fire spread members to produce burn probability and arrival-time variance across the grid.
 3. **Information Field** — computes where GP variance × fire sensitivity × drone observability is highest — the cells where a measurement would most reduce prediction uncertainty.
-4. **Selection** — greedy or QUBO solver picks the k cell locations that maximize cumulative information gain.
+4. **Selection (AB Protocol)** — greedy or QUBO solver picks the k cell locations that maximize cumulative information gain.
 5. **Assimilation** — drone observations update the GP posterior and EnKF ensemble; the cycle repeats.
 
 ---
@@ -18,9 +20,9 @@ Every IGNIS cycle:
 ## Repository layout
 
 ```
-angrybird/          Core package (ships to production)
+angrybird/          AB Protocol core package (ships to production)
   gp.py               Gaussian Process prior — FMC, wind speed, wind direction
-  orchestrator.py     Sequences the full IGNIS cycle
+  orchestrator.py     Sequences the full WISP cycle
   information.py      Information field computation
   assimilation.py     EnKF + GP observation ingestion
   observations.py     Centralized ObservationStore (RAWS, drone, satellite)
@@ -28,10 +30,10 @@ angrybird/          Core package (ships to production)
   nelson.py           Nelson dead fuel moisture model
   raws.py             RAWS station types and observer
   tif_getter.py       LANDFIRE GeoTIFF download → TerrainData
-  selectors/          Greedy and QUBO placement strategies
+  selectors/          Greedy and QUBO placement strategies (AB Protocol)
   visualization/      Operational and evaluation plots
 
-simulation/         Simulation harness (dev/eval only — not production)
+wispsim/            WISPsim simulation harness (dev/eval only — not production)
   runner.py           SimulationRunner (clock-based) and CycleRunner (cycle-based)
   scenarios.py        Built-in scenarios: hilly_heterogeneous, dual_ignition, etc.
   simple_fire.py      Huygens elliptical CPU fire engine (lightweight fallback)
@@ -40,7 +42,7 @@ simulation/         Simulation harness (dev/eval only — not production)
   renderer.py         6-panel frame renderer → MP4 video
 
 scripts/
-  run_sim.py          PRIMARY entry point — clock-based simulation with video output
+  run_sim.py          PRIMARY entry point — clock-based WISPsim run with video output
 
 archived/           Deprecated scripts (do not run)
 docs/               Architecture and design specifications
@@ -76,7 +78,7 @@ Output frames and an MP4 video are written to `out/<scenario_name>/`.
 | `flat_homogeneous` | Flat control baseline — minimal drone advantage expected |
 | `crown_fire_risk` | Dense timber, high FMC, crown fire conditions |
 
-New scenarios are auto-discovered: add a function to `simulation/scenarios.py` and it appears in `--scenario` choices automatically.
+New scenarios are auto-discovered: add a function to `wispsim/scenarios.py` and it appears in `--scenario` choices automatically.
 
 ---
 

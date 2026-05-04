@@ -4,7 +4,7 @@ Observation buffer with spatial thinning.
 Phase 4b — simulation harness only.
 
 Drones accumulate observations continuously at 10-second intervals.
-The buffer is flushed at each IGNIS cycle boundary; before passing
+The buffer is flushed at each WISP cycle boundary; before passing
 observations to the GP/EnKF we thin spatially so the assimilation
 does not receive hundreds of near-identical readings from the same cell.
 """

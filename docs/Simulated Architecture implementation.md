@@ -1,11 +1,11 @@
-# IGNIS Simulation Harness: Design Specification
+# WISP Simulation Harness: Design Specification
 
 ---
 ## Overview
 
-The simulation harness wraps the core IGNIS pipeline in a synthetic environment where ground truth is known, drones are simulated, and the entire system can be visualized as an animated video. It serves two purposes: validating that the system works, and producing the demo that wins the hackathon.
+The simulation harness wraps the core WISP pipeline in a synthetic environment where ground truth is known, drones are simulated, and the entire system can be visualized as an animated video. It serves two purposes: validating that the system works, and producing the demo that wins the hackathon.
 
-The simulation runs on a unified clock. At each simulation timestep, the ground truth fire advances, drones move along their paths collecting measurements, and at defined intervals the IGNIS core runs a cycle (ensemble → information field → selection → assimilation). The visualization renders every timestep as a video frame.
+The simulation runs on a unified clock. At each simulation timestep, the ground truth fire advances, drones move along their paths collecting measurements, and at defined intervals the WISP core runs a cycle (ensemble → information field → selection → assimilation). The visualization renders every timestep as a video frame.
 
 ---
 
@@ -22,7 +22,7 @@ The simulation runs on a unified clock. At each simulation timestep, the ground 
           │                │                    │
           ▼                ▼                    ▼
    ┌──────────────┐ ┌──────────────┐  ┌────────────────┐
-   │ GROUND TRUTH │ │    DRONE     │  │  IGNIS CORE    │
+   │ GROUND TRUTH │ │    DRONE     │  │  WISP CORE    │
    │              │ │  SIMULATOR   │  │  (runs every   │
    │ • FMC field  │ │              │  │   N minutes)   │
    │ • Wind field │ │ • Positions  │  │                │
@@ -37,7 +37,7 @@ The simulation runs on a unified clock. At each simulation timestep, the ground 
           │         │ OBSERVATION  │           │
           │         │ BUFFER       ├──────────▶│
           │         │ Thin & pass  │  (on cycle)
-          │         │ to IGNIS     │           │
+          │         │ to WISP     │           │
           │         └──────────────┘           │
           │                                    │
           ▼                                    ▼
@@ -142,7 +142,7 @@ class GroundTruthFire:
         self.current_time += dt
 ```
 
-The ground truth fire produces the "real" fire perimeter that the IGNIS ensemble is trying to predict. The gap between IGNIS's prediction and this ground truth is the error the system works to reduce.
+The ground truth fire produces the "real" fire perimeter that the WISP ensemble is trying to predict. The gap between WISP's prediction and this ground truth is the error the system works to reduce.
 
 ---
 
@@ -270,7 +270,7 @@ def collect_observations(drone: DroneState, ground_truth: GroundTruth,
 
 ### 2.4 Observation Buffer and Thinning
 
-Drones accumulate observations continuously. At each IGNIS cycle boundary, the buffer is thinned and passed to the core model.
+Drones accumulate observations continuously. At each WISP cycle boundary, the buffer is thinned and passed to the core model.
 
 ```python
 class ObservationBuffer:
@@ -299,7 +299,7 @@ class ObservationBuffer:
 class SimulationConfig:
     dt: float = 10.0                  # simulation timestep (seconds)
     total_time_s: float = 21600.0     # 6 hours
-    ignis_cycle_interval_s: float = 1200.0  # IGNIS runs every 20 minutes
+    ignis_cycle_interval_s: float = 1200.0  # WISP runs every 20 minutes
     n_drones: int = 5
     drone_speed: float = 15.0        # m/s
     drone_endurance_s: float = 1800.0  # 30 minutes per sortie
@@ -348,7 +348,7 @@ class SimulationRunner:
         self.cycle_count = 0
         self.cycle_reports = []
         
-        # Current IGNIS outputs for visualization
+        # Current WISP outputs for visualization
         self.current_info_field = None
         self.current_gp_mean = None
         self.current_gp_variance = None
@@ -390,7 +390,7 @@ class SimulationRunner:
                     )
                     self.obs_buffer.add(obs)
             
-            # 4. Check if IGNIS cycle is due
+            # 4. Check if WISP cycle is due
             if self.current_time - self.last_cycle_time >= self.config.ignis_cycle_interval_s:
                 self._run_ignis_cycle()
                 self.last_cycle_time = self.current_time
@@ -413,17 +413,17 @@ class SimulationRunner:
         return self.cycle_reports
     
     def _run_ignis_cycle(self):
-        """Execute one IGNIS cycle: assimilate observations, replan."""
+        """Execute one WISP cycle: assimilate observations, replan."""
         self.cycle_count += 1
         
         # Flush and thin observations from buffer
         observations = self.obs_buffer.flush_thinned()
         
-        # Run core IGNIS cycle
+        # Run core WISP cycle
         report = self.orchestrator.run_cycle(observations=observations)
         self.cycle_reports.append(report)
         
-        # Cache IGNIS outputs for visualization
+        # Cache WISP outputs for visualization
         self.current_info_field = report.info_field
         self.current_gp_mean = report.gp_mean
         self.current_gp_variance = report.gp_variance
@@ -470,7 +470,7 @@ Six-panel layout plus a timeline bar:
 │  SIMULATION TIME: 02:34:10    CYCLE: 7/18    DRONES: 5   │
 ├───────────────────┬───────────────────┬──────────────────┤
 │                   │                   │                  │
-│  GROUND TRUTH     │  IGNIS ESTIMATE   │  UNCERTAINTY     │
+│  GROUND TRUTH     │  WISP ESTIMATE   │  UNCERTAINTY     │
 │  FMC + WIND       │  FMC + WIND       │  MAP             │
 │                   │                   │                  │
 │  [terrain base]   │  [terrain base]   │  [terrain base]  │
@@ -598,7 +598,7 @@ class FrameRenderer:
         self.fig, self.axes = plt.subplots(2, 3, figsize=(20, 14))
         self.panels = {
             "truth_fmc": MapPanel(self.axes[0,0], terrain, "Ground Truth: FMC + Wind"),
-            "estimate":  MapPanel(self.axes[0,1], terrain, "IGNIS Estimate"),
+            "estimate":  MapPanel(self.axes[0,1], terrain, "WISP Estimate"),
             "uncertainty": MapPanel(self.axes[0,2], terrain, "Information Field"),
         }
         self.entropy_ax = self.fig.add_subplot(2, 1, 2)  # bottom spanning row
@@ -640,7 +640,7 @@ class FrameRenderer:
         render_drones(self.axes[0,0], drones, 
                      self.terrain.resolution_m, self.terrain.origin)
         
-        # Panel 2: IGNIS estimate
+        # Panel 2: WISP estimate
         if gp_mean is not None:
             self.panels["estimate"].update(
                 fmc=gp_mean,

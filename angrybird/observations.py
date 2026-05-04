@@ -1,114 +1,355 @@
 """
 Centralized observation types and storage for IGNIS.
 
-All observation ingestion, decay, and pruning is managed here.
-GP, EnKF, and visualization read from ObservationStore; they don't store obs.
+Design principles:
+  - Store physical observations, serve mathematical DataPoints.
+  - Time-parameterized queries: callers pass query_time; sigmas are decayed
+    at query time. The store is append-only (plus pruning). No mutable state.
+  - Decay logic lives in each observation class via to_data_points().
+  - The GP calls get_data_points() and sees only (location, value, sigma) tuples.
 """
 
 from __future__ import annotations
 
 import threading
-from collections import defaultdict
+from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Iterator, Optional
+from typing import Optional
 
 import numpy as np
 
 
 # ---------------------------------------------------------------------------
-# Enumerations
+# Variable and source enumerations
 # ---------------------------------------------------------------------------
 
-class ObservationType(Enum):
+class VariableType(Enum):
     FMC            = "fmc"
     WIND_SPEED     = "wind_speed"
     WIND_DIRECTION = "wind_direction"
-    FIRE_DETECTION = "fire_detection"
     TEMPERATURE    = "temperature"
     HUMIDITY       = "humidity"
+    FIRE_DETECTION = "fire_detection"
 
 
-class ObservationSource(Enum):
-    RAWS                = "raws"
-    DRONE_MULTISPECTRAL = "drone_multispectral"
-    DRONE_ANEMOMETER    = "drone_anemometer"
-    DRONE_WEATHER       = "drone_weather"
-    DRONE_THERMAL       = "drone_thermal"
-    SATELLITE_VIIRS     = "satellite_viirs"
-    SATELLITE_GOES      = "satellite_goes"
-    SATELLITE_MODIS     = "satellite_modis"
+# Backward-compat alias
+ObservationType = VariableType
 
 
 # ---------------------------------------------------------------------------
-# Base observation class
+# DataPoint — the mathematical representation consumed by GP / EnKF
 # ---------------------------------------------------------------------------
 
 @dataclass(frozen=True)
-class Observation:
-    """Immutable observation. Subclass for non-standard decay behaviour."""
-    location:  tuple[int, int]      # (row, col) in grid coordinates
-    obs_type:  ObservationType
-    source:    ObservationSource
-    value:     float                # measured value in SI units
-    sigma:     float                # measurement noise (original, never inflated)
-    timestamp: float                # simulation time in seconds
-    source_id: str                  # e.g. "RAWS_CEDU", "drone_03", "VIIRS_pass_12"
-
-    def effective_sigma(self, current_time: float, tau: float) -> float:
-        """Sigma inflated by temporal decay."""
-        age = max(0.0, current_time - self.timestamp)
-        return self.sigma * np.exp(age / tau)
-
-    def is_expired(self, current_time: float, tau: float,
-                   drop_factor: float = 10.0) -> bool:
-        return self.effective_sigma(current_time, tau) > drop_factor * self.sigma
+class DataPoint:
+    """
+    A single (location, value, sigma) tuple consumed by the GP/EnKF.
+    Mathematical consumers never see the Observation object that produced it.
+    sigma is the effective (post-decay) measurement noise.
+    """
+    location:  tuple[int, int]
+    variable:  VariableType
+    value:     float
+    sigma:     float      # effective sigma after decay
+    timestamp: float      # when the original measurement was taken
 
 
 # ---------------------------------------------------------------------------
-# Specialised subclasses
+# Decay constants and expiry threshold
+# ---------------------------------------------------------------------------
+
+# Tau values (seconds) per variable type, used by decaying observations.
+TAU: dict[VariableType, float] = {
+    VariableType.FMC:            3_600.0,   # 1 hr
+    VariableType.WIND_SPEED:     7_200.0,   # 2 hr
+    VariableType.WIND_DIRECTION: 3_600.0,   # 1 hr
+    VariableType.TEMPERATURE:    3_600.0,
+    VariableType.HUMIDITY:       3_600.0,
+}
+
+EXPIRY_FACTOR: float = 10.0  # observation expires when sigma > 10× original
+
+
+# ---------------------------------------------------------------------------
+# Abstract base class
+# ---------------------------------------------------------------------------
+
+class Observation(ABC):
+    """
+    Interface for all observation types.
+
+    An observation represents a physical measurement event. It may contain
+    multiple variable types (a drone measures FMC + wind simultaneously).
+    It knows how to decay itself and how to decide when it has expired.
+
+    Subclasses MUST implement:
+      to_data_points(query_time) -> list[DataPoint]
+      is_expired(query_time) -> bool
+      source_id (property)
+      timestamp (property)
+      variables (property)
+    """
+
+    @abstractmethod
+    def to_data_points(self, query_time: float) -> list[DataPoint]:
+        """
+        Convert this observation to mathematical data points at query_time.
+        Each returned DataPoint has sigma adjusted for temporal decay.
+        May return multiple DataPoints (one per variable measured).
+        """
+        ...
+
+    @abstractmethod
+    def is_expired(self, query_time: float) -> bool:
+        """
+        Should this observation be pruned at query_time?
+        RAWS observations return False (never expire — replaced instead).
+        Fire detections return False (permanent).
+        Drone observations return True when sigma has inflated > EXPIRY_FACTOR × original.
+        """
+        ...
+
+    @property
+    @abstractmethod
+    def source_id(self) -> str:
+        """Unique identifier for the source (station ID, drone ID, satellite pass)."""
+        ...
+
+    @property
+    @abstractmethod
+    def timestamp(self) -> float:
+        """When this observation was recorded (simulation seconds)."""
+        ...
+
+    @property
+    @abstractmethod
+    def variables(self) -> list[VariableType]:
+        """Which variable types this observation contains."""
+        ...
+
+
+# ---------------------------------------------------------------------------
+# RAWS observation — fixed ground station, never decays
 # ---------------------------------------------------------------------------
 
 @dataclass(frozen=True)
 class RAWSObservation(Observation):
     """
-    RAWS readings don't decay — they're replaced by fresh readings each cycle.
-    Sigma is fixed at the original measurement noise regardless of age.
+    Fixed ground station reading. Contains FMC + wind speed + wind direction.
+    Never decays. Replaced entirely when a new reading arrives from the
+    same station (store is keyed on source_id).
     """
+    _source_id:          str
+    _timestamp:          float
+    location:            tuple[int, int]
+    fmc:                 float
+    fmc_sigma:           float
+    wind_speed:          float
+    wind_speed_sigma:    float
+    wind_direction:      float
+    wind_direction_sigma: float
 
-    def effective_sigma(self, current_time: float, tau: float) -> float:
-        return self.sigma
+    @property
+    def source_id(self) -> str:
+        return self._source_id
 
-    def is_expired(self, current_time: float, tau: float,
-                   drop_factor: float = 10.0) -> bool:
-        return False
+    @property
+    def timestamp(self) -> float:
+        return self._timestamp
 
+    @property
+    def variables(self) -> list[VariableType]:
+        return [VariableType.FMC, VariableType.WIND_SPEED, VariableType.WIND_DIRECTION]
+
+    def to_data_points(self, query_time: float) -> list[DataPoint]:
+        # No decay — sigma is always original
+        return [
+            DataPoint(self.location, VariableType.FMC,
+                      self.fmc, self.fmc_sigma, self._timestamp),
+            DataPoint(self.location, VariableType.WIND_SPEED,
+                      self.wind_speed, self.wind_speed_sigma, self._timestamp),
+            DataPoint(self.location, VariableType.WIND_DIRECTION,
+                      self.wind_direction, self.wind_direction_sigma, self._timestamp),
+        ]
+
+    def is_expired(self, query_time: float) -> bool:
+        return False  # never expires — only replaced
+
+
+# ---------------------------------------------------------------------------
+# Drone observation — decays over time
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class DroneObservation(Observation):
+    """
+    Single measurement from a drone at one grid cell.
+    Contains whichever variables the drone's sensors captured.
+    Decays exponentially — sigma inflates with age.
+    """
+    _source_id:           str
+    _timestamp:           float
+    location:             tuple[int, int]
+
+    # Optional per variable — None means this drone didn't measure it here
+    fmc:                  Optional[float] = None
+    fmc_sigma:            Optional[float] = None
+    wind_speed:           Optional[float] = None
+    wind_speed_sigma:     Optional[float] = None
+    wind_direction:       Optional[float] = None
+    wind_direction_sigma: Optional[float] = None
+
+    @property
+    def source_id(self) -> str:
+        return self._source_id
+
+    @property
+    def timestamp(self) -> float:
+        return self._timestamp
+
+    @property
+    def variables(self) -> list[VariableType]:
+        v = []
+        if self.fmc is not None:
+            v.append(VariableType.FMC)
+        if self.wind_speed is not None:
+            v.append(VariableType.WIND_SPEED)
+        if self.wind_direction is not None:
+            v.append(VariableType.WIND_DIRECTION)
+        return v
+
+    def _effective_sigma(self, original_sigma: float, tau: float,
+                          query_time: float) -> float:
+        age = max(0.0, query_time - self._timestamp)
+        return original_sigma * np.exp(age / tau)
+
+    def to_data_points(self, query_time: float) -> list[DataPoint]:
+        points = []
+        if self.fmc is not None and self.fmc_sigma is not None:
+            sigma = self._effective_sigma(
+                self.fmc_sigma, TAU[VariableType.FMC], query_time)
+            points.append(DataPoint(
+                self.location, VariableType.FMC,
+                self.fmc, sigma, self._timestamp))
+
+        if self.wind_speed is not None and self.wind_speed_sigma is not None:
+            sigma = self._effective_sigma(
+                self.wind_speed_sigma, TAU[VariableType.WIND_SPEED], query_time)
+            points.append(DataPoint(
+                self.location, VariableType.WIND_SPEED,
+                self.wind_speed, sigma, self._timestamp))
+
+        if self.wind_direction is not None and self.wind_direction_sigma is not None:
+            sigma = self._effective_sigma(
+                self.wind_direction_sigma, TAU[VariableType.WIND_DIRECTION], query_time)
+            points.append(DataPoint(
+                self.location, VariableType.WIND_DIRECTION,
+                self.wind_direction, sigma, self._timestamp))
+
+        return points
+
+    def is_expired(self, query_time: float) -> bool:
+        # Expired only if ALL contained variables have decayed beyond threshold
+        vars_ = self.variables
+        if not vars_:
+            return True
+        for var in vars_:
+            sigma_orig = getattr(self, f"{var.value}_sigma")
+            tau = TAU[var]
+            sigma_eff = self._effective_sigma(sigma_orig, tau, query_time)
+            if sigma_eff <= EXPIRY_FACTOR * sigma_orig:
+                return False  # at least one variable is still informative
+        return True
+
+
+# ---------------------------------------------------------------------------
+# Fire detection observation — permanent
+# ---------------------------------------------------------------------------
 
 @dataclass(frozen=True)
 class FireDetectionObservation(Observation):
     """
-    Binary fire/no-fire detection. Permanent — a burned cell stays burned.
-    Value = 1.0 for fire, 0.0 for confirmed no-fire.
+    Binary fire/no-fire observation from thermal camera or satellite.
+    Never decays — a cell that was burning at time T was burning at time T.
+    Consumed by the particle filter, not the GP.
     """
-    is_fire:    bool  = True
-    confidence: float = 0.95
+    _source_id:  str
+    _timestamp:  float
+    location:    tuple[int, int]
+    is_fire:     bool
+    confidence:  float  # P(observation is correct), typically 0.8–0.99
 
-    def effective_sigma(self, current_time: float, tau: float) -> float:
-        return self.sigma
+    @property
+    def source_id(self) -> str:
+        return self._source_id
 
-    def is_expired(self, current_time: float, tau: float,
-                   drop_factor: float = 10.0) -> bool:
-        return False
+    @property
+    def timestamp(self) -> float:
+        return self._timestamp
 
+    @property
+    def variables(self) -> list[VariableType]:
+        return [VariableType.FIRE_DETECTION]
+
+    def to_data_points(self, query_time: float) -> list[DataPoint]:
+        # value = 1.0 (fire) or 0.0 (no fire); sigma = 1 - confidence
+        return [DataPoint(
+            self.location, VariableType.FIRE_DETECTION,
+            1.0 if self.is_fire else 0.0,
+            1.0 - self.confidence,
+            self._timestamp,
+        )]
+
+    def is_expired(self, query_time: float) -> bool:
+        return False  # permanent
+
+
+# ---------------------------------------------------------------------------
+# Satellite FMC observation — coarse multi-cell footprint, decays like drone
+# ---------------------------------------------------------------------------
 
 @dataclass(frozen=True)
-class SatelliteObservation(Observation):
+class SatelliteFMCObservation(Observation):
     """
-    Satellite observation with a spatial footprint.
-    footprint_cells lists all grid cells covered by the pixel.
-    Decays normally (satellite FMC estimates go stale like drone obs).
+    Coarse FMC estimate from satellite (MODIS/VIIRS).
+    Covers a footprint of multiple cells. Decays like drone observations.
     """
-    footprint_cells: tuple[tuple[int, int], ...] = field(default_factory=tuple)
+    _source_id:     str
+    _timestamp:     float
+    center_location: tuple[int, int]
+    footprint_cells: tuple[tuple[int, int], ...]
+    fmc:            float
+    fmc_sigma:      float  # higher than drone — coarser measurement
+
+    @property
+    def source_id(self) -> str:
+        return self._source_id
+
+    @property
+    def timestamp(self) -> float:
+        return self._timestamp
+
+    @property
+    def location(self) -> tuple[int, int]:
+        return self.center_location
+
+    @property
+    def variables(self) -> list[VariableType]:
+        return [VariableType.FMC]
+
+    def to_data_points(self, query_time: float) -> list[DataPoint]:
+        age = max(0.0, query_time - self._timestamp)
+        sigma = self.fmc_sigma * np.exp(age / TAU[VariableType.FMC])
+        return [
+            DataPoint(cell, VariableType.FMC, self.fmc, sigma, self._timestamp)
+            for cell in self.footprint_cells
+        ]
+
+    def is_expired(self, query_time: float) -> bool:
+        age = max(0.0, query_time - self._timestamp)
+        return (self.fmc_sigma * np.exp(age / TAU[VariableType.FMC])
+                > EXPIRY_FACTOR * self.fmc_sigma)
 
 
 # ---------------------------------------------------------------------------
@@ -117,321 +358,208 @@ class SatelliteObservation(Observation):
 
 class ObservationStore:
     """
-    Centralized, thread-safe observation management.
+    Central repository for all observations.
 
-    Thread safety: an RLock protects all mutations. During a cycle's prior
-    computation call lock_for_cycle() / unlock_cycle() to prevent concurrent
-    ingestion from partially-updated state.
+    Append-only (plus pruning). Queries are time-parameterized — callers
+    pass a query_time and receive DataPoints with appropriately decayed sigmas.
+    The store never mutates observation objects.
 
-    Decay config maps ObservationType → tau (seconds). Observations are pruned
-    when their effective sigma exceeds drop_factor × original sigma.
+    Thread-safe for concurrent reads. Lock during cycle computation to
+    prevent observation ingestion mid-cycle.
     """
 
-    def __init__(self, decay_config: dict[ObservationType, float]):
-        self._decay_config = decay_config
-        self._current_time: float = 0.0
+    def __init__(self) -> None:
+        # RAWS: keyed by source_id. New readings replace old.
+        self._raws: dict[str, RAWSObservation] = {}
 
-        # RAWS: keyed by station_id → {ObservationType → RAWSObservation}.
-        # Re-adding a station replaces all its previous readings atomically.
-        self._raws: dict[str, dict[ObservationType, RAWSObservation]] = {}
+        # All other observations: append-only list.
+        # Pruning removes expired entries periodically.
+        self._observations: list[Observation] = []
 
-        # Drone / satellite: append-only (until pruned).
-        self._drone:     dict[ObservationType, list[Observation]] = defaultdict(list)
-        self._satellite: dict[ObservationType, list[SatelliteObservation]] = defaultdict(list)
+        self._lock   = threading.RLock()
+        self._locked = False
 
-        # Fire detections: permanent, never pruned.
-        self._fire_detections: list[FireDetectionObservation] = []
-
-        self._lock             = threading.RLock()
-        self._locked_for_cycle = False
-
-        self._total_ingested = 0
-        self._total_pruned   = 0
-
-    # ------------------------------------------------------------------
-    # Time
-    # ------------------------------------------------------------------
-
-    def update_time(self, t: float) -> None:
-        """Advance the store clock. Call once per cycle."""
-        self._current_time = t
+        self._last_prune_time: float = -1.0
 
     # ------------------------------------------------------------------
     # Ingestion
     # ------------------------------------------------------------------
 
-    def add_raws(self, station_id: str, observations: list[RAWSObservation]) -> None:
-        """Replace all readings for this station atomically."""
+    def add_raws(self, obs: RAWSObservation) -> None:
+        """Add or replace a RAWS reading. Keyed by source_id."""
         with self._lock:
-            if self._locked_for_cycle:
-                raise RuntimeError(
-                    "Cannot add observations during cycle computation. "
-                    "Buffer externally and add after unlock_cycle()."
-                )
-            self._raws[station_id] = {obs.obs_type: obs for obs in observations}
-            self._total_ingested += len(observations)
+            self._check_not_locked()
+            self._raws[obs.source_id] = obs
 
-    def add_drone_observations(self, observations: list[Observation]) -> None:
-        """Append drone observations. Subject to temporal decay and pruning."""
+    def add(self, obs: Observation) -> None:
+        """Add any non-RAWS observation."""
         with self._lock:
-            if self._locked_for_cycle:
-                raise RuntimeError(
-                    "Cannot add observations during cycle computation."
-                )
-            for obs in observations:
-                self._drone[obs.obs_type].append(obs)
-            self._total_ingested += len(observations)
+            self._check_not_locked()
+            self._observations.append(obs)
 
-    def add_satellite_observations(self, observations: list[SatelliteObservation]) -> None:
+    def add_batch(self, observations: list[Observation]) -> None:
+        """Add multiple observations atomically."""
         with self._lock:
-            if self._locked_for_cycle:
-                raise RuntimeError(
-                    "Cannot add observations during cycle computation."
-                )
-            for obs in observations:
-                self._satellite[obs.obs_type].append(obs)
-            self._total_ingested += len(observations)
-
-    def add_fire_detections(self, detections: list[FireDetectionObservation]) -> None:
-        with self._lock:
-            if self._locked_for_cycle:
-                raise RuntimeError(
-                    "Cannot add observations during cycle computation."
-                )
-            self._fire_detections.extend(detections)
-            self._total_ingested += len(detections)
+            self._check_not_locked()
+            self._observations.extend(observations)
 
     # ------------------------------------------------------------------
-    # Cycle lock
+    # Queries — time-parameterized, non-mutating
     # ------------------------------------------------------------------
 
-    def lock_for_cycle(self) -> None:
-        """Block observation ingestion during cycle prior computation."""
-        self._lock.acquire()
-        self._locked_for_cycle = True
-
-    def unlock_cycle(self) -> None:
-        """Re-allow observation ingestion after cycle completes."""
-        self._locked_for_cycle = False
-        self._lock.release()
-
-    # ------------------------------------------------------------------
-    # Pruning
-    # ------------------------------------------------------------------
-
-    def prune(self, drop_factor: float = 10.0) -> int:
-        """
-        Remove expired drone and satellite observations.
-        RAWS and fire detections are never pruned.
-        Returns number of observations removed.
-        """
-        pruned = 0
-        for obs_type in list(self._drone.keys()):
-            tau    = self._decay_config.get(obs_type, float('inf'))
-            before = len(self._drone[obs_type])
-            self._drone[obs_type] = [
-                obs for obs in self._drone[obs_type]
-                if not obs.is_expired(self._current_time, tau, drop_factor)
-            ]
-            pruned += before - len(self._drone[obs_type])
-
-        for obs_type in list(self._satellite.keys()):
-            tau    = self._decay_config.get(obs_type, float('inf'))
-            before = len(self._satellite[obs_type])
-            self._satellite[obs_type] = [
-                obs for obs in self._satellite[obs_type]
-                if not obs.is_expired(self._current_time, tau, drop_factor)
-            ]
-            pruned += before - len(self._satellite[obs_type])
-
-        self._total_pruned += pruned
-        return pruned
-
-    # ------------------------------------------------------------------
-    # Queries
-    # ------------------------------------------------------------------
-
-    def get_all_for_type(
+    def get_data_points(
         self,
-        obs_type: ObservationType,
-        include_raws:      bool = True,
-        include_drone:     bool = True,
-        include_satellite: bool = True,
-    ) -> list[Observation]:
-        """All observations of a type across all sources (original sigma)."""
-        result: list[Observation] = []
-        if include_raws:
-            for station in self._raws.values():
-                if obs_type in station:
-                    result.append(station[obs_type])
-        if include_drone:
-            result.extend(self._drone.get(obs_type, []))
-        if include_satellite:
-            result.extend(self._satellite.get(obs_type, []))
-        return result
-
-    def get_decayed_for_type(
-        self, obs_type: ObservationType
-    ) -> tuple[list[Observation], list[float]]:
+        query_time: float,
+        variable: Optional[VariableType] = None,
+        min_spacing_cells: Optional[int] = None,
+    ) -> list[DataPoint]:
         """
-        All observations of a type with their effective (age-inflated) sigmas.
-        RAWS returns original sigma (no decay). Drone/satellite return decayed sigma.
+        Primary query method. Returns processed DataPoints with decayed sigmas
+        appropriate for query_time.
 
-        Returns (observations, effective_sigmas) — parallel lists.
-        This is what the GP consumes for fitting.
+        All observation types are flattened into DataPoints.
+        Optionally filter by variable type.
+        Optionally thin to one point per min_spacing_cells neighborhood.
+
+        This is what the GP calls.
         """
-        tau = self._decay_config.get(obs_type, float('inf'))
-        observations: list[Observation] = []
-        effective_sigmas: list[float]   = []
+        points: list[DataPoint] = []
 
-        for station in self._raws.values():
-            if obs_type in station:
-                obs = station[obs_type]
-                observations.append(obs)
-                effective_sigmas.append(obs.sigma)
+        for raws in self._raws.values():
+            points.extend(raws.to_data_points(query_time))
 
-        for obs in self._drone.get(obs_type, []):
-            observations.append(obs)
-            effective_sigmas.append(obs.effective_sigma(self._current_time, tau))
+        for obs in self._observations:
+            if obs.is_expired(query_time):
+                continue
+            points.extend(obs.to_data_points(query_time))
 
-        for obs in self._satellite.get(obs_type, []):
-            observations.append(obs)
-            effective_sigmas.append(obs.effective_sigma(self._current_time, tau))
+        if variable is not None:
+            points = [p for p in points if p.variable == variable]
 
-        return observations, effective_sigmas
+        if min_spacing_cells is not None:
+            points = self._thin(points, min_spacing_cells)
 
-    def get_thinned_for_type(
-        self,
-        obs_type: ObservationType,
-        min_spacing_cells: int,
-    ) -> tuple[list[Observation], list[float]]:
-        """
-        Return observations thinned to one per min_spacing_cells spatial bin.
-        Keeps the lowest-sigma observation in each bin.
-        Used by the GP to avoid singularity from dense satellite swath obs.
-        """
-        obs_list, sigmas = self.get_decayed_for_type(obs_type)
-        paired = sorted(zip(obs_list, sigmas), key=lambda x: x[1])
-        thinned_obs: list[Observation] = []
-        thinned_sigs: list[float]      = []
-        for obs, sigma in paired:
-            if all(
-                abs(obs.location[0] - t.location[0]) > min_spacing_cells or
-                abs(obs.location[1] - t.location[1]) > min_spacing_cells
-                for t in thinned_obs
-            ):
-                thinned_obs.append(obs)
-                thinned_sigs.append(sigma)
-        return thinned_obs, thinned_sigs
+        return points
 
     def get_fire_detections(
         self, since: Optional[float] = None
     ) -> list[FireDetectionObservation]:
-        """Fire detections, optionally filtered to those after a timestamp."""
-        if since is None:
-            return list(self._fire_detections)
-        return [d for d in self._fire_detections if d.timestamp >= since]
+        """
+        Return fire detection observations for the particle filter.
+        Returned as full observation objects (not DataPoints) because the
+        particle filter needs is_fire and confidence fields.
+        """
+        detections = [o for o in self._observations
+                      if isinstance(o, FireDetectionObservation)]
+        if since is not None:
+            detections = [d for d in detections if d.timestamp >= since]
+        return detections
 
-    def get_observations_near(
-        self,
-        location: tuple[int, int],
-        radius_cells: int,
-        obs_type: Optional[ObservationType] = None,
+    def get_raw_observations(
+        self, variable: Optional[VariableType] = None
     ) -> list[Observation]:
-        """Spatial query: all observations within radius_cells of location."""
-        result = []
-        for obs in self._iter_all(obs_type):
-            dr = obs.location[0] - location[0]
-            dc = obs.location[1] - location[1]
-            if dr * dr + dc * dc <= radius_cells * radius_cells:
-                result.append(obs)
+        """
+        Return raw observation objects (undecayed).
+        For diagnostics, visualization, and debugging.
+        """
+        result: list[Observation] = list(self._raws.values())
+        result.extend(self._observations)
+        if variable is not None:
+            result = [o for o in result if variable in o.variables]
         return result
 
-    def get_observation_locations(
-        self, obs_type: Optional[ObservationType] = None
-    ) -> list[tuple[int, int]]:
-        """All unique observation locations. Useful for visualization overlays."""
-        return list({obs.location for obs in self._iter_all(obs_type)})
+    # ------------------------------------------------------------------
+    # Thinning — operates on DataPoints (post-decay)
+    # ------------------------------------------------------------------
 
-    def _iter_all(
-        self, obs_type: Optional[ObservationType] = None
-    ) -> Iterator[Observation]:
-        """Iterate over all stored observations, optionally filtered by type."""
-        for station in self._raws.values():
-            for ot, obs in station.items():
-                if obs_type is None or ot == obs_type:
-                    yield obs
-        for ot, obs_list in self._drone.items():
-            if obs_type is None or ot == obs_type:
-                yield from obs_list
-        for ot, obs_list in self._satellite.items():
-            if obs_type is None or ot == obs_type:
-                yield from obs_list
-        if obs_type is None or obs_type == ObservationType.FIRE_DETECTION:
-            yield from self._fire_detections
+    def _thin(self, points: list[DataPoint], min_spacing: int) -> list[DataPoint]:
+        """Keep lowest-sigma point per spatial neighbourhood."""
+        sorted_pts = sorted(points, key=lambda p: p.sigma)
+        thinned: list[DataPoint] = []
+        for pt in sorted_pts:
+            if all(
+                abs(pt.location[0] - t.location[0]) > min_spacing or
+                abs(pt.location[1] - t.location[1]) > min_spacing
+                for t in thinned
+            ):
+                thinned.append(pt)
+        return thinned
+
+    # ------------------------------------------------------------------
+    # Pruning — removes expired observations for efficiency
+    # ------------------------------------------------------------------
+
+    def prune(self, current_time: float) -> int:
+        """
+        Remove observations expired as of current_time.
+        Returns number of observations pruned.
+        RAWS and FireDetectionObservation are never pruned.
+        """
+        if current_time <= self._last_prune_time:
+            return 0
+
+        before = len(self._observations)
+        self._observations = [
+            obs for obs in self._observations
+            if not obs.is_expired(current_time)
+        ]
+        pruned = before - len(self._observations)
+        self._last_prune_time = current_time
+        return pruned
+
+    # ------------------------------------------------------------------
+    # Cycle locking
+    # ------------------------------------------------------------------
+
+    def lock(self) -> None:
+        """Lock during cycle computation. Prevents ingestion."""
+        self._lock.acquire()
+        self._locked = True
+
+    def unlock(self) -> None:
+        """Unlock after cycle. Allows ingestion."""
+        self._locked = False
+        self._lock.release()
+
+    def _check_not_locked(self) -> None:
+        if self._locked:
+            raise RuntimeError(
+                "Cannot add observations during cycle computation. "
+                "Buffer externally and add after unlock().")
 
     # ------------------------------------------------------------------
     # Diagnostics
     # ------------------------------------------------------------------
 
-    def count(self, obs_type: Optional[ObservationType] = None) -> dict:
-        counts = {
-            "raws":           0,
-            "drone":          0,
-            "satellite":      0,
-            "fire_detection": len(self._fire_detections),
-            "total":          0,
-        }
-        for station in self._raws.values():
-            for ot in station:
-                if obs_type is None or ot == obs_type:
-                    counts["raws"] += 1
-        for ot, obs_list in self._drone.items():
-            if obs_type is None or ot == obs_type:
-                counts["drone"] += len(obs_list)
-        for ot, obs_list in self._satellite.items():
-            if obs_type is None or ot == obs_type:
-                counts["satellite"] += len(obs_list)
-        counts["total"] = sum(
-            counts[k] for k in ("raws", "drone", "satellite", "fire_detection")
-        )
+    def count(self) -> dict:
+        """Observation counts by type."""
+        counts: dict = {"raws": len(self._raws), "other": 0}
+        by_type: dict[str, int] = {}
+        for obs in self._observations:
+            name = type(obs).__name__
+            by_type[name] = by_type.get(name, 0) + 1
+        counts.update(by_type)
+        counts["total"] = counts["raws"] + len(self._observations)
         return counts
 
-    def age_summary(self) -> dict[ObservationType, dict]:
-        """Min/max/mean age of drone observations per type. Diagnostic."""
-        summary = {}
-        for obs_type, obs_list in self._drone.items():
-            if not obs_list:
-                continue
-            ages = [self._current_time - obs.timestamp for obs in obs_list]
-            summary[obs_type] = {
-                "count":      len(ages),
-                "min_age_s":  min(ages),
-                "max_age_s":  max(ages),
-                "mean_age_s": sum(ages) / len(ages),
-            }
-        return summary
+    # ------------------------------------------------------------------
+    # Fork — for LiveEstimator hypothetical queries
+    # ------------------------------------------------------------------
 
-    def snapshot(self) -> ObservationSnapshot:
+    def fork(self) -> ObservationStore:
         """
-        Immutable snapshot of current state.
-        Used for counterfactual evaluation (fork without affecting live store).
+        Create a mutable deep copy of this store.
+        Used by LiveEstimator to build a temporary working copy without
+        affecting the live store.
         """
-        return ObservationSnapshot(
-            raws={sid: dict(obs) for sid, obs in self._raws.items()},
-            drone={ot: list(obs) for ot, obs in self._drone.items()},
-            satellite={ot: list(obs) for ot, obs in self._satellite.items()},
-            fire_detections=list(self._fire_detections),
-            current_time=self._current_time,
-            decay_config=dict(self._decay_config),
-        )
+        new = ObservationStore()
+        new._raws         = dict(self._raws)
+        new._observations = list(self._observations)
+        new._last_prune_time = self._last_prune_time
+        return new
 
-    def __deepcopy__(self, memo: dict) -> "ObservationStore":
-        """
-        Custom deepcopy that creates a fresh RLock instead of copying the
-        existing one (threading.RLock objects are not copyable).
-        All observation data is deep-copied normally.
-        """
+    def __deepcopy__(self, memo: dict) -> ObservationStore:
+        """Custom deepcopy: creates a fresh RLock (threading.RLock is not copyable)."""
         import copy
         cls = self.__class__
         result = cls.__new__(cls)
@@ -443,82 +571,34 @@ class ObservationStore:
                 setattr(result, k, copy.deepcopy(v, memo))
         return result
 
-    def fork(self) -> ObservationStore:
-        """
-        Create a mutable deep copy of this store.
-        Used by LiveEstimator to build a temporary working copy without affecting
-        the live store.
-        """
-        new = ObservationStore(dict(self._decay_config))
-        new._current_time   = self._current_time
-        new._raws           = {sid: dict(obs) for sid, obs in self._raws.items()}
-        new._drone          = defaultdict(list,
-                               {ot: list(obs) for ot, obs in self._drone.items()})
-        new._satellite      = defaultdict(list,
-                               {ot: list(obs) for ot, obs in self._satellite.items()})
-        new._fire_detections = list(self._fire_detections)
-        return new
-
-    @property
-    def current_time(self) -> float:
-        return self._current_time
-
-    @property
-    def total_ingested(self) -> int:
-        return self._total_ingested
-
-    @property
-    def total_pruned(self) -> int:
-        return self._total_pruned
-
 
 # ---------------------------------------------------------------------------
-# Immutable snapshot
-# ---------------------------------------------------------------------------
-
-@dataclass(frozen=True)
-class ObservationSnapshot:
-    """Immutable snapshot for counterfactual evaluation."""
-    raws:            dict
-    drone:           dict
-    satellite:       dict
-    fire_detections: list
-    current_time:    float
-    decay_config:    dict
-
-
-# ---------------------------------------------------------------------------
-# Ingestion buffer
+# Ingestion buffer — buffers while store is locked
 # ---------------------------------------------------------------------------
 
 class IngestionBuffer:
     """
-    Buffers observations while the store is locked during a cycle.
-    External sources (drone telemetry, satellite) push here; flush() after
-    the cycle's unlock_cycle() delivers them to the store.
+    Buffers observations while the store is locked during cycle computation.
+    External sources (drone telemetry, satellite passes) push here.
+    Flushed to store after each cycle via flush().
     """
 
     def __init__(self, store: ObservationStore) -> None:
-        self._store   = store
-        self._pending: list[Observation] = []
+        self._store        = store
+        self._pending:      list[Observation]     = []
+        self._pending_raws: list[RAWSObservation] = []
 
     def add(self, obs: Observation) -> None:
-        """Always succeeds — buffers if store is locked."""
-        try:
-            if isinstance(obs, RAWSObservation):
-                self._store.add_raws(obs.source_id, [obs])
-            elif isinstance(obs, FireDetectionObservation):
-                self._store.add_fire_detections([obs])
-            elif isinstance(obs, SatelliteObservation):
-                self._store.add_satellite_observations([obs])
-            else:
-                self._store.add_drone_observations([obs])
-        except RuntimeError:
+        if isinstance(obs, RAWSObservation):
+            self._pending_raws.append(obs)
+        else:
             self._pending.append(obs)
 
     def flush(self) -> None:
-        """Deliver all buffered observations to the store. Call after unlock_cycle()."""
-        pending = list(self._pending)
+        """Push all buffered observations to store. Call after unlock()."""
+        for raws in self._pending_raws:
+            self._store.add_raws(raws)
+        if self._pending:
+            self._store.add_batch(self._pending)
         self._pending.clear()
-        for obs in pending:
-            self.add(obs)
+        self._pending_raws.clear()

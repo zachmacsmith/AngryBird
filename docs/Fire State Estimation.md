@@ -1,4 +1,4 @@
-# IGNIS: Fire State Estimation Design Specification
+# WISP: Fire State Estimation Design Specification
 
 ---
 
@@ -233,7 +233,7 @@ Manages per-member fire states across cycles. Handles carry-forward, reinitializ
 ```python
 class EnsembleFireState:
     """
-    Maintains per-member fire state across IGNIS cycles.
+    Maintains per-member fire state across WISP cycles.
     
     Two modes:
     - CONTINUE: each member carries its fire state forward from previous cycle

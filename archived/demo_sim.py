@@ -37,8 +37,7 @@ from angrybird.types import (
     DroneObservation, CycleReport, InformationField,
 )
 from angrybird.gp import IGNISGPPrior
-from angrybird.observations import ObservationStore, ObservationType
-from angrybird.config import TAU_FMC_S, TAU_WIND_SPEED_S, TAU_WIND_DIR_S
+from angrybird.observations import ObservationStore
 from angrybird.orchestrator import IGNISOrchestrator
 from angrybird.simulation.ground_truth import generate_ground_truth
 from angrybird.simulation.runner import CycleRunner
@@ -287,12 +286,7 @@ def make_gp(terrain: TerrainData) -> tuple[IGNISGPPrior, ObservationStore]:
     On the 10 km domain all production hyperparameters apply as-is:
     FMC correlation length 1.5 km, wind correlation length 5 km.
     """
-    decay_config = {
-        ObservationType.FMC:            TAU_FMC_S,
-        ObservationType.WIND_SPEED:     TAU_WIND_SPEED_S,
-        ObservationType.WIND_DIRECTION: TAU_WIND_DIR_S,
-    }
-    obs_store = ObservationStore(decay_config)
+    obs_store = ObservationStore()
     gp = IGNISGPPrior(obs_store, terrain=terrain, resolution_m=terrain.resolution_m)
     return gp, obs_store
 

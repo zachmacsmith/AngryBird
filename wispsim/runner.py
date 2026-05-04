@@ -1,5 +1,5 @@
 """
-Simulation runners for IGNIS.
+Simulation runners for WISP.
 
 CycleRunner (Phase 4b — strategy comparison)
     Cycle-based harness for multi-strategy PERR comparison.  All strategies
@@ -9,17 +9,17 @@ CycleRunner (Phase 4b — strategy comparison)
 SimulationRunner (Phase 4b — clock-based demo)
     Clock-based harness implementing the full simulation loop from the
     architecture spec.  Drones move continuously, collect observations, and
-    IGNIS cycles trigger at fixed intervals.  Produces an MP4 video via
+    WISP cycles trigger at fixed intervals.  Produces an MP4 video via
     FrameRenderer.
 
 LiveEstimator
     Lightweight between-cycle estimator.  Snapshots the GP state at each
-    IGNIS cycle boundary, then accumulates raw observations as they arrive
+    WISP cycle boundary, then accumulates raw observations as they arrive
     and computes an updated (FMC mean, wind mean, estimated arrival time)
     at each render frame — using only a GP predict() call + one fire member.
     This avoids the 30-member ensemble and runs in seconds, allowing the
     operator display to reflect new observations immediately rather than
-    waiting 20 minutes for the next IGNIS cycle.
+    waiting 20 minutes for the next WISP cycle.
 
 SimulationConfig
     Shared configuration dataclass for SimulationRunner (and scenarios.py).
@@ -92,10 +92,10 @@ from angrybird.config import (
 from .observer import ObservationSource, SimulatedObserver
 from .renderer import FrameRenderer
 from angrybird.observations import (
-    Observation,
-    ObservationSource as ObsSource,
-    ObservationType,
+    DroneObservation as DroneObs,
+    ObservationStore,
     RAWSObservation,
+    VariableType,
 )
 from angrybird.raws import RAWSObserver, RAWSStation, place_raws_stations
 
@@ -111,7 +111,7 @@ class SimulationConfig:
     """Configuration for the clock-based SimulationRunner."""
     dt: float = 10.0                                   # simulation timestep (seconds)
     total_time_s: float = SIM_TOTAL_TIME_S             # total simulation duration
-    ignis_cycle_interval_s: float = CYCLE_INTERVAL_S   # IGNIS cycle interval
+    ignis_cycle_interval_s: float = CYCLE_INTERVAL_S   # WISP cycle interval
     n_drones: int = N_DRONES
     drone_speed_ms: float = DRONE_SPEED_MS             # m/s cruise speed
     drone_endurance_s: float = DRONE_ENDURANCE_S       # flight endurance per sortie
@@ -133,11 +133,11 @@ class SimulationConfig:
 class LiveEstimator:
     """
     Provides a continuously-updated "best estimate" of FMC, wind, and fire
-    arrival times between IGNIS planning cycles.
+    arrival times between WISP planning cycles.
 
     Why this exists
     ---------------
-    IGNIS cycles run every ~20 minutes and require a full 30-member ensemble.
+    WISP cycles run every ~20 minutes and require a full 30-member ensemble.
     But the operator display only needs:
       • GP posterior mean for FMC and wind   ←  cheap: GP predict() ~ ms
       • Estimated arrival time per cell      ←  cheap: 1 fire member ~ seconds
@@ -152,7 +152,7 @@ class LiveEstimator:
 
     Usage (inside SimulationRunner)
     --------------------------------
-        # After each IGNIS cycle completes:
+        # After each WISP cycle completes:
         self._live_est.snapshot_from_cycle()
 
         # After each drone observation step:
@@ -177,7 +177,7 @@ class LiveEstimator:
         # Never modified between cycles — all inter-cycle obs go into _obs_buffer.
         self._live_gp       = copy.deepcopy(orchestrator.gp)
         # ObservationBuffer applies the same 200 m spatial thinning the main
-        # runner uses before IGNIS cycles.  Raw obs are added here; thinned()
+        # runner uses before WISP cycles.  Raw obs are added here; thinned()
         # view is computed in compute_estimate without consuming the buffer.
         self._obs_buffer = ObservationBuffer(
             min_spacing_m=OBSERVATION_THINNING_SPACING_M,
@@ -190,7 +190,7 @@ class LiveEstimator:
 
     def snapshot_from_cycle(self) -> None:
         """
-        Sync live GP to orchestrator GP state immediately after an IGNIS cycle.
+        Sync live GP to orchestrator GP state immediately after an WISP cycle.
 
         Called once per cycle boundary.  Deep-copy is ~ms (sklearn GP objects
         are small once fitted) and happens only every 20 sim-minutes.
@@ -228,7 +228,7 @@ class LiveEstimator:
         Compute the live best estimate using thinned drone observations.
 
         When new observations have arrived since the last call, thin the
-        buffer (200 m min spacing — identical to the IGNIS cycle pipeline) and
+        buffer (200 m min spacing — identical to the WISP cycle pipeline) and
         temporarily condition a copy of the snapshot GP on FMC + wind speed +
         wind direction from those thinned obs.  The snapshot GP itself is never
         mutated between cycles.
@@ -237,7 +237,7 @@ class LiveEstimator:
         -------
         prior : GPPrior
             GP posterior conditioned on all thinned observations collected since
-            the last IGNIS cycle (FMC mean, wind speed mean, wind dir mean,
+            the last WISP cycle (FMC mean, wind speed mean, wind dir mean,
             and their variances).
         arrival_times_h : ndarray or None
             Float32 (rows, cols) estimated ignition time in hours from
@@ -258,49 +258,30 @@ class LiveEstimator:
                 work_gp    = copy.deepcopy(self._live_gp)
                 work_gp._store = work_store
 
-                new_obs: list[Observation] = []
+                new_obs: list[DroneObs] = []
+                ws_by_loc = {o.location: o for o in aggregated
+                             if o.wind_speed is not None and np.isfinite(o.wind_speed)
+                             and o.wind_speed_sigma is not None}
+                wd_by_loc = {o.location: o for o in aggregated
+                             if o.wind_dir is not None and np.isfinite(o.wind_dir)}
                 for o in aggregated:
-                    t = o.timestamp or 0.0
-                    new_obs.append(Observation(
-                        location  = o.location,
-                        obs_type  = ObservationType.FMC,
-                        source    = ObsSource.DRONE_MULTISPECTRAL,
-                        value     = o.fmc,
-                        sigma     = o.fmc_sigma,
-                        timestamp = t,
-                        source_id = o.drone_id or "drone",
-                    ))
-                ws_obs = [o for o in aggregated
-                          if o.wind_speed is not None
-                          and np.isfinite(o.wind_speed)
-                          and o.wind_speed_sigma is not None
-                          and np.isfinite(o.wind_speed_sigma)]
-                for o in ws_obs:
-                    new_obs.append(Observation(
-                        location  = o.location,
-                        obs_type  = ObservationType.WIND_SPEED,
-                        source    = ObsSource.DRONE_ANEMOMETER,
-                        value     = o.wind_speed,
-                        sigma     = o.wind_speed_sigma,
-                        timestamp = o.timestamp or 0.0,
-                        source_id = o.drone_id or "drone",
-                    ))
-                wd_obs = [o for o in ws_obs
-                          if o.wind_dir is not None
-                          and np.isfinite(o.wind_dir)]
-                for o in wd_obs:
-                    new_obs.append(Observation(
-                        location  = o.location,
-                        obs_type  = ObservationType.WIND_DIRECTION,
-                        source    = ObsSource.DRONE_ANEMOMETER,
-                        value     = o.wind_dir,
-                        sigma     = o.wind_dir_sigma if o.wind_dir_sigma is not None else 10.0,
-                        timestamp = o.timestamp or 0.0,
-                        source_id = o.drone_id or "drone",
+                    wo = ws_by_loc.get(o.location)
+                    do = wd_by_loc.get(o.location)
+                    new_obs.append(DroneObs(
+                        _source_id           = o.drone_id or "drone",
+                        _timestamp           = o.timestamp or 0.0,
+                        location             = o.location,
+                        fmc                  = o.fmc,
+                        fmc_sigma            = o.fmc_sigma,
+                        wind_speed           = wo.wind_speed if wo else None,
+                        wind_speed_sigma     = wo.wind_speed_sigma if wo else None,
+                        wind_direction       = do.wind_dir if do else None,
+                        wind_direction_sigma = (do.wind_dir_sigma if do and do.wind_dir_sigma
+                                                is not None else (10.0 if do else None)),
                     ))
 
                 if new_obs:
-                    work_store.add_drone_observations(new_obs)
+                    work_store.add_batch(new_obs)
                 self._cached_prior = work_gp.predict(shape)
             # Reset so we don't redo the expensive fork/predict unless new obs arrive.
             self._has_obs = False
@@ -572,21 +553,21 @@ class SimulationRunner:
       2. Ground truth fire stepped forward
       3. All drones moved and observations collected
       4. New observations fed to LiveEstimator (cheap: GP dirty + 1 fire member)
-      5. Observations buffered; flushed + thinned at each IGNIS cycle boundary
-      6. IGNIS cycle runs (full ensemble → info field → selection → assimilation)
+      5. Observations buffered; flushed + thinned at each WISP cycle boundary
+      6. WISP cycle runs (full ensemble → info field → selection → assimilation)
       7. LiveEstimator syncs to updated GP state after each cycle
       8. Frame rendered (every frame_interval steps) with live estimate
 
     The live estimate panels (FMC+wind, arrival time) update every render
     frame — reflecting new observations immediately rather than waiting for
-    the next 20-minute IGNIS cycle.  The information field and mission
-    targets still update only at IGNIS cycle boundaries (require full ensemble).
+    the next 20-minute WISP cycle.  The information field and mission
+    targets still update only at WISP cycle boundaries (require full ensemble).
 
     Args:
         config:        SimulationConfig
         terrain:       TerrainData (static)
         ground_truth:  GroundTruth (mutable — wind + fire updated in-place)
-        orchestrator:  IGNISOrchestrator (runs IGNIS cycles)
+        orchestrator:  IGNISOrchestrator (runs WISP cycles)
     """
 
     def __init__(
@@ -672,37 +653,17 @@ class SimulationRunner:
 
         raws_obs = self.raws_observer.observe_all()
         for station, obs in zip(self.raws_observer.stations, raws_obs):
-            sid = station.station_id
-            station_obs = [
-                RAWSObservation(
-                    location  = obs.location,
-                    obs_type  = ObservationType.FMC,
-                    source    = ObsSource.RAWS,
-                    value     = obs.fmc,
-                    sigma     = obs.fmc_sigma,
-                    timestamp = 0.0,
-                    source_id = sid,
-                ),
-                RAWSObservation(
-                    location  = obs.location,
-                    obs_type  = ObservationType.WIND_SPEED,
-                    source    = ObsSource.RAWS,
-                    value     = obs.wind_speed,
-                    sigma     = obs.wind_speed_sigma,
-                    timestamp = 0.0,
-                    source_id = sid,
-                ),
-                RAWSObservation(
-                    location  = obs.location,
-                    obs_type  = ObservationType.WIND_DIRECTION,
-                    source    = ObsSource.RAWS,
-                    value     = obs.wind_dir,
-                    sigma     = obs.wind_dir_sigma,
-                    timestamp = 0.0,
-                    source_id = sid,
-                ),
-            ]
-            orchestrator.obs_store.add_raws(sid, station_obs)
+            orchestrator.obs_store.add_raws(RAWSObservation(
+                _source_id           = station.station_id,
+                _timestamp           = 0.0,
+                location             = obs.location,
+                fmc                  = obs.fmc,
+                fmc_sigma            = obs.fmc_sigma,
+                wind_speed           = obs.wind_speed,
+                wind_speed_sigma     = obs.wind_speed_sigma,
+                wind_direction       = obs.wind_dir,
+                wind_direction_sigma = obs.wind_dir_sigma,
+            ))
 
         # Snapshot RAWS-only GP variance (before any drone observations).
         # Deep-copy so the main GP's fitted state is not disturbed; the predict()
@@ -731,11 +692,11 @@ class SimulationRunner:
         )
 
         self.current_time: float = 0.0
-        # Trigger first IGNIS cycle immediately at t=0
+        # Trigger first WISP cycle immediately at t=0
         self._last_cycle_time: float = -config.ignis_cycle_interval_s
         self.cycle_reports: list[CycleReport] = []
 
-        # Cached IGNIS outputs for the renderer (update per cycle)
+        # Cached WISP outputs for the renderer (update per cycle)
         self._gp_prior: Optional[GPPrior] = None
         self._burn_probability: Optional[np.ndarray] = None
         self._mission_targets: list[tuple[int, int]] = []
@@ -757,7 +718,7 @@ class SimulationRunner:
         """
         Execute the full simulation.
 
-        Returns list[CycleReport] — one per IGNIS cycle.
+        Returns list[CycleReport] — one per WISP cycle.
         """
         n_steps = int(self.config.total_time_s / self.config.dt)
         rng     = np.random.default_rng(0)
@@ -821,7 +782,7 @@ class SimulationRunner:
             if new_obs_this_step:
                 self._live_est.add_observations(new_obs_this_step)
 
-            # 5. IGNIS cycle when due
+            # 5. WISP cycle when due
             if (self.current_time - self._last_cycle_time
                     >= self.config.ignis_cycle_interval_s):
                 self._run_ignis_cycle()
@@ -858,22 +819,23 @@ class SimulationRunner:
 
         self.renderer.finalize()
         logger.info(
-            "SimulationRunner finished: %d IGNIS cycles | %d frames",
+            "SimulationRunner finished: %d WISP cycles | %d frames",
             len(self.cycle_reports),
             self.renderer._frame_count,
         )
         return self.cycle_reports
 
     # ------------------------------------------------------------------
-    # IGNIS cycle
+    # WISP cycle
     # ------------------------------------------------------------------
 
     def _run_ignis_cycle(self) -> None:
         """Flush observation buffer, run orchestrator, dispatch drones."""
         observations = self.obs_buffer.flush_thinned()
 
-        # Advance the store clock so temporal decay reflects the current sim time.
-        self.orchestrator.obs_store.update_time(self.current_time)
+        # Prune expired observations; temporal decay is query-time-parameterized
+        # (passed to get_data_points at fit time) so no update_time() needed.
+        self.orchestrator.obs_store.prune(self.current_time)
 
         fire_state = self.truth.fire.fire_state  # current burn mask (float32)
 
@@ -959,7 +921,7 @@ class SimulationRunner:
         self._assign_drone_waypoints(targets)
 
         logger.info(
-            "IGNIS cycle %d | t=%.0fs | obs=%d | info_w=%.2f | "
+            "WISP cycle %d | t=%.0fs | obs=%d | info_w=%.2f | "
             "mission_val_red=%.4f | gp_var=%.1f | gp_var_red=%.1f",
             len(self.cycle_reports),
             self.current_time,

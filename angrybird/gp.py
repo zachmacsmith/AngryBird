@@ -47,7 +47,10 @@ from .config import (
     WIND_SPEED_MAX_MS,
     WIND_SPEED_MIN_MS,
 )
-from .observations import ObservationStore, ObservationType
+from .observations import (
+    DataPoint, DroneObservation as DroneObs, ObservationStore,
+    ObservationType, RAWSObservation, VariableType,
+)
 from .types import GPPrior, TerrainData
 
 logger = logging.getLogger(__name__)
@@ -192,12 +195,7 @@ class IGNISGPPrior:
         noise_wind_dir: float = GP_NOISE_WIND_DIR,
     ):
         if obs_store is None:
-            from .config import TAU_FMC_S, TAU_WIND_DIR_S, TAU_WIND_SPEED_S
-            obs_store = ObservationStore({
-                ObservationType.FMC:            TAU_FMC_S,
-                ObservationType.WIND_SPEED:     TAU_WIND_SPEED_S,
-                ObservationType.WIND_DIRECTION: TAU_WIND_DIR_S,
-            })
+            obs_store = ObservationStore()
         self._store = obs_store
         self.terrain = terrain
         self.resolution_m = resolution_m
@@ -221,6 +219,9 @@ class IGNISGPPrior:
         self._last_fmc_count: int = -1
         self._last_ws_count:  int = -1
         self._last_wd_count:  int = -1
+
+        # Current time — updated by fit(); predict() uses stored value
+        self._current_time: float = 0.0
 
         # Cached grid features (rebuilt when shape changes)
         self._cached_shape:  Optional[tuple[int, int]] = None
@@ -292,27 +293,21 @@ class IGNISGPPrior:
         station_id: str = "COMPAT",
     ) -> None:
         """Compatibility shim: converts lists to RAWSObservation and adds to store."""
-        from .observations import ObservationSource as ObsSrc, RAWSObservation
         n = len(locations)
         fmc_sigmas = fmc_sigmas or [self.noise_fmc] * n
         ws_sigmas  = ws_sigmas  or [self.noise_wind_speed] * n
         wd_sigmas  = wd_sigmas  or [self.noise_wind_dir] * n
-        obs_list: list[RAWSObservation] = []
-        for loc, fmc, ws, wd, sf, ss, sd in zip(
+        for i, (loc, fmc, ws, wd, sf, ss, sd) in enumerate(zip(
             locations, fmc_vals, ws_vals, wd_vals, fmc_sigmas, ws_sigmas, wd_sigmas
-        ):
-            obs_list += [
-                RAWSObservation(location=loc, obs_type=ObservationType.FMC,
-                                source=ObsSrc.RAWS, value=fmc, sigma=sf,
-                                timestamp=timestamp, source_id=station_id),
-                RAWSObservation(location=loc, obs_type=ObservationType.WIND_SPEED,
-                                source=ObsSrc.RAWS, value=ws, sigma=ss,
-                                timestamp=timestamp, source_id=station_id),
-                RAWSObservation(location=loc, obs_type=ObservationType.WIND_DIRECTION,
-                                source=ObsSrc.RAWS, value=wd, sigma=sd,
-                                timestamp=timestamp, source_id=station_id),
-            ]
-        self._store.add_raws(station_id, obs_list)
+        )):
+            self._store.add_raws(RAWSObservation(
+                _source_id=f"{station_id}_{i}",
+                _timestamp=timestamp,
+                location=loc,
+                fmc=fmc, fmc_sigma=sf,
+                wind_speed=ws, wind_speed_sigma=ss,
+                wind_direction=wd, wind_direction_sigma=sd,
+            ))
 
     def add_observations(
         self,
@@ -325,33 +320,26 @@ class IGNISGPPrior:
         wd_sigmas: Optional[list[float]] = None,
         timestamp: float = 0.0,
     ) -> None:
-        """Compatibility shim: converts lists to Observation and adds to store."""
-        from .observations import Observation, ObservationSource as ObsSrc
-        new_obs: list[Observation] = []
+        """Compatibility shim: converts lists to DroneObservation and adds to store."""
+        _ws_s = ws_sigmas  or ([self.noise_wind_speed] * len(locations) if ws_vals else None)
+        _wd_s = wd_sigmas  or ([self.noise_wind_dir]   * len(locations) if wd_vals else None)
+        new_obs = []
         for i, (loc, fmc, sf) in enumerate(zip(locations, fmc_vals, fmc_sigmas)):
-            new_obs.append(Observation(
-                location=loc, obs_type=ObservationType.FMC,
-                source=ObsSrc.DRONE, value=fmc, sigma=sf, timestamp=timestamp,
+            new_obs.append(DroneObs(
+                _source_id=f"compat_drone_{i}",
+                _timestamp=timestamp,
+                location=loc,
+                fmc=fmc, fmc_sigma=sf,
+                wind_speed=ws_vals[i]  if ws_vals else None,
+                wind_speed_sigma=_ws_s[i] if _ws_s else None,
+                wind_direction=wd_vals[i] if wd_vals else None,
+                wind_direction_sigma=_wd_s[i] if _wd_s else None,
             ))
-        if ws_vals is not None:
-            _ws_s = ws_sigmas or [self.noise_wind_speed] * len(locations)
-            for loc, ws, ss in zip(locations, ws_vals, _ws_s):
-                new_obs.append(Observation(
-                    location=loc, obs_type=ObservationType.WIND_SPEED,
-                    source=ObsSrc.DRONE, value=ws, sigma=ss, timestamp=timestamp,
-                ))
-        if wd_vals is not None:
-            _wd_s = wd_sigmas or [self.noise_wind_dir] * len(locations)
-            for loc, wd, sd in zip(locations, wd_vals, _wd_s):
-                new_obs.append(Observation(
-                    location=loc, obs_type=ObservationType.WIND_DIRECTION,
-                    source=ObsSrc.DRONE, value=wd, sigma=sd, timestamp=timestamp,
-                ))
-        self._store.add_drone_observations(new_obs)
+        self._store.add_batch(new_obs)
 
     def update_time(self, current_time: float) -> None:
-        """Compatibility shim: delegates to ObservationStore."""
-        self._store.update_time(current_time)
+        """Compatibility shim: updates stored time (used by predict())."""
+        self._current_time = current_time
 
     # ------------------------------------------------------------------
     # Fitting
@@ -433,29 +421,34 @@ class IGNISGPPrior:
                     raise
         return gp
 
-    def fit(self) -> None:
+    def fit(self, current_time: float = 0.0) -> None:
         """
-        Fit GPs to all current observations from the store.
+        Fit GPs to all observations from the store at current_time.
 
-        Reads from the ObservationStore via get_decayed_for_type(), which returns
-        RAWS observations at their original sigma and drone/satellite observations
-        with age-inflated (decayed) sigma. Pruning and decay are managed by the
-        store; this method only fits the statistical model.
+        Calls store.get_data_points(current_time, variable) which returns DataPoints
+        with decay already applied. RAWS points carry original sigma; drone/satellite
+        carry age-inflated sigma. Thinning (one point per correlation-length cell) is
+        applied inside the store query.
 
-        Kernel locking: if the observation count for a variable hasn't changed
-        since the last fit, the kernel is locked (hyperparameters held fixed) and
-        only the posterior is updated. If the count changes (new obs or pruning),
-        a fresh kernel optimization is run.
+        Kernel locking: if the observation count for a variable hasn't changed since
+        the last fit, hyperparameters are held fixed (only the posterior is updated).
+        A changed count triggers a fresh kernel optimization.
         """
+        self._current_time = current_time
+        thin_fmc = int(self.length_scale_fmc  / self.resolution_m)
+        thin_ws  = int(self.length_scale_wind / self.resolution_m)
+
         # --- FMC ---
-        fmc_obs, fmc_sigmas = self._store.get_decayed_for_type(ObservationType.FMC)
-        n_fmc = len(fmc_obs)
+        fmc_pts = self._store.get_data_points(
+            current_time, VariableType.FMC, min_spacing_cells=thin_fmc)
+        n_fmc = len(fmc_pts)
         if n_fmc != self._last_fmc_count:
-            self._gp_fmc = None  # training set changed → fresh kernel
+            self._gp_fmc = None
             self._last_fmc_count = n_fmc
 
-        fmc_locs = [o.location for o in fmc_obs]
-        fmc_vals = [o.value    for o in fmc_obs]
+        fmc_locs   = [p.location for p in fmc_pts]
+        fmc_vals   = [p.value    for p in fmc_pts]
+        fmc_sigmas = [p.sigma    for p in fmc_pts]
         fmc_vals_fit = list(fmc_vals)
         if self._nelson_mean is not None and fmc_locs:
             ri = [int(r) for r, _ in fmc_locs]
@@ -472,14 +465,16 @@ class IGNISGPPrior:
         )
 
         # --- Wind speed ---
-        ws_obs, ws_sigmas = self._store.get_decayed_for_type(ObservationType.WIND_SPEED)
-        n_ws = len(ws_obs)
+        ws_pts = self._store.get_data_points(
+            current_time, VariableType.WIND_SPEED, min_spacing_cells=thin_ws)
+        n_ws = len(ws_pts)
         if n_ws != self._last_ws_count:
             self._gp_ws = None
             self._last_ws_count = n_ws
 
-        ws_locs = [o.location for o in ws_obs]
-        ws_vals = [o.value    for o in ws_obs]
+        ws_locs   = [p.location for p in ws_pts]
+        ws_vals   = [p.value    for p in ws_pts]
+        ws_sigmas = [p.sigma    for p in ws_pts]
         ws_vals_fit = list(ws_vals)
         if self._wind_speed_mean is not None and ws_locs:
             ri = [int(r) for r, _ in ws_locs]
@@ -496,14 +491,16 @@ class IGNISGPPrior:
         )
 
         # --- Wind direction ---
-        wd_obs, wd_sigmas = self._store.get_decayed_for_type(ObservationType.WIND_DIRECTION)
-        n_wd = len(wd_obs)
+        wd_pts = self._store.get_data_points(
+            current_time, VariableType.WIND_DIRECTION, min_spacing_cells=thin_ws)
+        n_wd = len(wd_pts)
         if n_wd != self._last_wd_count:
             self._gp_wd = None
             self._last_wd_count = n_wd
 
-        wd_locs = [o.location for o in wd_obs]
-        wd_vals = [o.value    for o in wd_obs]
+        wd_locs   = [p.location for p in wd_pts]
+        wd_vals   = [p.value    for p in wd_pts]
+        wd_sigmas = [p.sigma    for p in wd_pts]
         wd_vals_fit = list(wd_vals)
         if self._wind_dir_mean is not None and wd_locs:
             ri = [int(r) for r, _ in wd_locs]
@@ -552,10 +549,10 @@ class IGNISGPPrior:
     def predict(self, shape: tuple[int, int]) -> GPPrior:
         """
         Predict FMC and wind mean+variance over a (rows, cols) grid.
-        Always refits from the store so the posterior reflects the latest
-        observations and temporal decay.
+        Always refits from the store at the stored current_time (set by the
+        last fit() call, or 0.0 if fit() has never been called explicitly).
         """
-        self.fit()
+        self.fit(self._current_time)
 
         X_grid = self._get_grid_features(shape)
 

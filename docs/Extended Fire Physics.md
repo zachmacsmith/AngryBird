@@ -1,4 +1,4 @@
-# IGNIS: Extended Fire Physics & Discrete Event Handling
+# WISP: Extended Fire Physics & Discrete Event Handling
 
 Additions to the core architecture. Each section is independent and can be implemented separately.
 
