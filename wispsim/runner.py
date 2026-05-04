@@ -104,6 +104,9 @@ from .network import (
     assign_packet_priority,
 )
 
+import csv
+from pathlib import Path
+
 logger = logging.getLogger(__name__)
 
 
@@ -742,6 +745,7 @@ class SimulationRunner:
         )
         self._live_gp_prior: Optional[GPPrior] = None
         self._live_arrival_times_h: Optional[np.ndarray] = None
+        self.network_log_rows = []
 
     # ------------------------------------------------------------------
     # Main loop
@@ -828,6 +832,25 @@ class SimulationRunner:
                     drone_positions=drone_positions,
                     current_time=self.current_time,
                 )
+                metrics = self.network.get_metrics()
+                buffer_sizes = self.network.get_buffer_sizes()
+                paths = self.network.get_last_paths()
+                connected = self.network.get_connected_drones()
+
+                self.network_log_rows.append({
+                    "time_s": self.current_time,
+                    "packets_created": metrics["packets_created"],
+                    "packets_delivered": metrics["packets_delivered"],
+                    "packets_failed": metrics["packets_failed"],
+                    "packet_delivery_rate": metrics["packet_delivery_rate"],
+                    "observations_created": metrics["observations_created"],
+                    "observations_delivered": metrics["observations_delivered"],
+                    "observation_delivery_rate": metrics["observation_delivery_rate"],
+                    "mean_delivery_delay_s": metrics["mean_delivery_delay_s"],
+                    "connected_drones": len(connected),
+                    "buffered_packets_total": sum(buffer_sizes.values()),
+                    "paths": str(paths),
+                })
 
                 if received_obs_this_step:
                     self.obs_buffer.add(received_obs_this_step)
@@ -878,6 +901,23 @@ class SimulationRunner:
         if self.config.enable_mesh_network:
             logger.info("Mesh network metrics: %s", self.network.get_metrics())
             logger.info("Final drone buffer sizes: %s", self.network.get_buffer_sizes())
+
+        if hasattr(self, "network_log_rows"):
+            output_dir = Path("out")
+            output_dir.mkdir(exist_ok=True)
+
+            network_csv = output_dir / "network_metrics.csv"
+
+            if len(self.network_log_rows) > 0:
+                with open(network_csv, "w", newline="") as f:
+                    writer = csv.DictWriter(
+                        f,
+                        fieldnames=self.network_log_rows[0].keys(),
+                    )
+                    writer.writeheader()
+                    writer.writerows(self.network_log_rows)
+
+                logger.info("Network metrics saved to %s", network_csv)
 
         return self.cycle_reports
 
