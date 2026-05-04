@@ -135,7 +135,7 @@ def main(
         gp=gp,
         obs_store=obs_store,
         fire_engine=fire_engine,
-        selector_name="greedy",
+        selector_name=config.selector_name,
         n_drones=config.n_drones,
         staging_area=staging_area,
         n_members=n_members,

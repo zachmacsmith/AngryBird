@@ -25,6 +25,8 @@ from ..types import (
     DronePlan, EnsembleResult, GPPrior, InformationField,
     MissionQueue, SelectionResult, TerrainData,
 )
+from ..fire_state import FireStateEstimator
+from ..observations import FireDetectionObservation
 from ._style import (
     DRONE_COLORS, STRATEGY_STYLES, VIZ_CONFIG,
     _add_legend, _domain_footnote, _imshow,
@@ -369,13 +371,14 @@ def plot_mission_queue_table(
                 fontsize=12, color="gray")
         return fig
 
-    col_labels = ["Rank", "Lat", "Lon", "Info Value", "Dominant Variable", "Expiry (min)"]
+    col_labels = ["Drone", "Waypoints", "First (Lat, Lon)", "Info Value", "Dominant Variable", "Expiry (min)"]
     rows_data = []
-    for rank, req in enumerate(mission_queue.requests, start=1):
+    for req in mission_queue.requests:
+        first = req.path[0] if req.path else (float("nan"), float("nan"))
         rows_data.append([
-            str(rank),
-            f"{req.target[0]:.4f}",
-            f"{req.target[1]:.4f}",
+            str(req.drone_id),
+            str(len(req.path)),
+            f"{first[0]:.4f}, {first[1]:.4f}",
             f"{req.information_value:.4f}",
             req.dominant_variable,
             f"{req.expiry_minutes:.0f}",
@@ -404,3 +407,127 @@ def plot_mission_queue_table(
 
     plt.tight_layout()
     return fig
+
+
+# ---------------------------------------------------------------------------
+# 1.6  Fire State Estimation
+# ---------------------------------------------------------------------------
+
+def plot_fire_state_estimation(
+    estimator: FireStateEstimator,
+    fire_obs: Optional[list[FireDetectionObservation]] = None,
+    terrain: Optional[TerrainData] = None,
+    ground_truth_mask: Optional[np.ndarray] = None,
+    title: str = "Fire State Estimation",
+    figsize: tuple[int, int] = (18, 5),
+) -> Figure:
+    """
+    §1.6 — 'How confident are we in the current fire location?'
+
+    Left panel   : Reconstructed arrival time (isochrones).
+    Center panel : Confidence (0.0 to 1.0).
+    Right panel  : Arrival time uncertainty (seconds).
+    """
+    fig, (ax_arr, ax_conf, ax_unc) = plt.subplots(1, 3, figsize=figsize)
+    fig.suptitle(title, fontsize=12, fontweight="bold")
+
+    rows, cols = estimator.grid_shape
+    extent = [0, cols, rows, 0]
+    
+    # Pre-compute hillshade if terrain is available
+    hs = None
+    if terrain is not None:
+        hs = compute_hillshade(terrain.elevation, resolution_m=terrain.resolution_m)
+
+    # Helper to plot background and overlay points
+    def setup_ax(ax, title_str):
+        if hs is not None:
+            ax.imshow(hs, origin="upper", cmap="gray", vmin=0, vmax=1,
+                      extent=extent, interpolation="bilinear")
+        ax.set_title(title_str, fontsize=VIZ_CONFIG["font_size"], fontweight="bold")
+        ax.set_xlabel("East →", fontsize=VIZ_CONFIG["label_size"])
+        ax.set_ylabel("↑ North", fontsize=VIZ_CONFIG["label_size"])
+        ax.tick_params(labelsize=VIZ_CONFIG["tick_size"])
+
+    # --- Left: Arrival Time ---
+    setup_ax(ax_arr, "Reconstructed Arrival Time")
+    
+    arr = np.where(estimator.arrival_time >= estimator.max_arrival * 0.9, np.nan, estimator.arrival_time)
+    
+    cmap_arr = plt.get_cmap("viridis")
+    if not np.isnan(arr).all():
+        im_arr = ax_arr.imshow(arr, origin="upper", cmap=cmap_arr, extent=extent, 
+                               alpha=0.8 if hs is not None else 1.0)
+        cb1 = fig.colorbar(im_arr, ax=ax_arr, fraction=0.046, pad=0.04)
+        cb1.set_label("Arrival Time (s)", fontsize=VIZ_CONFIG["label_size"])
+        cb1.ax.tick_params(labelsize=VIZ_CONFIG["tick_size"])
+        
+        # Draw 1-hour (3600s) isochrones
+        iso_levels = np.arange(3600, np.nanmax(arr) + 1, 3600)
+        if len(iso_levels) > 0:
+            cs = ax_arr.contour(arr, levels=iso_levels, colors="white", linewidths=0.8, linestyles="--")
+            ax_arr.clabel(cs, fmt="%ds", fontsize=6, colors="white")
+    else:
+        ax_arr.text(0.5, 0.5, "No Fire", ha="center", va="center", transform=ax_arr.transAxes, color="red")
+
+    # --- Center: Confidence ---
+    setup_ax(ax_conf, "Observation Confidence")
+    cmap_conf = plt.get_cmap("Blues")
+    im_conf = ax_conf.imshow(estimator.confidence, origin="upper", cmap=cmap_conf, vmin=0.0, vmax=1.0, 
+                             extent=extent, alpha=0.8 if hs is not None else 1.0)
+    cb2 = fig.colorbar(im_conf, ax=ax_conf, fraction=0.046, pad=0.04)
+    cb2.set_label("Confidence (0=Model, 1=Observed)", fontsize=VIZ_CONFIG["label_size"])
+    cb2.ax.tick_params(labelsize=VIZ_CONFIG["tick_size"])
+
+    # --- Right: Uncertainty ---
+    setup_ax(ax_unc, "Arrival Time Uncertainty")
+    unc = np.where(estimator.arrival_uncertainty >= estimator.max_arrival * 0.9, np.nan, estimator.arrival_uncertainty)
+    cmap_unc = plt.get_cmap("plasma")
+    
+    if not np.isnan(unc).all():
+        im_unc = ax_unc.imshow(unc, origin="upper", cmap=cmap_unc, extent=extent, 
+                               alpha=0.8 if hs is not None else 1.0)
+        cb3 = fig.colorbar(im_unc, ax=ax_unc, fraction=0.046, pad=0.04)
+        cb3.set_label("Uncertainty (s)", fontsize=VIZ_CONFIG["label_size"])
+        cb3.ax.tick_params(labelsize=VIZ_CONFIG["tick_size"])
+    else:
+        ax_unc.text(0.5, 0.5, "Infinite Uncertainty", ha="center", va="center", transform=ax_unc.transAxes, color="red")
+
+    # --- Plot Observations on all axes ---
+    if fire_obs:
+        fire_r, fire_c = [], []
+        nofire_r, nofire_c = [], []
+        
+        for obs in fire_obs:
+            if obs.is_fire:
+                fire_r.append(obs.location[0])
+                fire_c.append(obs.location[1])
+            else:
+                nofire_r.append(obs.location[0])
+                nofire_c.append(obs.location[1])
+                
+        for ax in [ax_arr, ax_conf, ax_unc]:
+            if fire_r:
+                ax.scatter(fire_c, fire_r, marker="^", color="red", edgecolors="black", 
+                           s=40, label="Fire Obs" if ax == ax_arr else "")
+            if nofire_r:
+                ax.scatter(nofire_c, nofire_r, marker="o", color="dodgerblue", edgecolors="black", 
+                           s=30, label="No-Fire Obs" if ax == ax_arr else "")
+            
+            # Ground truth outline
+            if ground_truth_mask is not None:
+                ax.contour(ground_truth_mask, levels=[0.5], colors=["#00FF00"], 
+                           linewidths=1.5, linestyles="-", origin="upper")
+                if ax == ax_arr:
+                    from matplotlib.lines import Line2D
+                    proxy = [Line2D([0], [0], color="#00FF00", lw=1.5, label="Ground Truth")]
+                    current_handles, current_labels = ax.get_legend_handles_labels()
+                    ax.legend(handles=current_handles + proxy, labels=current_labels + ["Ground Truth"], 
+                              fontsize=6, loc="upper right", framealpha=0.75, labelcolor="black")
+            elif ax == ax_arr and (fire_r or nofire_r):
+                _add_legend(ax)
+
+    _domain_footnote(fig, rows, cols, terrain.resolution_m if terrain else 50.0)
+    plt.tight_layout(rect=[0, 0.03, 1, 0.97])
+    return fig
+

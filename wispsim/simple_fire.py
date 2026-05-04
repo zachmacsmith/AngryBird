@@ -11,7 +11,7 @@ Implements FireEngineProtocol via a CPU-parallel KD-tree approach:
         t = sqrt( (along_wind_m / R)² + (cross_wind_m / R_cross)² )
   - Cells with t > horizon_min → unburned (NaN)
 
-Use GPUFireEngine (simulation.gpu_fire_engine) for production runs
+Use GPUFireEngine (angrybird.fire_engines.GPUFireEngine) for production runs
 — it handles crown fire, terrain slope, and ensemble variance correctly.
 SimpleFire is kept here as a lightweight fallback for environments without
 PyTorch or for quick smoke-testing.

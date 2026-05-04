@@ -152,32 +152,52 @@ def plan_paths(
 
 
 def selections_to_mission_queue(
-    selected_locations: list[tuple[int, int]],
+    drone_plans: list[DronePlan],
     info_field: InformationField,
     terrain: TerrainData,
     resolution_m: float = GRID_RESOLUTION_M,
     expiry_minutes: float = CYCLE_INTERVAL_MIN * 1.5,
 ) -> MissionQueue:
     """
-    Convert grid (row, col) selections to a MissionQueue for the UTM layer.
-    Converts to (lat, lon) using the terrain's NW corner origin.
-    Sorted by information value descending.
+    Convert DronePlans to a MissionQueue for the UTM layer.
+
+    Each MissionRequest is one drone's ordered path — a list of (lat, lon)
+    waypoints derived from the plan's grid-cell waypoints.  Drones with no
+    assigned targets produce no request.
+
+    information_value is the sum of info_field.w over the target waypoints
+    (i.e. excluding the staging-area start and return).
+    Sorted by information_value descending.
     """
     origin_lat, origin_lon = terrain.origin_latlon
     requests: list[MissionRequest] = []
 
-    for r, c in selected_locations:
-        lat, lon = grid_to_latlon(r, c, origin_lat, origin_lon, resolution_m)
-        w_val = float(info_field.w[r, c])
-        dominant = max(
-            info_field.w_by_variable,
-            key=lambda k: float(info_field.w_by_variable[k][r, c]),
-        )
+    for plan in drone_plans:
+        # Waypoints are [staging, t1, t2, ..., staging]; skip if no targets.
+        target_wps = plan.waypoints[1:-1] if len(plan.waypoints) > 2 else []
+        if not target_wps:
+            continue
+
+        path = [
+            grid_to_latlon(r, c, origin_lat, origin_lon, resolution_m)
+            for r, c in plan.waypoints   # full path including staging
+        ]
+
+        # Total information value over the target cells.
+        total_w = sum(float(info_field.w[r, c]) for r, c in target_wps)
+
+        # Dominant variable: most frequent across target cells.
+        dominant_counts: dict[str, float] = {k: 0.0 for k in info_field.w_by_variable}
+        for r, c in target_wps:
+            d = max(info_field.w_by_variable, key=lambda k: float(info_field.w_by_variable[k][r, c]))
+            dominant_counts[d] += 1.0
+        dominant = max(dominant_counts, key=lambda k: dominant_counts[k])
+
         requests.append(MissionRequest(
-            target=(lat, lon),
-            information_value=w_val,
+            drone_id=plan.drone_id,
+            path=path,
+            information_value=total_w,
             dominant_variable=dominant,
-            substitutes=[],
             expiry_minutes=expiry_minutes,
         ))
 
