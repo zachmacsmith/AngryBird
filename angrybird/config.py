@@ -161,6 +161,7 @@ RAWS_WIND_DIR_SIGMA: float = 5.0    # wind vane (vs 10° drone)
 # Selector parameters
 # ---------------------------------------------------------------------------
 
+IGNIS_SELECTOR: str = "greedy"  # "greedy"|"qubo"|"uniform"|"fire_front" (points) | "correlation_path" (paths)
 MIN_SELECTION_SPACING_M: float = 500.0   # minimum distance between selected locations
 QUBO_MAX_CANDIDATES: int = 300           # M: top-M candidates passed to QUBO
 

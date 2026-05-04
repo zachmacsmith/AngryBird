@@ -762,24 +762,27 @@ def test_ss5_path_planner():
 
     with _test("SS5", "selections_to_mission_queue: sorted by info value desc"):
         selected = [(5, 5), (15, 15), (25, 25)]
-        mq = selections_to_mission_queue(selected, info, t, 50.0)
+        plans = plan_paths(selected, (0, 0), n_drones=3, shape=shape)
+        mq = selections_to_mission_queue(plans, info, t, 50.0)
         vals = [req.information_value for req in mq.requests]
         assert vals == sorted(vals, reverse=True), "MissionQueue must be sorted descending"
 
     with _test("SS5", "selections_to_mission_queue: dominant variable is valid"):
         selected = [(5, 5), (15, 15)]
-        mq = selections_to_mission_queue(selected, info, t, 50.0)
+        plans = plan_paths(selected, (0, 0), n_drones=2, shape=shape)
+        mq = selections_to_mission_queue(plans, info, t, 50.0)
         for req in mq.requests:
             assert req.dominant_variable in ("fmc", "wind_speed", "wind_dir"), \
                 f"Unexpected dominant_variable: {req.dominant_variable}"
 
-    with _test("SS5", "selections_to_mission_queue: targets are valid (lat, lon)"):
+    with _test("SS5", "selections_to_mission_queue: path waypoints are valid (lat, lon)"):
         selected = [(5, 5), (15, 15)]
-        mq = selections_to_mission_queue(selected, info, t, 50.0)
+        plans = plan_paths(selected, (0, 0), n_drones=2, shape=shape)
+        mq = selections_to_mission_queue(plans, info, t, 50.0)
         for req in mq.requests:
-            lat, lon = req.target
-            assert 30.0 < lat < 50.0 or True, "lat should be in reasonable range"
-            assert isinstance(lat, float) and isinstance(lon, float)
+            assert len(req.path) >= 2, "Path must have at least start and end"
+            for lat, lon in req.path:
+                assert isinstance(lat, float) and isinstance(lon, float)
 
     # ── Diagnostic plot ───────────────────────────────────────────────────
     selected_diag = [(5, 5), (10, 25), (25, 10), (25, 25), (15, 15)]

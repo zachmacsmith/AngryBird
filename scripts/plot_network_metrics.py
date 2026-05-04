@@ -1,0 +1,40 @@
+import pandas as pd
+import matplotlib.pyplot as plt
+
+df = pd.read_csv("out/network_metrics.csv")
+
+plt.figure()
+plt.plot(df["time_s"], df["packet_delivery_rate"])
+plt.xlabel("Simulation time (s)")
+plt.ylabel("Packet delivery rate")
+plt.title("Mesh Network Packet Delivery Rate Over Time")
+plt.grid(True)
+plt.savefig("out/packet_delivery_rate.png", dpi=200)
+plt.show()
+
+plt.figure()
+plt.plot(df["time_s"], df["connected_drones"])
+plt.xlabel("Simulation time (s)")
+plt.ylabel("Connected drones")
+plt.title("Number of Drones Connected to Ground Station")
+plt.grid(True)
+plt.savefig("out/connected_drones.png", dpi=200)
+plt.show()
+
+plt.figure()
+plt.plot(df["time_s"], df["buffered_packets_total"])
+plt.xlabel("Simulation time (s)")
+plt.ylabel("Buffered packets")
+plt.title("Packets Stored Onboard Drones")
+plt.grid(True)
+plt.savefig("out/buffered_packets.png", dpi=200)
+plt.show()
+
+plt.figure()
+plt.plot(df["time_s"], df["mean_delivery_delay_s"])
+plt.xlabel("Simulation time (s)")
+plt.ylabel("Mean delay (s)")
+plt.title("Average Telemetry Delivery Delay")
+plt.grid(True)
+plt.savefig("out/mean_delivery_delay.png", dpi=200)
+plt.show()

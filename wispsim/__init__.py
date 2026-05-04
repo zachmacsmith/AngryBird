@@ -31,7 +31,7 @@ from .drone_sim import DroneState, NoiseConfig
 from .simple_fire import SimpleFire
 from .evaluator import CounterfactualEvaluator
 from .fire_oracle import GroundTruthFire
-from .gpu_fire_engine import GPUFireEngine
+from angrybird.fire_engines import GPUFireEngine
 from .ground_truth import GroundTruth, WindEvent, generate_ground_truth
 from .observation_buffer import ObservationBuffer
 from .observer import ObservationSource, SimulatedObserver

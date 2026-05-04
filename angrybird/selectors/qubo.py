@@ -247,6 +247,7 @@ class QUBOSelector:
     """
 
     name = "qubo"
+    kind = "points"
 
     def __init__(
         self,

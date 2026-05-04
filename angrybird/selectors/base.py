@@ -17,17 +17,21 @@ from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
     from ..gp import IGNISGPPrior
-    from ..types import EnsembleResult, InformationField, SelectionResult
+    from ..types import (
+        EnsembleResult,
+        InformationField,
+        PathSelectionResult,
+        SelectionResult,
+        TerrainData,
+    )
 
 
 @runtime_checkable
 class Selector(Protocol):
-    """
-    Duck-typed interface every selector must satisfy.
-    Implement `name` and `select()`; everything else is optional.
-    """
+    """Point selector: returns N grid cells ranked by information value."""
 
     name: str
+    kind: str  # "points"
 
     def select(
         self,
@@ -36,6 +40,26 @@ class Selector(Protocol):
         ensemble: "EnsembleResult",
         k: int,
     ) -> "SelectionResult": ...
+
+
+@runtime_checkable
+class PathSelector(Protocol):
+    """Path selector: returns fully planned DronePlans directly."""
+
+    name: str
+    kind: str  # "paths"
+
+    def select(
+        self,
+        info_field: "InformationField",
+        gp: "IGNISGPPrior",
+        ensemble: "EnsembleResult",
+        k: int,
+        *,
+        terrain: "TerrainData",
+        staging_area: tuple[int, int],
+        resolution_m: float,
+    ) -> "PathSelectionResult": ...
 
 
 class SelectorRegistry:
@@ -78,9 +102,13 @@ class SelectorRegistry:
         gp: "IGNISGPPrior",
         ensemble: "EnsembleResult",
         k: int,
-    ) -> "SelectionResult":
-        """Run one selector by name."""
-        return self[name].select(info_field, gp, ensemble, k)
+        **context,
+    ) -> "SelectionResult | PathSelectionResult":
+        """Run one selector by name.  Path selectors receive terrain/staging/resolution via **context."""
+        sel = self[name]
+        if getattr(sel, "kind", "points") == "paths":
+            return sel.select(info_field, gp, ensemble, k, **context)
+        return sel.select(info_field, gp, ensemble, k)
 
     def run_all(
         self,
@@ -88,12 +116,16 @@ class SelectorRegistry:
         gp: "IGNISGPPrior",
         ensemble: "EnsembleResult",
         k: int,
-    ) -> "dict[str, SelectionResult]":
-        """Run every registered selector; return {name: SelectionResult}."""
-        return {
-            name: sel.select(info_field, gp, ensemble, k)
-            for name, sel in self._selectors.items()
-        }
+        **context,
+    ) -> "dict[str, SelectionResult | PathSelectionResult]":
+        """Run every registered selector; return {name: result}."""
+        results = {}
+        for name, sel in self._selectors.items():
+            if getattr(sel, "kind", "points") == "paths":
+                results[name] = sel.select(info_field, gp, ensemble, k, **context)
+            else:
+                results[name] = sel.select(info_field, gp, ensemble, k)
+        return results
 
     def __repr__(self) -> str:
         return f"SelectorRegistry({list(self._selectors)})"

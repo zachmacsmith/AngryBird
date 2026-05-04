@@ -26,6 +26,7 @@ from .base import spacing_mask
 
 class GreedySelector:
     name = "greedy"
+    kind = "points"
 
     def __init__(
         self,
