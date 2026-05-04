@@ -112,3 +112,30 @@ Note: `landfire-python` in `requirements.txt` does not exist on PyPI — should 
 #### `angrybird/simulation/runner.py`
 - `SimulationRunner._run_ignis_cycle()`: passes `start_time=self.current_time` to `orchestrator.run_cycle()`.
 - `CycleRunner.run_cycle()`: passes `gp_prior` (local `predict()` result) and `selection_result=selection_results.get(primary_strategy)`.
+
+---
+
+### Restructure: simulation/ top-level package, demo scripts archived
+**Commit:** `a45e287`
+
+#### `simulation/` — promoted from `angrybird/simulation/`
+- All 11 source files moved via `git mv` (history preserved).
+- All `from ..X import` replaced with `from angrybird.X import` — the package now treats `angrybird` as an external dependency rather than a sibling subpackage.
+- `simulation/__init__.py` docstring updated; relative imports within the package unchanged.
+- **New:** `simulation/simple_fire.py` — `SimpleFire` + `_run_fire_member` extracted from `demo_sim.py` so `run_sim.py` no longer depends on the deprecated script.
+
+#### `archived/` — deprecated files moved here
+- `scripts/demo_sim.py`: was already marked DEPRECATED in its own docstring; agents kept running it instead of `run_sim.py`.
+- `scripts/demo_phase2.py`: cycle-based phase-2 runner, superseded by `SimulationRunner`.
+- `angrybird/_visualization_old.py`: backward-compat shim, only consumed by the two archived demo scripts.
+
+#### `scripts/run_sim.py`
+- Removed `from demo_sim import SimpleFire, make_gp`.
+- `SimpleFire` imported from `simulation`; `make_gp` inlined (15 lines).
+- All simulation imports updated to `from simulation import ...`.
+
+#### `scripts/test_subsystems.py`
+- `from angrybird.simulation.X` → `from simulation.X` (3 import lines).
+
+#### `angrybird/visualization/core.py` + `__init__.py`
+- Removed `_visualization_old` backward-compat shim (only consumer was `demo_phase2.py`, now archived).
