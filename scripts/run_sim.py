@@ -9,20 +9,22 @@ PRIMARY DEMO SCRIPT. Runs the full SimulationRunner:
   - IGNIS cycles every 20 minutes (ensemble → info field → selection → assimilation)
   - 6-panel frame renderer → PNG sequence + MP4 video
 
-Scenarios
+Scenarios (auto-discovered from scenarios.py — add a function there to register it)
 ---------
-  hilly   (default)  Complex ridge/valley terrain, mixed fuels, steady SW wind
-  shift              Same terrain + 45° wind shift at hour 3
-  flat               Flat/uniform control — minimal PERR advantage expected
+  hilly_heterogeneous  (default)  Complex ridge/valley terrain, mixed fuels, SW wind + event
+  wind_shift                      Same terrain + 45° wind shift at hour 3
+  flat_homogeneous                Flat/uniform control — minimal PERR advantage expected
+  dual_ignition                   Two simultaneous fires, 1-hour, 45° wind event at 30 min
+  crown_fire_risk                 Dense timber, high FMC, crown fire conditions
 
 Usage
 -----
     cd /path/to/AngryBird
-    python scripts/run_sim.py                        # hilly, 6 h, 5 drones
-    python scripts/run_sim.py --scenario shift       # wind-shift stress test
-    python scripts/run_sim.py --scenario flat        # control baseline
-    python scripts/run_sim.py --drones 3 --hours 1  # quick 1-hour test run
-    python scripts/run_sim.py --out out/my_run       # custom output directory
+    python scripts/run_sim.py                                        # hilly_heterogeneous, 6 h
+    python scripts/run_sim.py --scenario wind_shift                  # wind-shift stress test
+    python scripts/run_sim.py --scenario dual_ignition --hours 1     # dual-ignition, 1 h
+    python scripts/run_sim.py --drones 3 --hours 1                   # quick 1-hour test run
+    python scripts/run_sim.py --out out/my_run                       # custom output directory
 
 No real terrain, no QPU, no cloud required.
 """
@@ -47,13 +49,9 @@ from demo_sim import SimpleFire, make_gp  # noqa: E402
 
 from angrybird.gp import IGNISGPPrior
 from angrybird.orchestrator import IGNISOrchestrator
-from angrybird.simulation import (
-    SimulationConfig,
-    SimulationRunner,
-    flat_homogeneous,
-    hilly_heterogeneous,
-    wind_shift,
-)
+import inspect
+import angrybird.simulation.scenarios as _scenario_module
+from angrybird.simulation import SimulationConfig, SimulationRunner
 
 logging.basicConfig(level=logging.INFO,
                     format="%(levelname)s | %(name)s | %(message)s")
@@ -64,10 +62,12 @@ log = logging.getLogger("run_sim")
 # Scenario registry
 # ---------------------------------------------------------------------------
 
-_SCENARIOS = {
-    "hilly": hilly_heterogeneous,
-    "shift": wind_shift,
-    "flat":  flat_homogeneous,
+# Auto-discover scenario factories defined in scenarios.py — no manual registration needed.
+# Adding a new scenario only requires writing the function there; it appears here automatically.
+_SCENARIOS: dict = {
+    name: fn
+    for name, fn in inspect.getmembers(_scenario_module, inspect.isfunction)
+    if not name.startswith("_") and fn.__module__ == _scenario_module.__name__
 }
 
 
@@ -76,7 +76,7 @@ _SCENARIOS = {
 # ---------------------------------------------------------------------------
 
 def main(
-    scenario: str = "hilly",
+    scenario: str = "hilly_heterogeneous",
     n_drones: int = 5,
     n_members: int = 30,
     hours: float = 6.0,
@@ -138,7 +138,7 @@ def main(
         cycles, frames, elapsed, out.resolve(),
     )
 
-    video = out.parent / "simulation.mp4"
+    video = out.parent / f"{out.name}.mp4"
     if video.exists():
         log.info("Video: %s  (%.1f MB)", video, video.stat().st_size / 1e6)
     else:
@@ -150,8 +150,8 @@ def main(
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="IGNIS clock-based simulation")
     parser.add_argument(
-        "--scenario", choices=list(_SCENARIOS), default="hilly",
-        help="Scenario: hilly (default), shift (wind-shift stress test), flat (control)",
+        "--scenario", choices=list(_SCENARIOS), default="hilly_heterogeneous",
+        help=f"Scenario name — auto-discovered from scenarios.py: {sorted(_SCENARIOS)}",
     )
     parser.add_argument("--drones",  type=int,   default=5,
                         help="Number of drones (default 5)")

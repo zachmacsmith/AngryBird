@@ -45,6 +45,16 @@ OBS_WIND_SPEED_SIGMA: float = 1.0  # m/s
 OBS_WIND_DIR_SIGMA: float = 10.0   # degrees
 
 # ---------------------------------------------------------------------------
+# RAWS station sensor noise
+# Fixed ground instruments are more accurate than drone sensors.
+# FMC is derived from T+RH (Nelson/Fosberg) rather than multispectral imagery.
+# ---------------------------------------------------------------------------
+
+RAWS_FMC_SIGMA: float = 0.01        # ~Nelson residual — T/RH measurement
+RAWS_WIND_SPEED_SIGMA: float = 0.5  # cup anemometer (vs 1.0 m/s drone)
+RAWS_WIND_DIR_SIGMA: float = 5.0    # wind vane (vs 10° drone)
+
+# ---------------------------------------------------------------------------
 # Selector parameters
 # ---------------------------------------------------------------------------
 
@@ -65,6 +75,32 @@ ENKF_OUTLIER_THRESHOLD: float = 3.0          # flag obs if > N sigma from ensemb
 
 REPLAN_VARIANCE_REDUCTION_THRESHOLD: float = 0.20  # 20% drop → flag
 REPLAN_WIND_SHIFT_THRESHOLD_DEG: float = 30.0       # 30° shift → immediate replan
+
+# ---------------------------------------------------------------------------
+# GP temporal decay
+# ---------------------------------------------------------------------------
+
+# Per-variable decay timescales (seconds).  Effective sigma = original_sigma * exp(age / tau).
+# Observations are pruned when effective sigma exceeds GP_OBS_DECAY_DROP_FACTOR × original.
+TAU: dict[str, float] = {
+    "fmc_1hr":        3600.0,    # 1 hour — unchanged, well-characterized
+    "fmc_10hr":       36000.0,   # 10 hours — unchanged
+    "wind_speed":     7200.0,    # 2 hours — mean speed is fairly persistent
+    "wind_direction": 3600.0,    # 1 hour — direction drifts faster than speed
+    "fire_state":     float('inf'),  # permanent — fire doesn't un-burn
+}
+
+TAU_FMC_S: float          = TAU["fmc_1hr"]        # shorthand used by IGNISGPPrior
+TAU_WIND_SPEED_S: float   = TAU["wind_speed"]      # shorthand for wind speed GP
+TAU_WIND_DIR_S: float     = TAU["wind_direction"]  # shorthand for wind direction GP
+GP_OBS_DECAY_DROP_FACTOR: float = 10.0  # drop obs when effective sigma > 10× original
+
+# ---------------------------------------------------------------------------
+# Observation aggregation and ensemble noise floors
+# ---------------------------------------------------------------------------
+
+AGGREGATION_SIGMA_FLOOR: float = 0.015  # minimum aggregated FMC sigma (systematic error floor)
+PROCESS_NOISE_FLOOR: float = 0.01       # minimum FMC perturbation std per ensemble member
 
 # ---------------------------------------------------------------------------
 # Anderson 13 fuel model parameters (Andrews 2018, RMRS-GTR-371)

@@ -369,8 +369,12 @@ class GPUFireEngine:
             gp_prior.wind_speed_mean[np.newaxis] + n_ws * ws_std[np.newaxis],
             0.5, 25.0,
         ).astype(np.float32)
-        # wind direction perturbation stored for EnsembleResult but not used
-        # in the scalar level-set (ROS magnitude only)
+        # Wind direction: perturb and wrap to [0, 360). Not used by the scalar
+        # level-set (ROS magnitude only), but stored so compute_sensitivity can
+        # correlate direction perturbations with arrival-time spread.
+        wd_np = (
+            (gp_prior.wind_dir_mean[np.newaxis] + n_wd * wd_std[np.newaxis]) % 360.0
+        ).astype(np.float32)
 
         fmc = torch.tensor(fmc_np, dtype=torch.float32, device=self.device)
         ws  = torch.tensor(ws_np,  dtype=torch.float32, device=self.device)
@@ -456,6 +460,7 @@ class GPUFireEngine:
             member_arrival_times  = at_min.astype(np.float32),
             member_fmc_fields     = fmc_np,
             member_wind_fields    = ws_np,
+            member_wind_dir_fields= wd_np,
             burn_probability      = burn_prob,
             mean_arrival_time     = mean_at.astype(np.float32),
             arrival_time_variance = var_at.astype(np.float32),

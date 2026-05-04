@@ -17,7 +17,7 @@ Field names follow the spec:
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field as dataclass_field
 from typing import Optional
 
 import numpy as np
@@ -139,6 +139,7 @@ class GroundTruth:
     wind_events      : scheduled wind shifts
     fire             : GroundTruthFire oracle — stepped each timestep
     shape            : (rows, cols)
+    ignition_cells   : fire start locations (row, col) — for RAWS placement exclusion
     """
     fmc:                  np.ndarray         # float32[rows, cols]
     wind_speed:           np.ndarray         # float32[rows, cols], current
@@ -148,6 +149,7 @@ class GroundTruth:
     wind_events:          list[WindEvent]
     fire:                 GroundTruthFire
     shape:                tuple[int, int]
+    ignition_cells:       list[tuple[int, int]] = dataclass_field(default_factory=list)
 
     @property
     def burned_mask(self) -> np.ndarray:
@@ -237,7 +239,7 @@ def _generate_base_wind(
 
 def generate_ground_truth(
     terrain: TerrainData,
-    ignition_cell: tuple[int, int],
+    ignition_cell: "tuple[int, int] | list[tuple[int, int]]",
     base_fmc: float = 0.08,
     base_ws: float = 5.0,
     base_wd: float = 180.0,
@@ -255,13 +257,17 @@ def generate_ground_truth(
 
     Args:
         terrain:        TerrainData
-        ignition_cell:  (row, col) fire start location
+        ignition_cell:  (row, col) or list of (row, col) fire start locations
         base_fmc:       domain-mean FMC dead fraction (default 0.08)
         base_ws:        domain-mean wind speed m/s (default 5.0)
         base_wd:        prevailing wind direction degrees (default 180)
         wind_events:    scheduled wind shifts (default: none)
         seed:           random seed
     """
+    cells: list[tuple[int, int]] = (
+        [ignition_cell] if isinstance(ignition_cell, tuple) else list(ignition_cell)
+    )
+
     rng    = np.random.default_rng(seed)
     fmc    = _generate_fmc_field(terrain, base_fmc, rng)
     ws, wd = _generate_base_wind(terrain, base_ws, base_wd, rng)
@@ -276,4 +282,5 @@ def generate_ground_truth(
         wind_events=wind_events or [],
         fire=fire,
         shape=terrain.shape,
+        ignition_cells=cells,
     )

@@ -31,6 +31,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from angrybird.config import PROCESS_NOISE_FLOOR
 from angrybird.types import (
     TerrainData, GPPrior, EnsembleResult,
     DroneObservation, CycleReport, InformationField,
@@ -192,7 +193,10 @@ class SimpleFire:
         ig_r, ig_c = np.where(ignition)
 
         fuel_arr = np.vectorize(self._FUEL_SPREAD.get)(terrain.fuel_model, 1.0)
-        fmc_std  = np.sqrt(np.clip(gp_prior.fmc_variance, 0.0, None)).astype(np.float32)
+        fmc_std  = np.maximum(
+            np.sqrt(np.clip(gp_prior.fmc_variance, 0.0, None)),
+            PROCESS_NOISE_FLOOR,
+        ).astype(np.float32)
         ws_std   = np.sqrt(np.clip(gp_prior.wind_speed_variance, 0.0, None)).astype(np.float32)
 
         # One unique seed per member drawn from the caller's rng

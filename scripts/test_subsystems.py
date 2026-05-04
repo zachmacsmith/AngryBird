@@ -68,8 +68,11 @@ def _make_ensemble(
     member_arrivals = []
     member_fmc = []
     member_ws = []
+    member_wd = []
     fmc_mean = gp_prior.fmc_mean.astype(np.float64)
     ws_mean  = gp_prior.wind_speed_mean.astype(np.float64)
+    wd_mean  = gp_prior.wind_dir_mean.astype(np.float64)
+    wd_std   = np.sqrt(np.clip(gp_prior.wind_dir_variance, 0.0, None)).astype(np.float64)
 
     fire_rows, fire_cols = np.where(fire_state > 0)
     if len(fire_rows) == 0:
@@ -79,8 +82,10 @@ def _make_ensemble(
     for _ in range(n_members):
         fmc_pert = draw_gp_scaled_field(shape, 1500.0, res, gp_prior.fmc_variance)
         ws_pert  = draw_gp_scaled_field(shape, 5000.0, res, gp_prior.wind_speed_variance)
+        wd_pert  = rng.standard_normal(shape).astype(np.float64) * wd_std
         fmc_m = np.clip(fmc_mean + fmc_pert, 0.02, 0.40)
         ws_m  = np.clip(ws_mean  + ws_pert,  0.0,  20.0)
+        wd_m  = (wd_mean + wd_pert) % 360.0
 
         fmc_factor = np.clip((0.30 - fmc_m) / 0.28, 0.05, 1.0)
         fuel_load = np.array(
@@ -105,6 +110,7 @@ def _make_ensemble(
         member_arrivals.append(arrival_hr.astype(np.float32))
         member_fmc.append(fmc_m.astype(np.float32))
         member_ws.append(ws_m.astype(np.float32))
+        member_wd.append(wd_m.astype(np.float32))
 
     mat = np.stack(member_arrivals)
     bp = (np.sum(~np.isnan(mat), axis=0) / n_members).astype(np.float32)
@@ -115,6 +121,7 @@ def _make_ensemble(
         member_arrival_times=mat,
         member_fmc_fields=np.stack(member_fmc),
         member_wind_fields=np.stack(member_ws),
+        member_wind_dir_fields=np.stack(member_wd),
         burn_probability=bp,
         mean_arrival_time=mean_arr,
         arrival_time_variance=var_arr,

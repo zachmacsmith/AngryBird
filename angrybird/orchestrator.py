@@ -253,8 +253,9 @@ def _neutral_ensemble(shape: tuple[int, int], n_members: int) -> EnsembleResult:
     zero = np.zeros((rows, cols), dtype=np.float32)
     return EnsembleResult(
         member_arrival_times=np.full((n_members, rows, cols), np.nan, dtype=np.float32),
-        member_fmc_fields=np.full((n_members, rows, cols), 0.10, dtype=np.float32),
-        member_wind_fields=np.full((n_members, rows, cols), 5.0,  dtype=np.float32),
+        member_fmc_fields=np.full((n_members, rows, cols), 0.10,  dtype=np.float32),
+        member_wind_fields=np.full((n_members, rows, cols), 5.0,   dtype=np.float32),
+        member_wind_dir_fields=np.full((n_members, rows, cols), 270.0, dtype=np.float32),
         burn_probability=zero,
         mean_arrival_time=zero,
         arrival_time_variance=zero,

@@ -28,9 +28,13 @@ from .config import (
     GP_NOISE_FMC,
     GP_NOISE_WIND_DIR,
     GP_NOISE_WIND_SPEED,
+    GP_OBS_DECAY_DROP_FACTOR,
     GP_TERRAIN_ALPHA,
     GP_TERRAIN_BETA,
     GRID_RESOLUTION_M,
+    TAU_FMC_S,
+    TAU_WIND_DIR_S,
+    TAU_WIND_SPEED_S,
 )
 from .types import GPPrior, TerrainData
 
@@ -166,6 +170,9 @@ class IGNISGPPrior:
         noise_fmc: float = GP_NOISE_FMC,
         noise_wind_speed: float = GP_NOISE_WIND_SPEED,
         noise_wind_dir: float = GP_NOISE_WIND_DIR,
+        tau_fmc: float = TAU_FMC_S,
+        tau_wind_speed: float = TAU_WIND_SPEED_S,
+        tau_wind_dir: float = TAU_WIND_DIR_S,
     ):
         self.terrain = terrain
         self.resolution_m = resolution_m
@@ -177,7 +184,22 @@ class IGNISGPPrior:
         self.noise_wind_speed = noise_wind_speed
         self.noise_wind_dir = noise_wind_dir
 
-        # Observation stores — separate for each variable
+        # RAWS observation stores — replaced entirely on each add_raws() call.
+        # No timestamps: RAWS readings are always treated as current; calling
+        # add_raws() again (e.g. each IGNIS cycle) supersedes the previous reading.
+        self._raws_fmc_locs:   list[tuple[int, int]] = []
+        self._raws_fmc_vals:   list[float] = []
+        self._raws_fmc_sigmas: list[float] = []
+
+        self._raws_ws_locs:   list[tuple[int, int]] = []
+        self._raws_ws_vals:   list[float] = []
+        self._raws_ws_sigmas: list[float] = []
+
+        self._raws_wd_locs:   list[tuple[int, int]] = []
+        self._raws_wd_vals:   list[float] = []
+        self._raws_wd_sigmas: list[float] = []
+
+        # Drone observation stores — accumulate over time, subject to temporal decay.
         self._fmc_locs: list[tuple[int, int]] = []
         self._fmc_vals: list[float] = []
         self._fmc_sigmas: list[float] = []
@@ -189,6 +211,18 @@ class IGNISGPPrior:
         self._wd_locs: list[tuple[int, int]] = []
         self._wd_vals: list[float] = []
         self._wd_sigmas: list[float] = []
+
+        # Observation timestamps — parallel to drone stores only.
+        # Used to compute effective sigma = orig_sigma * exp(age / tau).
+        self._fmc_times: list[float] = []
+        self._ws_times:  list[float] = []
+        self._wd_times:  list[float] = []
+
+        # GP clock — updated once per simulation cycle.
+        self._current_time: float = 0.0
+        self._tau_fmc:        float = tau_fmc
+        self._tau_wind_speed: float = tau_wind_speed
+        self._tau_wind_dir:   float = tau_wind_dir
 
         # Cached fitted regressors — invalidated when new observations arrive
         self._gp_fmc: Optional[GaussianProcessRegressor] = None
@@ -204,6 +238,13 @@ class IGNISGPPrior:
         # When set, FMC obs are fitted as residuals from this field and
         # predictions add it back — GP corrects Nelson where data disagrees.
         self._nelson_mean: Optional[np.ndarray] = None
+
+        # Scenario/weather-model wind prior mean fields.
+        # When set, wind obs are fitted as residuals and predictions add back
+        # the prior — same pattern as Nelson for FMC.  Corrects the hardcoded
+        # 270° / 5 m/s fallback to the actual scenario baseline.
+        self._wind_speed_mean: Optional[np.ndarray] = None
+        self._wind_dir_mean:   Optional[np.ndarray] = None
 
     # ------------------------------------------------------------------
     # Nelson mean function
@@ -226,6 +267,43 @@ class IGNISGPPrior:
         self._dirty = True   # residuals changed → refit on next predict()
 
     # ------------------------------------------------------------------
+    # Wind prior mean function
+    # ------------------------------------------------------------------
+
+    def set_wind_prior_mean(
+        self, ws_field: np.ndarray, wd_field: np.ndarray
+    ) -> None:
+        """
+        Set spatially varying prior mean fields for wind speed and direction.
+
+        Mirrors set_nelson_mean for FMC: drone wind observations are fitted as
+        residuals (observed − prior), predictions add the prior back.  The GP
+        then corrects where drones disagree with the background.
+
+        Call once at simulation startup (and again after a wind-shift event)
+        with the scenario's base wind fields.  Without this, predict() falls
+        back to a hardcoded 270° west / 5 m/s prior regardless of scenario.
+
+        Wind direction residuals use circular arithmetic so wrap-around at 0°/
+        360° does not introduce a ~360° spike.
+        """
+        self._wind_speed_mean = np.asarray(ws_field, dtype=np.float32).copy()
+        self._wind_dir_mean   = np.asarray(wd_field, dtype=np.float32).copy()
+        self._dirty = True
+
+    def update_time(self, t: float) -> None:
+        """
+        Advance the GP clock to simulation time t (seconds).
+
+        Triggers a refit on the next predict() call so that effective observation
+        sigmas (which grow with age) and any stale-observation pruning are applied.
+        No-op if t has not changed.
+        """
+        if t != self._current_time:
+            self._current_time = t
+            self._dirty = True
+
+    # ------------------------------------------------------------------
     # Observation ingestion
     # ------------------------------------------------------------------
 
@@ -238,24 +316,34 @@ class IGNISGPPrior:
         fmc_sigmas: Optional[list[float]] = None,
         ws_sigmas: Optional[list[float]] = None,
         wd_sigmas: Optional[list[float]] = None,
+        obs_time: Optional[float] = None,  # retained for API compatibility; unused
     ) -> None:
-        """Add RAWS station observations for all three variables."""
+        """Replace RAWS station observations for all three variables.
+
+        Each call replaces any previous RAWS readings — the latest reading from a
+        fixed ground station supersedes the old one.  Call this every IGNIS cycle
+        with fresh telemetry and the GP will always anchor to current conditions.
+
+        RAWS observations are never subject to temporal decay.  They represent
+        the instantaneous station reading at the moment of the call, which is
+        always "now" from the GP's perspective.
+        """
         n = len(locations)
         fmc_sigmas = fmc_sigmas or [self.noise_fmc] * n
-        ws_sigmas = ws_sigmas or [self.noise_wind_speed] * n
-        wd_sigmas = wd_sigmas or [self.noise_wind_dir] * n
+        ws_sigmas  = ws_sigmas  or [self.noise_wind_speed] * n
+        wd_sigmas  = wd_sigmas  or [self.noise_wind_dir] * n
 
-        self._fmc_locs.extend(locations)
-        self._fmc_vals.extend(fmc_vals)
-        self._fmc_sigmas.extend(fmc_sigmas)
+        self._raws_fmc_locs   = list(locations)
+        self._raws_fmc_vals   = list(fmc_vals)
+        self._raws_fmc_sigmas = list(fmc_sigmas)
 
-        self._ws_locs.extend(locations)
-        self._ws_vals.extend(ws_vals)
-        self._ws_sigmas.extend(ws_sigmas)
+        self._raws_ws_locs   = list(locations)
+        self._raws_ws_vals   = list(ws_vals)
+        self._raws_ws_sigmas = list(ws_sigmas)
 
-        self._wd_locs.extend(locations)
-        self._wd_vals.extend(wd_vals)
-        self._wd_sigmas.extend(wd_sigmas)
+        self._raws_wd_locs   = list(locations)
+        self._raws_wd_vals   = list(wd_vals)
+        self._raws_wd_sigmas = list(wd_sigmas)
 
         self._dirty = True
 
@@ -270,6 +358,9 @@ class IGNISGPPrior:
         wd_vals: Optional[list[float]] = None,
         wd_sigmas: Optional[list[float]] = None,
         wd_locs: Optional[list[tuple[int, int]]] = None,
+        obs_times: Optional[list[float]] = None,
+        ws_times:  Optional[list[float]] = None,
+        wd_times:  Optional[list[float]] = None,
     ) -> None:
         """Add drone FMC (and optionally wind speed + direction) observations.
 
@@ -280,6 +371,8 @@ class IGNISGPPrior:
         self._fmc_locs.extend(locations)
         self._fmc_vals.extend(fmc_vals)
         self._fmc_sigmas.extend(fmc_sigmas)
+        _fmc_t = obs_times if obs_times is not None else [self._current_time] * len(locations)
+        self._fmc_times.extend(_fmc_t)
 
         if ws_vals is not None:
             _ws_locs = ws_locs if ws_locs is not None else locations
@@ -287,6 +380,8 @@ class IGNISGPPrior:
             self._ws_locs.extend(_ws_locs)
             self._ws_vals.extend(ws_vals)
             self._ws_sigmas.extend(ws_sigmas)
+            _ws_t = ws_times if ws_times is not None else [self._current_time] * len(_ws_locs)
+            self._ws_times.extend(_ws_t)
 
         if wd_vals is not None:
             _wd_locs = wd_locs if wd_locs is not None else locations
@@ -294,28 +389,14 @@ class IGNISGPPrior:
             self._wd_locs.extend(_wd_locs)
             self._wd_vals.extend(wd_vals)
             self._wd_sigmas.extend(wd_sigmas)
+            _wd_t = wd_times if wd_times is not None else [self._current_time] * len(_wd_locs)
+            self._wd_times.extend(_wd_t)
 
         self._dirty = True
 
     # ------------------------------------------------------------------
     # Fitting
     # ------------------------------------------------------------------
-
-    def _build_gp(self, length_scale: float, noise_sigma: float) -> GaussianProcessRegressor:
-        # Use alpha (fixed noise) instead of WhiteKernel so the optimizer cannot
-        # collapse all variance into noise. With sparse RAWS, WhiteKernel absorbs
-        # all signal and the posterior variance becomes spatially flat (PotentialBugs1 §9).
-        ls_bounds = (length_scale * 0.5, length_scale * 5.0)
-        kernel = C(1.0, (1e-3, 1e3)) * _TerrainMatern32(
-            length_scale, self.alpha, self.beta, length_scale_bounds=ls_bounds
-        )
-        return GaussianProcessRegressor(
-            kernel=kernel,
-            alpha=noise_sigma ** 2,   # fixed known measurement noise
-            n_restarts_optimizer=2,
-            normalize_y=True,
-            copy_X_train=True,
-        )
 
     def _fit_variable(
         self,
@@ -330,20 +411,36 @@ class IGNISGPPrior:
             return None
         X = _obs_features(locs, self.terrain, self.resolution_m)
         y = np.array(vals, dtype=np.float64)
+        # Per-observation alpha: uses effective (age-inflated) sigmas for drone obs
+        # and original sigmas for RAWS obs.  This is the mechanism that makes decay
+        # gradual rather than binary — stale observations have inflated alpha and thus
+        # lower weight in the GP posterior, not just a hard prune at the drop threshold.
+        alpha = np.array(sigmas, dtype=np.float64) ** 2
         if previous_gp is not None:
             # Lock hyperparameters to the first-fit values; only update the posterior.
             # Re-optimizing every cycle lets the kernel amplitude grow when new obs span
             # a wider range, reversing variance reductions from earlier cycles.
             gp = GaussianProcessRegressor(
                 kernel=previous_gp.kernel_,
-                alpha=noise_sigma ** 2,
+                alpha=alpha,
                 n_restarts_optimizer=0,
-                normalize_y=True,
+                normalize_y=False,
                 copy_X_train=True,
                 optimizer=None,
             )
         else:
-            gp = self._build_gp(length_scale, noise_sigma)
+            ls_bounds = (length_scale * 0.5, length_scale * 5.0)
+            kernel = C(1.0, (1e-3, 1e3)) * _TerrainMatern32(
+                length_scale, self.alpha, self.beta,
+                length_scale_bounds=ls_bounds,
+            )
+            gp = GaussianProcessRegressor(
+                kernel=kernel,
+                alpha=alpha,
+                n_restarts_optimizer=2,
+                normalize_y=False,
+                copy_X_train=True,
+            )
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             try:
@@ -356,39 +453,153 @@ class IGNISGPPrior:
                         "Locked-kernel Cholesky failed (%d obs); "
                         "re-fitting with optimization.", len(locs)
                     )
-                    gp = self._build_gp(length_scale, noise_sigma)
+                    ls_bounds = (length_scale * 0.5, length_scale * 5.0)
+                    kernel = C(1.0, (1e-3, 1e3)) * _TerrainMatern32(
+                        length_scale, self.alpha, self.beta,
+                        length_scale_bounds=ls_bounds,
+                    )
+                    gp = GaussianProcessRegressor(
+                        kernel=kernel, alpha=alpha,
+                        n_restarts_optimizer=2, normalize_y=False, copy_X_train=True,
+                    )
                     gp.fit(X, y)
                 else:
                     raise
         return gp
 
+    def _prune_and_decay(
+        self,
+        locs:   list,
+        vals:   list,
+        sigmas: list,
+        times:  list,
+        tau:    float,
+    ) -> tuple[list, list, list, list, list[float], bool]:
+        """
+        Apply temporal decay and prune observations whose effective sigma
+        exceeds GP_OBS_DECAY_DROP_FACTOR × the original sigma.
+
+        Returns
+        -------
+        (filtered_locs, filtered_vals, filtered_sigmas, filtered_times,
+         effective_sigmas, pruned)
+
+        Original sigmas are retained in storage (never inflated in-place).
+        Effective sigmas are returned for use in GP fitting only.
+        pruned is True when at least one observation was dropped.
+        """
+        if not locs:
+            return [], [], [], [], [], False
+
+        keep: list[bool] = []
+        eff_sigmas: list[float] = []
+        for sigma, t in zip(sigmas, times):
+            age = max(0.0, self._current_time - t)
+            sigma_eff = float(sigma * np.exp(age / tau))
+            if sigma_eff <= GP_OBS_DECAY_DROP_FACTOR * sigma:
+                keep.append(True)
+                eff_sigmas.append(sigma_eff)
+            else:
+                keep.append(False)
+
+        pruned = not all(keep)
+        f_locs   = [l for l, k in zip(locs,   keep) if k]
+        f_vals   = [v for v, k in zip(vals,   keep) if k]
+        f_sigs   = [s for s, k in zip(sigmas, keep) if k]
+        f_times  = [t for t, k in zip(times,  keep) if k]
+        return f_locs, f_vals, f_sigs, f_times, eff_sigmas, pruned
+
     def fit(self) -> None:
-        """Fit GPs to all current observations."""
-        # FMC: fit residuals from Nelson prior mean so the GP corrects the
-        # physics model rather than interpolating raw values.
-        fmc_vals = self._fmc_vals
-        if self._nelson_mean is not None and self._fmc_locs:
-            ri = [int(r) for r, _ in self._fmc_locs]
-            ci = [int(c) for _, c in self._fmc_locs]
+        """Fit GPs to all current observations.
+
+        RAWS observations are always included at their original sigmas (no decay).
+        Drone observations are subject to temporal decay: effective sigma grows
+        exponentially with age, and observations are pruned when sigma_eff > 10×
+        original.  Merged RAWS + drone training data is passed to the GP so the
+        posterior reflects both the stable ground-station anchor and the decaying
+        flight observations.
+        """
+        # --- FMC: decay drone obs, then merge with RAWS ---
+        (self._fmc_locs, self._fmc_vals, self._fmc_sigmas, self._fmc_times,
+         fmc_eff_sigmas, fmc_pruned) = self._prune_and_decay(
+            self._fmc_locs, self._fmc_vals, self._fmc_sigmas, self._fmc_times,
+            self._tau_fmc,
+        )
+        if fmc_pruned:
+            self._gp_fmc = None  # force full refit when training set changes
+
+        # Merged locs/vals/sigmas: RAWS at original sigma, drones at effective sigma
+        all_fmc_locs  = self._raws_fmc_locs + self._fmc_locs
+        all_fmc_vals  = self._raws_fmc_vals  + list(self._fmc_vals)
+        all_fmc_sigs  = self._raws_fmc_sigmas + (fmc_eff_sigmas if fmc_eff_sigmas else self._fmc_sigmas)
+
+        # Nelson prior: subtract from combined locs
+        fmc_vals_fit = list(all_fmc_vals)
+        if self._nelson_mean is not None and all_fmc_locs:
+            ri = [int(r) for r, _ in all_fmc_locs]
+            ci = [int(c) for _, c in all_fmc_locs]
             nelson_at_obs = self._nelson_mean[ri, ci].astype(np.float64)
-            fmc_vals = [float(v) - float(n)
-                        for v, n in zip(self._fmc_vals, nelson_at_obs)]
+            fmc_vals_fit = [float(v) - float(n)
+                            for v, n in zip(all_fmc_vals, nelson_at_obs)]
 
         self._gp_fmc = self._fit_variable(
-            self._fmc_locs, fmc_vals, self._fmc_sigmas,
+            all_fmc_locs, fmc_vals_fit, all_fmc_sigs,
             self.length_scale_fmc, self.noise_fmc,
             previous_gp=self._gp_fmc,
         )
+
+        # --- Wind speed: decay drone obs, merge with RAWS ---
+        (self._ws_locs, self._ws_vals, self._ws_sigmas, self._ws_times,
+         ws_eff_sigmas, ws_pruned) = self._prune_and_decay(
+            self._ws_locs, self._ws_vals, self._ws_sigmas, self._ws_times,
+            self._tau_wind_speed,
+        )
+        if ws_pruned:
+            self._gp_ws = None
+
+        all_ws_locs = self._raws_ws_locs + self._ws_locs
+        all_ws_vals = self._raws_ws_vals  + list(self._ws_vals)
+        all_ws_sigs = self._raws_ws_sigmas + (ws_eff_sigmas if ws_eff_sigmas else self._ws_sigmas)
+
+        ws_vals_fit = list(all_ws_vals)
+        if self._wind_speed_mean is not None and all_ws_locs:
+            ri = [int(r) for r, _ in all_ws_locs]
+            ci = [int(c) for _, c in all_ws_locs]
+            ws_prior_at_obs = self._wind_speed_mean[ri, ci].astype(np.float64)
+            ws_vals_fit = [float(v) - float(p)
+                           for v, p in zip(all_ws_vals, ws_prior_at_obs)]
         self._gp_ws = self._fit_variable(
-            self._ws_locs, self._ws_vals, self._ws_sigmas,
+            all_ws_locs, ws_vals_fit, all_ws_sigs,
             self.length_scale_wind, self.noise_wind_speed,
             previous_gp=self._gp_ws,
         )
+
+        # --- Wind direction: decay drone obs, merge with RAWS ---
+        (self._wd_locs, self._wd_vals, self._wd_sigmas, self._wd_times,
+         wd_eff_sigmas, wd_pruned) = self._prune_and_decay(
+            self._wd_locs, self._wd_vals, self._wd_sigmas, self._wd_times,
+            self._tau_wind_dir,
+        )
+        if wd_pruned:
+            self._gp_wd = None
+
+        all_wd_locs = self._raws_wd_locs + self._wd_locs
+        all_wd_vals = self._raws_wd_vals  + list(self._wd_vals)
+        all_wd_sigs = self._raws_wd_sigmas + (wd_eff_sigmas if wd_eff_sigmas else self._wd_sigmas)
+
+        wd_vals_fit = list(all_wd_vals)
+        if self._wind_dir_mean is not None and all_wd_locs:
+            ri = [int(r) for r, _ in all_wd_locs]
+            ci = [int(c) for _, c in all_wd_locs]
+            wd_prior_at_obs = self._wind_dir_mean[ri, ci].astype(np.float64)
+            wd_vals_fit = [float(((v - p + 180.0) % 360.0) - 180.0)
+                           for v, p in zip(all_wd_vals, wd_prior_at_obs)]
         self._gp_wd = self._fit_variable(
-            self._wd_locs, self._wd_vals, self._wd_sigmas,
+            all_wd_locs, wd_vals_fit, all_wd_sigs,
             self.length_scale_wind, self.noise_wind_dir,
             previous_gp=self._gp_wd,
         )
+
         self._dirty = False
 
     # ------------------------------------------------------------------
@@ -445,16 +656,30 @@ class IGNISGPPrior:
         )
         if _nelson is not None:
             fmc_mean = np.clip(fmc_mean + _nelson, 0.02, 0.40).astype(np.float32)
+        _ws_prior = (self._wind_speed_mean
+                     if self._wind_speed_mean is not None
+                     and self._wind_speed_mean.shape == tuple(shape)
+                     else None)
+        _wd_prior = (self._wind_dir_mean
+                     if self._wind_dir_mean is not None
+                     and self._wind_dir_mean.shape == tuple(shape)
+                     else None)
+
         ws_mean, ws_var = self._predict_variable(
             self._gp_ws, X_grid, shape,
-            default_mean=5.0,    # 5 m/s fallback
+            default_mean=0.0 if _ws_prior is not None else 5.0,
             default_variance=4.0,
         )
+        if _ws_prior is not None:
+            ws_mean = np.clip(ws_mean + _ws_prior, 0.5, 25.0).astype(np.float32)
+
         wd_mean, wd_var = self._predict_variable(
             self._gp_wd, X_grid, shape,
-            default_mean=270.0,  # westerly fallback
+            default_mean=0.0 if _wd_prior is not None else 270.0,
             default_variance=900.0,
         )
+        if _wd_prior is not None:
+            wd_mean = ((wd_mean + _wd_prior) % 360.0).astype(np.float32)
 
         return GPPrior(
             fmc_mean=fmc_mean,

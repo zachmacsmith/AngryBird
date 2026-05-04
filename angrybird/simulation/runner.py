@@ -65,9 +65,15 @@ from .evaluator import CounterfactualEvaluator
 from .ground_truth import GroundTruth, compute_wind_field
 from .observation_buffer import ObservationBuffer, thin_observations
 from ..assimilation import aggregate_drone_observations
-from ..config import GP_CORRELATION_LENGTH_FMC_M
+from ..config import (
+    GP_CORRELATION_LENGTH_FMC_M,
+    RAWS_FMC_SIGMA,
+    RAWS_WIND_SPEED_SIGMA,
+    RAWS_WIND_DIR_SIGMA,
+)
 from .observer import ObservationSource, SimulatedObserver
 from .renderer import FrameRenderer
+from ..raws import RAWSObserver, RAWSStation, place_raws_stations
 
 logger = logging.getLogger(__name__)
 
@@ -91,6 +97,9 @@ class SimulationConfig:
     fps: int = 10                           # video frames per second
     output_path: str = "out/simulation"
     scenario_name: str = "simulation"
+    # RAWS stations — 1 randomly placed by default; pass raws_locations to fix positions
+    n_raws: int = 1
+    raws_locations: list = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -248,14 +257,20 @@ class LiveEstimator:
                               if o.wind_dir_sigma is not None else 10.0
                               for o in wd_obs]
 
+                obs_times = [o.timestamp if o.timestamp is not None else 0.0 for o in aggregated]
+                ws_times  = [o.timestamp if o.timestamp is not None else 0.0 for o in ws_obs]
+                wd_times  = [o.timestamp if o.timestamp is not None else 0.0 for o in wd_obs]
                 work_gp.add_observations(
                     locs, fmc_vals, fmc_sigmas,
+                    obs_times=obs_times,
                     ws_vals=ws_vals or None,
                     ws_sigmas=ws_sigmas or None,
                     ws_locs=ws_locs or None,
+                    ws_times=ws_times or None,
                     wd_vals=wd_vals or None,
                     wd_sigmas=wd_sigmas or None,
                     wd_locs=wd_locs or None,
+                    wd_times=wd_times or None,
                 )
                 self._cached_prior = work_gp.predict(shape)
             # Always reset so we don't redo the expensive deepcopy/predict unless
@@ -568,12 +583,20 @@ class SimulationRunner:
             frame_interval=config.frame_interval,
             fps=config.fps,
             horizon_h=horizon_h,
+            raws_locations=None,   # filled after RAWS placement below
         )
         self.noise = NoiseConfig(camera_footprint_m=config.camera_footprint_m)
 
-        # Tracks info_field.w.sum() from the previous cycle to compute per-cycle
-        # entropy reduction cheaply (no kernel evaluations needed).
+        # Tracks info_field.w.sum() from the previous cycle (mission-value metric).
+        # Can increase as fire spreads into new high-sensitivity cells, so is NOT
+        # a pure information-gain metric — use _prev_gp_var_sum for that.
         self._prev_info_entropy: Optional[float] = None
+
+        # Pure GP variance baseline: sum of fmc_variance + wind_speed_variance over the grid.
+        # Initialized from the no-observations default so cycle 1 captures the RAWS
+        # seeding contribution. Monotonically decreasing (more obs → lower variance).
+        _n = terrain.shape[0] * terrain.shape[1]
+        self._prev_gp_var_sum: float = (0.04 + 4.0) * _n  # FMC + wind-speed defaults
 
         base_pos = cell_to_pos_m(config.base_cell, terrain.resolution_m)
         self.drones = [
@@ -590,6 +613,69 @@ class SimulationRunner:
             )
             for i in range(config.n_drones)
         ]
+
+        # Build RAWS stations and seed the GP from their initial observations.
+        # The provider is a SimulatedObserver with lower noise than drone sensors
+        # (fixed ground station quality).  In production, swap the provider for a
+        # real telemetry client — the GP.add_raws() call below is identical.
+        if config.raws_locations:
+            raws_stations = [RAWSStation(loc) for loc in config.raws_locations]
+        else:
+            raws_stations = place_raws_stations(
+                shape=terrain.shape,
+                n=config.n_raws,
+                ignition_cells=ground_truth.ignition_cells,
+                base_cell=config.base_cell,
+                rng=np.random.default_rng(config.n_raws * 37),
+            )
+        self.raws_observer = RAWSObserver(
+            raws_stations,
+            SimulatedObserver(
+                ground_truth,
+                fmc_sigma=RAWS_FMC_SIGMA,
+                wind_speed_sigma=RAWS_WIND_SPEED_SIGMA,
+                wind_dir_sigma=RAWS_WIND_DIR_SIGMA,
+                rng=np.random.default_rng(55),
+            ),
+        )
+        self.renderer._raws_locations = self.raws_observer.locations
+
+        raws_obs = self.raws_observer.observe_all()
+        orchestrator.gp.add_raws(
+            locations=[o.location for o in raws_obs],
+            fmc_vals=[o.fmc for o in raws_obs],
+            ws_vals=[o.wind_speed for o in raws_obs],
+            wd_vals=[o.wind_dir for o in raws_obs],
+            fmc_sigmas=[o.fmc_sigma for o in raws_obs],
+            ws_sigmas=[o.wind_speed_sigma for o in raws_obs],
+            wd_sigmas=[o.wind_dir_sigma for o in raws_obs],
+        )
+
+        # Snapshot RAWS-only GP variance (before any drone observations).
+        # Deep-copy so the main GP's fitted state is not disturbed; the predict()
+        # call triggers a fit on the copy with only RAWS obs.  This is the baseline
+        # the renderer uses to draw the RAWS-only horizontal reference line.
+        _raws_only_gp = copy.deepcopy(orchestrator.gp)
+        _raws_prior = _raws_only_gp.predict(terrain.shape)
+        self.renderer._raws_only_gp_var_sum = float(
+            _raws_prior.fmc_variance.sum() + _raws_prior.wind_speed_variance.sum()
+        )
+        self.renderer._initial_gp_var_sum = self._prev_gp_var_sum
+
+        # Set a constant uninformed wind prior (5 m/s / 270° westerly) to:
+        #   1. Activate circular arithmetic in fit() for wind direction.
+        #   2. Ensure non-zero GP residuals (RAWS obs - prior ≠ 0) so the kernel
+        #      amplitude optimizer can fit a sensible C rather than collapsing to
+        #      the lower bound.
+        #   3. Give cells far from any training data a neutral fallback (prior).
+        # A prior equal to the RAWS observation gives residual = 0 → C → 1e-3
+        # → GP variance collapses and wind observations get no credit in the
+        # information field.  In production this prior would come from a NWP
+        # model (HRRR/GFS); here we use a fixed uninformed background.
+        orchestrator.gp.set_wind_prior_mean(
+            np.full(terrain.shape, 5.0,   dtype=np.float32),
+            np.full(terrain.shape, 270.0, dtype=np.float32),
+        )
 
         self.current_time: float = 0.0
         # Trigger first IGNIS cycle immediately at t=0
@@ -733,6 +819,10 @@ class SimulationRunner:
         """Flush observation buffer, run orchestrator, dispatch drones."""
         observations = self.obs_buffer.flush_thinned()
 
+        # Advance the GP clock so temporal decay and stale-observation pruning
+        # reflect the current simulation time before the cycle fits new data.
+        self.orchestrator.gp.update_time(self.current_time)
+
         fire_state = self.truth.fire.fire_state  # current burn mask (float32)
 
         # Update Nelson FMC prior mean for current time of day.
@@ -770,11 +860,21 @@ class SimulationRunner:
         targets = self.orchestrator._previous_selections
         self._mission_targets = list(targets)
 
-        # Cheap entropy tracking: diff consecutive info_field.w.sum() values.
-        # info_field.w encodes GP variance × fire sensitivity — it naturally falls
-        # as the GP accumulates observations, giving a real entropy-reduction signal
-        # without the O(cells × n_train × grid) cost of CounterfactualEvaluator.
+        # Mission-value metric: diff of info_field.w.sum() between cycles.
+        # w = gp_variance × |sensitivity| × observability — can INCREASE as fire
+        # spreads into new high-sensitivity cells, so is NOT a pure information-gain
+        # signal.  Use gp_var_reduction below for a monotonically-decreasing metric.
         evaluations: dict[str, StrategyEvaluation] = {}
+
+        # Pure GP variance metric: sum of fmc_variance + wind_speed_variance.
+        # Monotonically decreasing; baseline is the pre-observation default so cycle 1
+        # shows the RAWS seeding contribution and later cycles show drone contributions.
+        curr_gp_var = float(
+            self._gp_prior.fmc_variance.sum() + self._gp_prior.wind_speed_variance.sum()
+        ) if self._gp_prior is not None else self._prev_gp_var_sum
+        gp_var_red = max(0.0, self._prev_gp_var_sum - curr_gp_var)
+        self._prev_gp_var_sum = curr_gp_var
+
         if cycle_report.info_field is not None:
             curr_entropy = float(cycle_report.info_field.w.sum())
             prev_entropy = (self._prev_info_entropy
@@ -790,6 +890,9 @@ class SimulationRunner:
                 entropy_reduction=reduction,
                 perr=reduction / max(self.config.n_drones, 1),
                 cells_observed=[],
+                gp_var_before=self._prev_gp_var_sum + gp_var_red,  # prev value
+                gp_var_after=curr_gp_var,
+                gp_var_reduction=gp_var_red,
             )
 
         # CycleReport is frozen — use dataclasses.replace to attach evaluations.
@@ -803,13 +906,15 @@ class SimulationRunner:
         self._assign_drone_waypoints(targets)
 
         logger.info(
-            "IGNIS cycle %d | t=%.0fs | obs=%d | targets=%d | info_w=%.2f | entropy_red=%.4f",
+            "IGNIS cycle %d | t=%.0fs | obs=%d | info_w=%.2f | "
+            "mission_val_red=%.4f | gp_var=%.1f | gp_var_red=%.1f",
             len(self.cycle_reports),
             self.current_time,
             len(observations),
-            len(targets),
             self._prev_info_entropy or 0.0,
             evaluations.get("greedy", StrategyEvaluation("greedy", [], 0., 0., 0., 0., [])).entropy_reduction,
+            curr_gp_var,
+            gp_var_red,
         )
 
     # ------------------------------------------------------------------

@@ -149,6 +149,7 @@ class MapPanel:
         drones: Optional[list[DroneState]] = None,
         resolution_m: float = 50.0,
         shape: Optional[tuple[int, int]] = None,
+        raws_locations: Optional[list[tuple[int, int]]] = None,
     ) -> None:
         self._clear()
         ax = self.ax
@@ -217,6 +218,17 @@ class MapPanel:
             q = ax.quiver(X, Y, U, V, color="white", alpha=0.70,
                           scale=150, width=0.003)
             self._dyn.append(q)
+
+        # ── RAWS station markers ─────────────────────────────────────────
+
+        if raws_locations:
+            for j, (rr, rc) in enumerate(raws_locations):
+                sc = ax.scatter([rc], [rr], marker="D", c="yellow",
+                                s=55, zorder=8, edgecolors="black",
+                                linewidths=0.8)
+                tx = ax.text(rc + 1, rr - 1, f"W{j+1}", fontsize=5,
+                             color="yellow", fontweight="bold", zorder=9)
+                self._dyn += [sc, tx]
 
         # ── Drone targets ────────────────────────────────────────────────
 
@@ -353,6 +365,7 @@ class FrameRenderer:
         fps: int = 10,
         make_video: bool = True,
         horizon_h: float = 6.0,
+        raws_locations: Optional[list[tuple[int, int]]] = None,
     ) -> None:
         self.terrain        = terrain
         self.out_dir        = _unique_frame_dir(Path(out_dir))
@@ -364,6 +377,11 @@ class FrameRenderer:
         self._frame_count   = 0
         self._step_count    = 0
         self._cb_drawn      = False   # arrival-time colorbar drawn once
+        self._raws_locations = raws_locations or []
+        # Set by SimulationRunner after RAWS seeding: used to draw the RAWS-only
+        # GP-variance-reduction baseline alongside the full-model curve.
+        self._raws_only_gp_var_sum: float = 0.0
+        self._initial_gp_var_sum: float = 0.0
 
         # Build figure — 4 map panels + entropy strip
         self.fig = plt.figure(figsize=figsize)
@@ -434,6 +452,8 @@ class FrameRenderer:
             fontsize=11, fontweight="bold",
         )
 
+        rl = self._raws_locations  # shorthand
+
         # ── Panel 1: Ground truth ─────────────────────────────────────────
         self.panels["truth"].update(
             fmc=ground_truth.fmc,
@@ -442,28 +462,26 @@ class FrameRenderer:
             fire_arrival=ground_truth.fire.arrival_times.astype(np.float32),
             current_time=time_s,
             drones=drones, resolution_m=res, shape=sh,
+            raws_locations=rl,
         )
 
         # ── Panel 2: Live IGNIS estimate — FMC + wind ─────────────────────
-        # Uses live_gp_prior (updates per observation) when available,
-        # falls back to last cycle's gp_prior.
         self.panels["est"].update(
             fmc=est_prior.fmc_mean if est_prior is not None else None,
             wind_speed=(est_prior.wind_speed_mean if est_prior is not None else None),
             wind_direction=(est_prior.wind_dir_mean if est_prior is not None else None),
             drones=drones, resolution_m=res, shape=sh,
+            raws_locations=rl,
         )
 
         # ── Panel 3: Live estimated arrival time ──────────────────────────
-        # Shows single-member deterministic fire prediction from GP mean conditions.
-        # Updates whenever a drone returns an observation (not just at IGNIS cycle).
         self.panels["arrival"].update(
             arrival_times_h=live_arrival_times_h,
             current_time=time_s,
             horizon_h=self.horizon_h,
             drones=drones, resolution_m=res, shape=sh,
+            raws_locations=rl,
         )
-        # Draw the arrival time colorbar once (the ScalarMappable doesn't change)
         if not self._cb_drawn and live_arrival_times_h is not None:
             _draw_arrival_colorbar(self.panels["arrival"].ax, self.horizon_h)
             self._cb_drawn = True
@@ -473,6 +491,7 @@ class FrameRenderer:
             uncertainty=info_field.w if info_field is not None else None,
             drone_targets=mission_targets or [],
             drones=drones, resolution_m=res, shape=sh,
+            raws_locations=rl,
         )
 
         # ── Bottom: entropy convergence ───────────────────────────────────
@@ -487,31 +506,49 @@ class FrameRenderer:
     def _update_entropy(self, reports: list[CycleReport]) -> None:
         ax = self.ax_entropy
         ax.clear()
-        ax.set_title("Entropy Convergence (greedy strategy)", fontsize=8, fontweight="bold")
+        ax.set_title(
+            "Cumulative GP Variance Reduction — Full Model vs RAWS-Only Baseline",
+            fontsize=8, fontweight="bold",
+        )
         ax.set_xlabel("IGNIS Cycle", fontsize=7)
-        ax.set_ylabel("Cumulative Entropy Reduction", fontsize=7)
+        ax.set_ylabel("Cumulative GP Variance Reduction (FMC + wind)", fontsize=7)
         ax.tick_params(labelsize=6)
         ax.grid(True, alpha=0.3)
 
+        # Full model: cumulative gp_var_reduction per cycle (greedy strategy).
+        # This is the sum of FMC+wind GP variance reduced by RAWS seeding + each
+        # successive round of drone observations.
+        gp_var_reds = [
+            r.evaluations["greedy"].gp_var_reduction
+            for r in reports
+            if "greedy" in r.evaluations
+        ]
         any_plotted = False
-        for name, style in STRATEGY_STYLES.items():
-            # Derive per-cycle entropy reductions directly from reports.
-            # Avoids the frame-by-frame accumulation bug (appending every render
-            # frame instead of every cycle inflated the cumsum by ~20×).
-            vals = [
-                r.evaluations[name].entropy_reduction
-                for r in reports
-                if name in r.evaluations
-            ]
-            if vals:
-                cumulative = np.cumsum(vals)
-                ax.plot(range(1, len(cumulative) + 1), cumulative,
-                        color=style["color"], linestyle=style["linestyle"],
-                        linewidth=1.5, label=style["label"])
-                any_plotted = True
+        if gp_var_reds:
+            cumulative = np.cumsum(gp_var_reds)
+            ax.plot(
+                range(1, len(cumulative) + 1), cumulative,
+                color="#2196F3", linestyle="-", linewidth=1.5,
+                label="Full model (RAWS + drones)",
+            )
+            any_plotted = True
+
+        # RAWS-only baseline: how much variance a static RAWS network alone
+        # removes from the flat uninformed prior.  This is a constant horizontal
+        # line — RAWS stations are at fixed locations so their posterior-variance
+        # reduction does not grow with additional cycles.
+        if self._initial_gp_var_sum > 0 and self._raws_only_gp_var_sum > 0:
+            raws_reduction = self._initial_gp_var_sum - self._raws_only_gp_var_sum
+            n_x = max(len(gp_var_reds), 1)
+            ax.hlines(
+                raws_reduction, xmin=1, xmax=n_x,
+                colors="#FF9800", linestyles="--", linewidth=1.5,
+                label=f"RAWS-only baseline ({raws_reduction:.1f})",
+            )
+            any_plotted = True
 
         if any_plotted:
-            ax.legend(fontsize=6, loc="upper left")
+            ax.legend(fontsize=6, loc="lower right")
 
     def finalize(self) -> None:
         """Close figure and optionally assemble video from PNG frames."""
@@ -525,7 +562,7 @@ class FrameRenderer:
         """Assemble PNG frames into MP4 via FFMpeg (if available)."""
         try:
             import subprocess
-            out_video = self.out_dir.parent / "simulation.mp4"
+            out_video = self.out_dir.parent / f"{self.out_dir.name}.mp4"
             cmd = [
                 "ffmpeg", "-y",
                 "-framerate", str(self.fps),

@@ -22,6 +22,7 @@ from typing import Optional
 import numpy as np
 
 from .config import (
+    AGGREGATION_SIGMA_FLOOR,
     ENKF_INFLATION_FACTOR,
     ENKF_LOCALIZATION_RADIUS_M,
     ENKF_OUTLIER_THRESHOLD,
@@ -135,7 +136,7 @@ def aggregate_drone_observations(
         # Floor at half the individual sensor sigma — prevents averaging many
         # readings from collapsing sigma to near-zero and over-constraining the GP
         # (which drives info_field.w → 0 everywhere after the first cycle).
-        sigma_fmc    = max(float(1.0 / np.sqrt(fmc_wsum)), OBS_FMC_SIGMA / 2.0)
+        sigma_fmc    = max(float(1.0 / np.sqrt(fmc_wsum)), AGGREGATION_SIGMA_FLOOR)
 
         # Centroid location (rounded to nearest cell)
         r_agg = int(round(float(np.mean([o.location[0] for o in group]))))
@@ -343,13 +344,19 @@ def assimilate_observations(
         )
 
     # GP update: FMC from all thinned cells; wind speed + direction from nadir cells
+    fmc_times = [o.timestamp if o.timestamp is not None else 0.0 for o in thinned]
+    ws_times  = [o.timestamp if o.timestamp is not None else 0.0 for o in wind_obs]
+    wd_times  = [o.timestamp if o.timestamp is not None else 0.0 for o in dir_obs]
     gp.add_observations(locs, fmc_vals, fmc_sigs,
+                        obs_times=fmc_times,
                         ws_vals=ws_vals or None,
                         ws_sigmas=ws_sigs or None,
                         ws_locs=ws_locs or None,
+                        ws_times=ws_times or None,
                         wd_vals=wd_vals or None,
                         wd_sigmas=wd_sigs or None,
-                        wd_locs=wd_locs or None)
+                        wd_locs=wd_locs or None,
+                        wd_times=wd_times or None)
 
     # EnKF updates — separate pass per variable, wind uses its own location subset
     obs_idx    = [r * shape[1] + c for r, c in locs]

@@ -41,7 +41,8 @@ class EnsembleResult:
     mean_arrival_time: np.ndarray      # float32[rows, cols]
     arrival_time_variance: np.ndarray  # float32[rows, cols]
     n_members: int
-    member_fire_types: Optional[np.ndarray] = field(default=None)  # int8[N, rows, cols]: 1=surface 2=crown
+    member_fire_types: Optional[np.ndarray] = field(default=None)      # int8[N, rows, cols]: 1=surface 2=crown
+    member_wind_dir_fields: Optional[np.ndarray] = field(default=None) # float32[N, rows, cols], perturbed wind direction used
 
 
 @dataclass(frozen=True)
@@ -105,6 +106,12 @@ class StrategyEvaluation:
     entropy_reduction: float
     perr: float                  # per-drone entropy reduction
     cells_observed: list[tuple[int, int]]
+    # Pure GP variance sum (fmc_variance + wind_speed_variance, summed over grid).
+    # Unlike entropy_reduction, this is monotonically decreasing and unconfounded
+    # by fire-spread changes in sensitivity / observability.
+    gp_var_before: float = 0.0
+    gp_var_after: float = 0.0
+    gp_var_reduction: float = 0.0
 
 
 @dataclass(frozen=True)

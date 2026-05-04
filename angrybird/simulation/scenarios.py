@@ -148,11 +148,20 @@ def hilly_heterogeneous(
 
     Complex ridge/valley terrain with mixed fuel types and spatially variable
     FMC.  Fire ignites from the SW quadrant (row 150, col 40) and spreads
-    upslope into drier fuels under a steady southerly wind.  No wind events —
-    this scenario isolates the value of targeted placement.
+    upslope into drier fuels under a southerly wind.  A moderate 30° wind
+    shift at hour 2 stresses the wind-estimation pipeline.
     """
     terrain = _hilly_terrain()
     ignition_cell = (150, 40)
+
+    events = [
+        WindEvent(
+            time_s=7200.0,         # hour 2
+            direction_change=30.0, # clockwise: S → SSW
+            speed_change=1.5,      # gust from 5 → 6.5 m/s
+            ramp_duration_s=900.0, # 15-minute transition
+        ),
+    ]
 
     ground_truth = generate_ground_truth(
         terrain=terrain,
@@ -160,7 +169,7 @@ def hilly_heterogeneous(
         base_fmc=0.08,
         base_ws=5.0,
         base_wd=180.0,
-        wind_events=[],
+        wind_events=events,
         seed=seed,
     )
 
@@ -269,6 +278,60 @@ def flat_homogeneous(
         fps=10,
         output_path="out/sim_flat",
         scenario_name="flat_homogeneous",
+    )
+
+    return terrain, ground_truth, config
+
+
+def dual_ignition(
+    seed: int = 42,
+) -> tuple[TerrainData, GroundTruth, SimulationConfig]:
+    """
+    Two simultaneous ignitions on hilly terrain with a mid-simulation wind shift.
+
+    Fire 1 starts in the SW quadrant (row 155, col 35) on lower-elevation
+    shrub/rough-wood fuels.  Fire 2 starts in the NE area (row 35, col 155)
+    on steep-slope grass fuels with faster spread rates.  A 45° wind shift
+    at t=30 min forces the drone fleet to re-route mid-mission and tests
+    whether the wind GP estimate tracks the change from drone observations.
+
+    Designed as a 1-hour stress test: both fires are active simultaneously,
+    the wind shifts partway through, and FMC is dry (0.07) to maximise spread.
+    """
+    terrain = _hilly_terrain()
+
+    events = [
+        WindEvent(
+            time_s=1800.0,         # 30 minutes in
+            direction_change=45.0, # clockwise: SW → W
+            speed_change=2.5,      # gust from 6 → 8.5 m/s
+            ramp_duration_s=300.0, # 5-minute transition
+        ),
+    ]
+
+    ground_truth = generate_ground_truth(
+        terrain=terrain,
+        ignition_cell=[(155, 35), (35, 155)],
+        base_fmc=0.07,    # dry — maximises spread for the short 1-hour window
+        base_ws=6.0,
+        base_wd=225.0,    # SW wind — pushes both fires into different terrain features
+        wind_events=events,
+        seed=seed,
+    )
+
+    config = SimulationConfig(
+        dt=10.0,
+        total_time_s=3600.0,           # 1 hour
+        ignis_cycle_interval_s=1200.0, # 3 IGNIS cycles in the hour
+        n_drones=5,
+        drone_speed_ms=15.0,
+        drone_endurance_s=1800.0,
+        camera_footprint_m=100.0,
+        base_cell=(195, 100),
+        frame_interval=6,
+        fps=10,
+        output_path="out/sim_dual",
+        scenario_name="dual_ignition",
     )
 
     return terrain, ground_truth, config

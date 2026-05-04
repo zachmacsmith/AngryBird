@@ -78,9 +78,12 @@ def build_synthetic_ensemble(gp_prior, rng: np.random.Generator) -> EnsembleResu
     shape = (ROWS, COLS)
     rr, cc = np.meshgrid(np.arange(ROWS), np.arange(COLS), indexing="ij")
 
-    member_arrivals = np.zeros((N_MEMBERS, ROWS, COLS), dtype=np.float32)
-    member_fmc      = np.zeros((N_MEMBERS, ROWS, COLS), dtype=np.float32)
-    member_wind     = np.zeros((N_MEMBERS, ROWS, COLS), dtype=np.float32)
+    member_arrivals  = np.zeros((N_MEMBERS, ROWS, COLS), dtype=np.float32)
+    member_fmc       = np.zeros((N_MEMBERS, ROWS, COLS), dtype=np.float32)
+    member_wind      = np.zeros((N_MEMBERS, ROWS, COLS), dtype=np.float32)
+    member_wind_dir  = np.zeros((N_MEMBERS, ROWS, COLS), dtype=np.float32)
+
+    wd_std = np.sqrt(np.clip(gp_prior.wind_dir_variance, 0.0, None)).astype(np.float32)
 
     for i in range(N_MEMBERS):
         # GP-scaled FMC perturbation: higher uncertainty in data-sparse west
@@ -92,9 +95,13 @@ def build_synthetic_ensemble(gp_prior, rng: np.random.Generator) -> EnsembleResu
         )
         fmc_field = np.clip(gp_prior.fmc_mean + fmc_pert, 0.01, 0.50)
 
-        # Wind perturbation (isotropic, smaller magnitude)
+        # Wind speed perturbation (isotropic, smaller magnitude)
         ws_field = gp_prior.wind_speed_mean + rng.normal(0, 1.0, shape).astype(np.float32)
         ws_field = np.clip(ws_field, 0.5, 20.0)
+
+        # Wind direction perturbation — GP-scaled, circular wrap
+        wd_pert  = rng.normal(0, 1.0, shape).astype(np.float32) * wd_std
+        wd_field = (gp_prior.wind_dir_mean + wd_pert) % 360.0
 
         # Speed decreases with FMC (fire is harder to spread in wet fuels).
         # No upper clip — the sensitivity test needs speed to vary between members.
@@ -106,9 +113,10 @@ def build_synthetic_ensemble(gp_prior, rng: np.random.Generator) -> EnsembleResu
 
         # Cells beyond the horizon don't burn
         burned = arr <= HORIZON_H
-        member_arrivals[i] = np.where(burned, arr, np.nan)
-        member_fmc[i]      = fmc_field
-        member_wind[i]     = ws_field
+        member_arrivals[i]  = np.where(burned, arr, np.nan)
+        member_fmc[i]       = fmc_field
+        member_wind[i]      = ws_field
+        member_wind_dir[i]  = wd_field
 
     burn_prob  = (~np.isnan(member_arrivals)).mean(axis=0).astype(np.float32)
     mean_arr   = np.nanmean(member_arrivals, axis=0).astype(np.float32)
@@ -118,6 +126,7 @@ def build_synthetic_ensemble(gp_prior, rng: np.random.Generator) -> EnsembleResu
         member_arrival_times=member_arrivals,
         member_fmc_fields=member_fmc,
         member_wind_fields=member_wind,
+        member_wind_dir_fields=member_wind_dir,
         burn_probability=burn_prob,
         mean_arrival_time=mean_arr,
         arrival_time_variance=var_arr,

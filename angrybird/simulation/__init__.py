@@ -37,7 +37,7 @@ from .observation_buffer import ObservationBuffer
 from .observer import ObservationSource, SimulatedObserver
 from .renderer import FrameRenderer
 from .runner import CycleRunner, SimulationConfig, SimulationRunner
-from .scenarios import crown_fire_risk, flat_homogeneous, hilly_heterogeneous, wind_shift
+from .scenarios import crown_fire_risk, dual_ignition, flat_homogeneous, hilly_heterogeneous, wind_shift
 
 __all__ = [
     # runners
@@ -67,4 +67,5 @@ __all__ = [
     "wind_shift",
     "flat_homogeneous",
     "crown_fire_risk",
+    "dual_ignition",
 ]

@@ -81,13 +81,16 @@ class GroundTruthFire:
         ignition_cell:  (row, col) where the fire starts
     """
 
-    def __init__(self, terrain: TerrainData, ignition_cell: tuple[int, int]) -> None:
+    def __init__(
+        self,
+        terrain: TerrainData,
+        ignition_cell: "tuple[int, int] | list[tuple[int, int]]",
+    ) -> None:
         rows, cols = terrain.shape
         self.terrain      = terrain
         self.current_time = 0.0
 
         self.arrival_times = np.full((rows, cols), np.inf, dtype=np.float64)
-        self.arrival_times[ignition_cell] = 0.0
 
         # Fire type per cell: SURFACE_FIRE or CROWN_FIRE
         self.fire_types = np.zeros((rows, cols), dtype=np.int8)
@@ -95,8 +98,13 @@ class GroundTruthFire:
         # processed[r,c] = True once a cell's neighbors have been updated
         self._processed = np.zeros((rows, cols), dtype=bool)
 
-        # Min-heap of (arrival_time, row, col)
-        self._heap: list[tuple[float, int, int]] = [(0.0, ignition_cell[0], ignition_cell[1])]
+        # Support a single cell or a list of cells for multi-ignition scenarios
+        cells: list[tuple[int, int]] = (
+            [ignition_cell] if isinstance(ignition_cell, tuple) else list(ignition_cell)
+        )
+        for cell in cells:
+            self.arrival_times[cell] = 0.0
+        self._heap: list[tuple[float, int, int]] = [(0.0, r, c) for r, c in cells]
 
         # Canopy arrays — use terrain attributes when present, else proxy tables
         if terrain.canopy_base_height is not None:

@@ -148,6 +148,14 @@ def compute_sensitivity(
     ws_perturb = ensemble.member_wind_fields - gp_prior.wind_speed_mean[None, :, :]
     sensitivities["wind_speed"] = _corr(ws_perturb, "wind_speed")
 
+    # Wind direction perturbation — circular wrap to [-180, +180] avoids 360° spikes
+    if ensemble.member_wind_dir_fields is not None:
+        wd_perturb = (
+            (ensemble.member_wind_dir_fields - gp_prior.wind_dir_mean[None, :, :] + 180.0)
+            % 360.0
+        ) - 180.0
+        sensitivities["wind_dir"] = _corr(wd_perturb, "wind_dir")
+
     return sensitivities
 
 
@@ -171,8 +179,9 @@ def compute_observability(
     gets the distance to the nearest burning cell (not just the centroid).
     """
     rows, cols = shape
-    D_fmc = np.full((rows, cols), fmc_accuracy, dtype=np.float32)
-    D_wind = np.full((rows, cols), wind_accuracy, dtype=np.float32)
+    D_fmc      = np.full((rows, cols), fmc_accuracy,  dtype=np.float32)
+    D_wind     = np.full((rows, cols), wind_accuracy, dtype=np.float32)
+    D_wind_dir = np.full((rows, cols), wind_accuracy, dtype=np.float32)
 
     # Degrade near the ACTIVE FIRE PERIMETER (0.1 < p < 0.9) — not the full burned area.
     # Drones fly ahead of the fire; cells far ahead have full observability.
@@ -185,10 +194,11 @@ def compute_observability(
         dist_cells = distance_transform_edt(~active_mask)
         dist_m = (dist_cells * resolution_m).astype(np.float32)
         degradation = np.clip(dist_m / degradation_radius_m, 0.0, 1.0)
-        D_fmc *= degradation
-        D_wind *= degradation
+        D_fmc      *= degradation
+        D_wind     *= degradation
+        D_wind_dir *= degradation
 
-    return {"fmc": D_fmc, "wind_speed": D_wind}
+    return {"fmc": D_fmc, "wind_speed": D_wind, "wind_dir": D_wind_dir}
 
 
 # ---------------------------------------------------------------------------
@@ -247,6 +257,15 @@ def compute_information_field(
 
     w = w_fmc + w_wind
 
+    w_wind_dir: Optional[np.ndarray] = None
+    if "wind_dir" in sensitivity:
+        w_wind_dir = (
+            gp_prior.wind_dir_variance
+            * np.abs(sensitivity["wind_dir"])
+            * observability["wind_dir"]
+        ).astype(np.float32)
+        w = (w + w_wind_dir).astype(np.float32)
+
     # Bimodal entropy augmentation (Extended Fire Physics §3)
     max_arrival = _max_arrival_sentinel(horizon_minutes)
     if bimodal_alpha > 0.0:
@@ -262,24 +281,36 @@ def compute_information_field(
     w[burned] = 0.0
     w_fmc[burned] = 0.0
     w_wind[burned] = 0.0
+    if w_wind_dir is not None:
+        w_wind_dir[burned] = 0.0
 
     # Operator overlays
     if priority_weight_field is not None:
         w = (w * priority_weight_field).astype(np.float32)
         w_fmc = (w_fmc * priority_weight_field).astype(np.float32)
         w_wind = (w_wind * priority_weight_field).astype(np.float32)
+        if w_wind_dir is not None:
+            w_wind_dir = (w_wind_dir * priority_weight_field).astype(np.float32)
 
     if exclusion_mask is not None:
         w[exclusion_mask] = 0.0
         w_fmc[exclusion_mask] = 0.0
         w_wind[exclusion_mask] = 0.0
+        if w_wind_dir is not None:
+            w_wind_dir[exclusion_mask] = 0.0
+
+    w_by_variable: dict[str, np.ndarray] = {"fmc": w_fmc, "wind_speed": w_wind}
+    gp_variance: dict[str, np.ndarray] = {
+        "fmc": gp_prior.fmc_variance,
+        "wind_speed": gp_prior.wind_speed_variance,
+    }
+    if w_wind_dir is not None:
+        w_by_variable["wind_dir"] = w_wind_dir
+        gp_variance["wind_dir"] = gp_prior.wind_dir_variance
 
     return InformationField(
         w=w,
-        w_by_variable={"fmc": w_fmc, "wind_speed": w_wind},
+        w_by_variable=w_by_variable,
         sensitivity=sensitivity,
-        gp_variance={
-            "fmc": gp_prior.fmc_variance,
-            "wind_speed": gp_prior.wind_speed_variance,
-        },
+        gp_variance=gp_variance,
     )
