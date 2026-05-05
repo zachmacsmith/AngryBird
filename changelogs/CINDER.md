@@ -76,6 +76,54 @@ First session: 2026-05-04
 
 ---
 
+## Session 2 — 2026-05-04
+
+### Phase 8: mode-based continuous flight path planner
+**Commit:** `b063f00`
+
+Implements `docs/Drone Path.md`: replaces per-cycle station-to-station sorties with
+persistent `DroneFlightState` that carries across cycle boundaries within a single sortie.
+
+#### New types (`angrybird/types.py`)
+- `DroneMode(str, Enum)` — NORMAL / RETURN / EMERGENCY, one-way FSM
+- `DroneFlightState(@dataclass)` — position_m, remaining_range_m, mode, target_gs_idx,
+  visited_domains, sortie_distance_m, returned
+- `DronePlan` — new fields: `plan_distance_m`, `drone_mode`
+- `PathSelectionResult` — new optional field: `updated_drone_states`
+
+#### New config constants (`angrybird/config.py`)
+`DRONE_CYCLE_DURATION_S` (1200), `DRONE_CYCLE_DISTANCE_M` (18 km), `DRONE_RETURN_THRESHOLD`
+(0.35), `DRONE_SAFETY_FRACTION` (0.10), `DRONE_SAFETY_MARGIN_M` (2 km),
+`DRONE_HOVER_POWER_RATIO` (0.85), `DRONE_MIN_USEFUL_INFO`, `DRONE_REVISIT_PERCENTILE` (95).
+
+#### `angrybird/selectors/correlation_path.py` — full rewrite of select()
+- `_check_mode_transitions()`: reserve_on_arrival FSM; GS lock override (physically unreachable);
+  RETURN→EMERGENCY when r ≤ d_return + d_safety
+- `_plan_greedy_path()`: unified greedy for NORMAL and RETURN (parameterised by budget and
+  return_costs); RETURN uses target-GS distances + d_safety already baked into budget
+- `_dijkstra_path()`: shortest-path Dijkstra for EMERGENCY direct routing to GS
+- `_apply_revisit_threshold()`: re-admits visited domains where w_i > 95th percentile
+- `_compute_all_gs_distances()`: Dijkstra from each GS domain; `_min_gs_return_costs()` aggregates
+- `select()`: dispatches per drone by mode; builds `updated_drone_states`; loiter detection
+
+#### `angrybird/orchestrator.py`
+- `ground_stations` constructor parameter (list of extra GS grid coords)
+- `_ground_stations_m` computed at init
+- `_drone_states: Optional[list[DroneFlightState]]` — initialised lazily by selector on first call
+- `registry.run()` passes `drone_states` and `ground_stations_m`; result's `updated_drone_states`
+  fed into `_advance_drone_states()`
+- `_advance_drone_states()`: drones with `returned=True` reset to full battery + NORMAL mode
+
+#### Tests (`angrybird/tests/test_drone_path.py`) — 18 tests
+- Mode transitions (7 tests): NORMAL→RETURN, RETURN→EMERGENCY, emergency terminal, GS lock
+- Budget calculation (2 tests): NORMAL = d_cycle, RETURN = min(d_cycle, r − d_safety)
+- Reachability invariant (1 test): endpoint within R_feasible of target GS
+- EMERGENCY mode (2 tests): direct path + returned=True
+- Visited-domain tracking (4 tests): accumulation, revisit threshold, cross-drone deconfliction
+- Full sortie simulation (2 tests): distance bound, mode sequence one-way guarantee
+
+---
+
 ### Fix: `angrybird/tif_getter.py` — LANDFIRE terrain loader
 **Commit:** `aa8a008`
 
