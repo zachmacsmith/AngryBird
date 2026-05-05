@@ -34,11 +34,14 @@ from .config import (
     N_DRONES,
     SIMULATION_HORIZON_MIN,
 )
+from .fire_retrospect import generate_fire_retrospect_observations
 from .fire_state import (
     ConsistencyChecker,
     EnsembleFireState,
     FireStateEstimator,
+    compute_particle_weights,
     particle_filter_fire,
+    systematic_resample,
 )
 from .gp import IGNISGPPrior
 from .information import compute_information_field
@@ -217,6 +220,20 @@ class IGNISOrchestrator:
         # static-prior baseline can run the same initial fire state.
         self._cycle1_initial_phi: Optional[np.ndarray] = None
 
+        # ── Terrain domain graph for fire retrospect observations ─────────────
+        # Built once from static terrain; used each cycle to identify
+        # representative cells for weighted FMC/wind observations at the fire front.
+        try:
+            from .selectors.correlation_path import build_terrain_domain_graph
+            self._domain_graph = build_terrain_domain_graph(terrain, resolution_m)
+            logger.debug(
+                "Fire retrospect: %d terrain domains ready",
+                len(self._domain_graph.domains),
+            )
+        except Exception as _exc:
+            logger.warning("Fire retrospect: could not build domain graph — %s", _exc)
+            self._domain_graph = None
+
     # ------------------------------------------------------------------
     # Main cycle
     # ------------------------------------------------------------------
@@ -367,17 +384,47 @@ class IGNISOrchestrator:
                         self.cycle_count, disagreement * 100, len(fire_obs),
                     )
                 else:
-                    indices, n_eff = particle_filter_fire(
+                    retro_weights, n_eff = compute_particle_weights(
                         self._last_ensemble_result, fire_obs,
                         start_time, self.n_members,
                         last_cycle_time_s=self._last_cycle_time_s,
                     )
+                    if n_eff < self.n_members * 0.5:
+                        indices = systematic_resample(retro_weights, self.n_members)
+                    else:
+                        indices = np.arange(self.n_members)
                     self.ensemble_fire_state.resample(indices)
                     logger.info(
                         "Cycle %d | fire state particle filter | "
                         "disagreement=%.0f%% | N_eff=%.0f",
                         self.cycle_count, disagreement * 100, n_eff,
                     )
+
+                    # ── Fire retrospect: update GP with weighted FMC/wind at fire front
+                    if self._domain_graph is not None:
+                        elapsed_min = (start_time - self._last_cycle_time_s) / 60.0
+                        burn_frac   = (
+                            self._last_ensemble_result.member_arrival_times < elapsed_min
+                        ).mean(axis=0).astype(np.float32)
+                        fire_front  = (burn_frac > 0.05) & (burn_frac < 0.95)
+                        if fire_front.any():
+                            retro_obs = generate_fire_retrospect_observations(
+                                retro_weights,
+                                self._last_ensemble_result,
+                                fire_front,
+                                self._domain_graph.domains,
+                                gp_prior,
+                                current_time=start_time,
+                            )
+                            if retro_obs:
+                                self.obs_store.remove_by_source_prefix("fire_retrospect")
+                                self.obs_store.add_batch(retro_obs)
+                                self.gp.fit(start_time)
+                                gp_prior = self.gp.predict(shape)
+                                logger.debug(
+                                    "Cycle %d | fire retrospect: %d domain obs injected",
+                                    self.cycle_count, len(retro_obs),
+                                )
 
         if self.ensemble_fire_state.initialized:
             initial_phi_for_engine = self.ensemble_fire_state.get_initial_phi(start_time)

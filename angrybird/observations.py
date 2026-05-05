@@ -353,6 +353,62 @@ class SatelliteFMCObservation(Observation):
 
 
 # ---------------------------------------------------------------------------
+# Fire retrospect observation — synthetic, non-decaying, replaced each cycle
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class FireRetrospectObservation(Observation):
+    """
+    Synthetic FMC + wind observation implied by particle filter weights at the
+    active fire front.
+
+    Generated each cycle from weighted ensemble statistics over the fire-active
+    correlation domains.  Non-decaying — replaced wholesale each cycle via
+    ObservationStore.remove_by_source_prefix("fire_retrospect").
+    """
+    _source_id:           str      # "fire_retrospect_{domain_id}"
+    _timestamp:           float
+    location:             tuple[int, int]
+    fmc:                  float
+    fmc_sigma:            float
+    wind_speed:           float
+    wind_speed_sigma:     float
+    wind_direction:       Optional[float] = None
+    wind_direction_sigma: Optional[float] = None
+
+    @property
+    def source_id(self) -> str:
+        return self._source_id
+
+    @property
+    def timestamp(self) -> float:
+        return self._timestamp
+
+    @property
+    def variables(self) -> list[VariableType]:
+        v = [VariableType.FMC, VariableType.WIND_SPEED]
+        if self.wind_direction is not None:
+            v.append(VariableType.WIND_DIRECTION)
+        return v
+
+    def to_data_points(self, query_time: float) -> list[DataPoint]:
+        pts = [
+            DataPoint(self.location, VariableType.FMC,
+                      self.fmc, self.fmc_sigma, self._timestamp),
+            DataPoint(self.location, VariableType.WIND_SPEED,
+                      self.wind_speed, self.wind_speed_sigma, self._timestamp),
+        ]
+        if self.wind_direction is not None and self.wind_direction_sigma is not None:
+            pts.append(DataPoint(self.location, VariableType.WIND_DIRECTION,
+                                 self.wind_direction, self.wind_direction_sigma,
+                                 self._timestamp))
+        return pts
+
+    def is_expired(self, query_time: float) -> bool:
+        return False  # replaced wholesale, never expires individually
+
+
+# ---------------------------------------------------------------------------
 # Observation store
 # ---------------------------------------------------------------------------
 
@@ -488,6 +544,15 @@ class ObservationStore:
     # ------------------------------------------------------------------
     # Pruning — removes expired observations for efficiency
     # ------------------------------------------------------------------
+
+    def remove_by_source_prefix(self, prefix: str) -> int:
+        """Remove all non-RAWS observations whose source_id starts with prefix."""
+        before = len(self._observations)
+        self._observations = [
+            o for o in self._observations
+            if not o.source_id.startswith(prefix)
+        ]
+        return before - len(self._observations)
 
     def prune(self, current_time: float) -> int:
         """

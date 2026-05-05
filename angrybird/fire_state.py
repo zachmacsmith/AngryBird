@@ -656,6 +656,44 @@ class ConsistencyChecker:
 # Particle filter
 # ---------------------------------------------------------------------------
 
+def compute_particle_weights(
+    ensemble_result: EnsembleResult,
+    fire_observations: list[FireDetectionObservation],
+    current_time_s: float,
+    n_members: int,
+    last_cycle_time_s: float = 0.0,
+) -> tuple[np.ndarray, float]:
+    """
+    Compute normalized particle filter weights from fire observations.
+
+    Returns: (weights: float64[N] summing to 1, n_eff: float)
+    Separated from resampling so weights are available for downstream uses
+    (e.g. fire retrospect observations) before members are duplicated.
+    """
+    weights     = np.ones(n_members, dtype=np.float64)
+    elapsed_min = (current_time_s - last_cycle_time_s) / 60.0
+    ensemble_burned = ensemble_result.member_arrival_times < elapsed_min
+
+    for obs in fire_observations:
+        r, c = obs.location
+        conf = float(obs.confidence)
+        for n in range(n_members):
+            member_burned = bool(ensemble_burned[n, r, c])
+            if obs.is_fire:
+                weights[n] *= conf if member_burned else (1.0 - conf)
+            else:
+                weights[n] *= conf if not member_burned else (1.0 - conf)
+
+    weight_sum = weights.sum()
+    if weight_sum < 1e-30:
+        weights = np.ones(n_members, dtype=np.float64) / n_members
+    else:
+        weights /= weight_sum
+
+    n_eff = 1.0 / float((weights**2).sum())
+    return weights, n_eff
+
+
 def particle_filter_fire(
     ensemble_result: EnsembleResult,
     fire_observations: list[FireDetectionObservation],
@@ -677,33 +715,13 @@ def particle_filter_fire(
 
     Returns: (resampled_indices: int[N], n_eff: float)
     """
-    weights      = np.ones(n_members, dtype=np.float64)
-    elapsed_min  = (current_time_s - last_cycle_time_s) / 60.0
-    ensemble_burned  = ensemble_result.member_arrival_times < elapsed_min
-
-    for obs in fire_observations:
-        r, c = obs.location
-        conf = float(obs.confidence)
-        for n in range(n_members):
-            member_burned = bool(ensemble_burned[n, r, c])
-            if obs.is_fire:
-                weights[n] *= conf if member_burned else (1.0 - conf)
-            else:
-                weights[n] *= conf if not member_burned else (1.0 - conf)
-
-    weight_sum = weights.sum()
-    if weight_sum < 1e-30:
-        weights = np.ones(n_members, dtype=np.float64) / n_members
-    else:
-        weights /= weight_sum
-
-    n_eff = 1.0 / float((weights**2).sum())
-
+    weights, n_eff = compute_particle_weights(
+        ensemble_result, fire_observations, current_time_s, n_members, last_cycle_time_s,
+    )
     if n_eff < n_members * 0.5:
         indices = systematic_resample(weights, n_members)
     else:
         indices = np.arange(n_members)
-
     return indices, n_eff
 
 

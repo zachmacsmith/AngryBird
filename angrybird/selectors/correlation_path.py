@@ -646,6 +646,54 @@ def _domains_to_drone_plan(
 
 
 # ---------------------------------------------------------------------------
+# Public helper — terrain-only domain graph for fire retrospect
+# ---------------------------------------------------------------------------
+
+def build_terrain_domain_graph(
+    terrain: "TerrainData",
+    resolution_m: float,
+    correlation_length_m: float = 500.0,
+    min_domain_cells: int = 10,
+) -> CorrelationGraph:
+    """
+    Build a terrain-based CorrelationGraph without information-field weights.
+
+    Used by the fire retrospect system to identify representative cells for
+    each correlation domain before the selector has run.  The resulting graph
+    has valid domain IDs and representative_cells; info_value and
+    dominant_variable are set to zero / "fmc" (unused by retrospect).
+    """
+    import warnings as _warnings
+
+    features = _terrain_features(terrain)
+    with _warnings.catch_warnings():
+        _warnings.filterwarnings("ignore")
+        try:
+            label_map = _felzenszwalb_label_map(
+                terrain, features, correlation_length_m, resolution_m, min_domain_cells,
+            )
+            if _is_pathological(label_map):
+                label_map = _regular_grid_label_map(
+                    terrain.shape, correlation_length_m, resolution_m,
+                )
+        except Exception:
+            label_map = _regular_grid_label_map(
+                terrain.shape, correlation_length_m, resolution_m,
+            )
+
+    shape = terrain.shape
+    w_zero = np.zeros(shape, dtype=np.float32)
+    return _build_correlation_graph(
+        label_map=label_map,
+        features=features,
+        w_field=w_zero,
+        w_by_variable={},
+        resolution_m=resolution_m,
+        fuel_model=terrain.fuel_model,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Selector
 # ---------------------------------------------------------------------------
 
