@@ -349,7 +349,9 @@ class IGNISOrchestrator:
             fire_obs = self.obs_store.get_fire_detections(since=self._last_cycle_time_s)
             if fire_obs:
                 should_reset, disagreement = self.consistency_checker.check(
-                    fire_obs, self._last_ensemble_result, start_time)
+                    fire_obs, self._last_ensemble_result, start_time,
+                    last_cycle_time_s=self._last_cycle_time_s,
+                )
 
                 if should_reset:
                     arrival_field = self.fire_state_estimator.reconstruct_arrival_time(
@@ -367,7 +369,9 @@ class IGNISOrchestrator:
                 else:
                     indices, n_eff = particle_filter_fire(
                         self._last_ensemble_result, fire_obs,
-                        start_time, self.n_members)
+                        start_time, self.n_members,
+                        last_cycle_time_s=self._last_cycle_time_s,
+                    )
                     self.ensemble_fire_state.resample(indices)
                     logger.info(
                         "Cycle %d | fire state particle filter | "
@@ -403,7 +407,12 @@ class IGNISOrchestrator:
         _t["ensemble"] = time.perf_counter() - _t0
 
         # Carry forward per-member fire state for next cycle.
-        self.ensemble_fire_state.carry_forward(ensemble.member_arrival_times)
+        # carry_forward_time_s records this cycle's start so the next cycle's
+        # get_initial_phi / particle_filter can compute elapsed time correctly.
+        self.ensemble_fire_state.carry_forward(
+            ensemble.member_arrival_times,
+            carry_forward_time_s=start_time,
+        )
         self._last_ensemble_result = ensemble
         self._last_cycle_time_s    = start_time
 

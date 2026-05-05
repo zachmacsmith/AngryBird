@@ -795,12 +795,22 @@ class CorrelationPathSelector:
 
         if total_w <= 0:
             # Info field is degenerate (fire hasn't spread yet, sensitivity=0).
-            # Fall back to mean GP variance per domain so drones explore where
-            # measurement uncertainty is highest rather than loitering.
-            logger.debug("Info field degenerate (w≈0); using GP variance as domain score")
-            rep_by_id = {d.domain_id: d.representative_cell for d in graph.domains}
+            # Fall back to GP variance weighted by proximity to the ensemble's
+            # predicted fire area — this keeps drones orbiting the fire rather
+            # than flying toward arbitrary GP-high corners of the grid.
+            from scipy.ndimage import distance_transform_edt as _edt
+            near_fire = ensemble.burn_probability > 0.01
+            if near_fire.any():
+                dist_cells = _edt(~near_fire)
+                # Decay ~30 cells (≈1.5 km at 50 m res) from nearest burning cell.
+                proximity = np.exp(-dist_cells / 30.0).astype(np.float32)
+            else:
+                # Fire not yet in ensemble (t≈0): uniform so drones fan out from GS.
+                proximity = np.ones(shape, dtype=np.float32)
+            fire_weighted_var = (gp_var * proximity).astype(np.float64)
+            logger.debug("Info field degenerate (w≈0); using fire-proximity-weighted GP variance")
             base_domain_w = {
-                d.domain_id: float(np.mean(gp_var[
+                d.domain_id: float(np.mean(fire_weighted_var[
                     [c[0] for c in d.cells],
                     [c[1] for c in d.cells],
                 ]))

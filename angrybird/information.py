@@ -320,7 +320,13 @@ def compute_information_field(
     max_arrival = _max_arrival_sentinel(horizon_minutes)
     if bimodal_alpha > 0.0:
         burn_frac, _ = detect_bimodality(ensemble.member_arrival_times, max_arrival)
-        w = (w + bimodal_alpha * _binary_entropy(burn_frac)).astype(np.float32)
+        burn_entropy = _binary_entropy(burn_frac)
+        # Suppress fringe: cells reached by fewer than 10% of members are driven
+        # by 1-4 outlier ensemble members, not genuine uncertainty.  Sending a
+        # drone km off course to resolve a 5% burn probability wastes a sortie.
+        min_frac = max(0.10, 1.0 / max(ensemble.n_members, 1))
+        burn_entropy = np.where(burn_frac >= min_frac, burn_entropy, 0.0).astype(np.float32)
+        w = (w + bimodal_alpha * burn_entropy).astype(np.float32)
 
     if bimodal_beta > 0.0 and ensemble.member_fire_types is not None:
         crown_frac, _ = detect_regime_split(ensemble.member_fire_types)

@@ -415,6 +415,13 @@ class EnsembleFireState:
 
         self.initialized = False
 
+        # Simulation time (seconds from t=0) at which carry_forward was last
+        # called.  Arrival times stored after carry_forward are in seconds
+        # *relative to this epoch*, so burned-by-T requires elapsed = T - epoch.
+        # Initialisation paths (from ignition / fire_state / reconstruction)
+        # store absolute arrival times, so epoch stays 0.
+        self._carry_forward_time_s: float = 0.0
+
     # ------------------------------------------------------------------
     # Initialization paths
     # ------------------------------------------------------------------
@@ -496,12 +503,21 @@ class EnsembleFireState:
     # Cycle interface
     # ------------------------------------------------------------------
 
-    def carry_forward(self, member_arrival_times_min: np.ndarray) -> None:
+    def carry_forward(
+        self,
+        member_arrival_times_min: np.ndarray,
+        carry_forward_time_s: float = 0.0,
+    ) -> None:
         """
         Continue mode: store each member's fire state from the completed cycle.
 
-        member_arrival_times_min: float32[N, rows, cols] in **minutes**
-          (as stored in EnsembleResult).  Converted to seconds internally.
+        member_arrival_times_min: float32[N, rows, cols] in **minutes** relative
+          to the cycle that just completed (i.e. minutes from carry_forward_time_s).
+          Converted to seconds internally.
+
+        carry_forward_time_s: absolute simulation time (seconds from t=0) at
+          which this ensemble was generated.  Stored so _recompute_phi_from_
+          arrival_times can compute the correct elapsed time on the next call.
 
         The caller's ensemble may have a different N than self.n_members was
         initialised with (e.g. CycleRunner passes n_members=15 while the
@@ -511,6 +527,7 @@ class EnsembleFireState:
         """
         self.member_arrival_times = (
             member_arrival_times_min * 60.0).astype(np.float32)
+        self._carry_forward_time_s = carry_forward_time_s
         # Keep n_members in sync with the actual stored array size.
         self.n_members = self.member_arrival_times.shape[0]
 
@@ -538,14 +555,24 @@ class EnsembleFireState:
     # ------------------------------------------------------------------
 
     def _recompute_phi_from_arrival_times(self, current_time_s: float) -> None:
-        """Convert per-member arrival times (seconds) to SDF (metres)."""
+        """Convert per-member arrival times (seconds) to SDF (metres).
+
+        Stored arrival times are in seconds *relative to _carry_forward_time_s*
+        (the simulation time of the ensemble that was carried forward).
+        Initialisation paths (ignition / fire_state / reconstruction) store
+        absolute seconds, keeping _carry_forward_time_s = 0.
+        """
         assert self.member_arrival_times is not None
+        # elapsed_s: how much simulated time has passed since the epoch at which
+        # the stored arrival times were computed.  A cell with stored arrival
+        # <= elapsed_s has actually burned by current_time_s.
+        elapsed_s = current_time_s - self._carry_forward_time_s
         self.member_phi = np.zeros(
             (self.n_members, *self.grid_shape), dtype=np.float32)
         for n in range(self.n_members):
-            # Use <= so cells with arrival_time == current_time_s (including
-            # ignition cells at t=0 with arrival=0.0) are treated as burned.
-            burned = self.member_arrival_times[n] <= current_time_s
+            # Use <= so cells at arrival == 0 (ignition / already burned) are
+            # treated as burned even when elapsed_s == 0.
+            burned = self.member_arrival_times[n] <= elapsed_s
             if not burned.any():
                 self.member_phi[n] = np.full(self.grid_shape, self.dx, dtype=np.float32)
                 continue
@@ -587,12 +614,14 @@ class ConsistencyChecker:
         fire_observations: list[FireDetectionObservation],
         ensemble_result: EnsembleResult,
         current_time_s: float,
+        last_cycle_time_s: float = 0.0,
     ) -> tuple[bool, float]:
         """
         Compare fire observations against ensemble consensus.
 
-        EnsembleResult.member_arrival_times are in **minutes**; current_time_s
-        is in **seconds** — converted internally for comparison.
+        EnsembleResult.member_arrival_times are in **minutes from the previous
+        cycle start** (last_cycle_time_s); current_time_s is in **absolute
+        seconds**.  We evaluate burned-state at the elapsed time between cycles.
 
         Returns: (should_reset, disagreement_fraction)
           should_reset = True when the ensemble has drifted significantly.
@@ -600,8 +629,8 @@ class ConsistencyChecker:
         if len(fire_observations) < self.min_observations:
             return False, 0.0
 
-        current_time_min = current_time_s / 60.0
-        ensemble_burned  = ensemble_result.member_arrival_times < current_time_min
+        elapsed_min = (current_time_s - last_cycle_time_s) / 60.0
+        ensemble_burned  = ensemble_result.member_arrival_times < elapsed_min
         burn_probability = ensemble_burned.mean(axis=0)   # (rows, cols)
 
         disagreements = 0
@@ -629,6 +658,7 @@ def particle_filter_fire(
     fire_observations: list[FireDetectionObservation],
     current_time_s: float,
     n_members: int,
+    last_cycle_time_s: float = 0.0,
 ) -> tuple[np.ndarray, float]:
     """
     Reweight and resample ensemble members based on fire observations.
@@ -637,14 +667,16 @@ def particle_filter_fire(
     members are downweighted.  Resampling occurs only when ESS drops below
     50 % of N (avoids unnecessary diversity loss).
 
-    EnsembleResult arrival times are in **minutes**; current_time_s in seconds
-    (converted internally).
+    EnsembleResult arrival times are in **minutes from last_cycle_time_s** (the
+    previous cycle start).  We evaluate burned-state at the elapsed time between
+    cycles, not at absolute simulation time, to avoid a systematic reference-
+    point mismatch that causes ensemble collapse.
 
     Returns: (resampled_indices: int[N], n_eff: float)
     """
-    weights          = np.ones(n_members, dtype=np.float64)
-    current_time_min = current_time_s / 60.0
-    ensemble_burned  = ensemble_result.member_arrival_times < current_time_min
+    weights      = np.ones(n_members, dtype=np.float64)
+    elapsed_min  = (current_time_s - last_cycle_time_s) / 60.0
+    ensemble_burned  = ensemble_result.member_arrival_times < elapsed_min
 
     for obs in fire_observations:
         r, c = obs.location
