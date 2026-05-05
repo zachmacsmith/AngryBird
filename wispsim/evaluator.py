@@ -38,69 +38,6 @@ from .observer import ObservationSource
 logger = logging.getLogger(__name__)
 
 
-def compute_arrival_accuracy(
-    ensemble: EnsembleResult,
-    truth_arrival_s: np.ndarray,
-    horizon_s: float,
-) -> tuple[float, float, float]:
-    """
-    Compare ensemble arrival time predictions to oracle ground truth.
-
-    Only evaluates cells that the ground truth fire actually burns within the
-    planning horizon — cells with truth_arrival_s >= horizon_s are excluded
-    (fire hasn't reached there yet, so prediction error is not meaningful).
-
-    Ensemble sentinels (2×horizon_min for unburned members) are kept as-is:
-    if the ensemble thinks a cell won't burn but the truth says it will, those
-    large sentinel values correctly penalise the score.
-
-    Returns
-    -------
-    crps_minutes : float
-        Continuous Ranked Probability Score averaged over burned cells (minutes).
-        Proper scoring rule — rewards accuracy *and* calibration simultaneously.
-        Lower is better.
-    rmse_minutes : float
-        RMSE of ensemble mean_arrival_time vs truth over burned cells (minutes).
-        Lower is better.
-    spread_skill_ratio : float
-        sqrt(mean ensemble variance) / RMSE.  ~1.0 means the spread correctly
-        predicts the magnitude of errors; >1 = over-dispersed, <1 = over-confident.
-    """
-    burned_mask = (truth_arrival_s < horizon_s) & np.isfinite(truth_arrival_s)
-    if not burned_mask.any():
-        return 0.0, 0.0, 1.0
-
-    truth_min = (truth_arrival_s[burned_mask] / 60.0).astype(np.float64)
-
-    # members_min: float64[N, n_burned]
-    members_min = ensemble.member_arrival_times[:, burned_mask].astype(np.float64)
-    N = members_min.shape[0]
-
-    # ── CRPS via the sorted-member identity ──────────────────────────────────
-    # CRPS(F,y) = E[|X-y|] - ½ E[|X-X'|]
-    # With N ensemble members:
-    #   E[|X-y|]   = (1/N) Σ_i |x_i - y|
-    #   ½ E[|X-X'|] = (1/N²) Σ_{i=0}^{N-1} x_(i) * (2i - N + 1)   (x sorted)
-    term1 = np.mean(np.abs(members_min - truth_min[np.newaxis, :]), axis=0)
-
-    sorted_m = np.sort(members_min, axis=0)
-    ranks = np.arange(N, dtype=np.float64)[:, np.newaxis]          # [N, 1]
-    term2 = np.sum(sorted_m * (2.0 * ranks - N + 1.0), axis=0) / (N * N)
-
-    crps = float(np.mean(term1 - term2))
-
-    # ── RMSE of ensemble mean ─────────────────────────────────────────────────
-    mean_min = ensemble.mean_arrival_time[burned_mask].astype(np.float64)
-    rmse = float(np.sqrt(np.mean((mean_min - truth_min) ** 2)))
-
-    # ── Spread-skill ratio ────────────────────────────────────────────────────
-    spread = float(np.sqrt(np.mean(ensemble.arrival_time_variance[burned_mask])))
-    spread_skill = spread / (rmse + 1e-6)
-
-    return crps, rmse, spread_skill
-
-
 class CounterfactualEvaluator:
     """
     Evaluates all strategies on equal footing without mutating any shared state.
@@ -208,45 +145,63 @@ def compute_arrival_accuracy(
     ensemble: EnsembleResult,
     truth_arrival_s: np.ndarray,
     horizon_s: float,
+    current_time_s: float = 0.0,
 ) -> tuple[float, float, float]:
     """
-    Compute CRPS, RMSE, and spread-skill ratio for ensemble arrival-time forecasts.
+    Compute CRPS, RMSE, and spread-skill for ensemble arrival-time forecasts.
+
+    Evaluates only cells that the ground truth fire will reach within the
+    planning horizon *from the current simulation time*.  Already-burned cells
+    (truth_arrival_s < current_time_s) are excluded: the ensemble is
+    initialised from the current burn state so those cells are trivially
+    correct and would pollute the score.
+
+    Both truth and ensemble are expressed as minutes *relative to current_time_s*
+    so the comparison is on the same time base regardless of how far into the
+    simulation we are.
 
     Parameters
     ----------
-    ensemble       : EnsembleResult — member_arrival_times in minutes
-    truth_arrival_s: (rows, cols) ground-truth arrival times in seconds
-    horizon_s      : planning horizon in seconds (unburned sentinel threshold)
+    ensemble        : EnsembleResult — member_arrival_times in minutes from current_time_s
+    truth_arrival_s : (rows, cols) ground-truth arrival times in seconds from t=0
+    horizon_s       : planning horizon in seconds
+    current_time_s  : current simulation time in seconds (default 0)
 
     Returns
     -------
     (crps_minutes, rmse_minutes, spread_skill_ratio)
-    Returns (0.0, 0.0, 0.0) when no ground-truth cells have burned yet.
+    Returns (0.0, 0.0, 0.0) when no cells will burn within the horizon.
     """
-    burned_truth = truth_arrival_s < horizon_s
-    if not burned_truth.any():
+    # Cells that will burn within the horizon from now (not yet burned at T).
+    mask = (
+        (truth_arrival_s >= current_time_s) &
+        ((truth_arrival_s - current_time_s) < horizon_s) &
+        np.isfinite(truth_arrival_s)
+    )
+    if not mask.any():
         return 0.0, 0.0, 0.0
 
-    truth_min = truth_arrival_s[burned_truth] / 60.0          # (n_burned,)
-    at_pred   = ensemble.member_arrival_times[:, burned_truth] # (N, n_burned)
-    N         = ensemble.n_members
+    # Truth in minutes from current time T  →  range [0, horizon_min)
+    truth_rel_min = ((truth_arrival_s[mask] - current_time_s) / 60.0).astype(np.float64)
 
-    # --- CRPS (fair energy-score form) ---
+    # Ensemble member_arrival_times are already in minutes from T
+    at_pred = ensemble.member_arrival_times[:, mask].astype(np.float64)  # (N, n_cells)
+    N = ensemble.n_members
+
+    # --- CRPS via the sorted-member identity ---
     # CRPS = E|X - y| - ½ E|X - X'|
-    # Efficient O(N log N) computation via sorted ensemble:
-    #   E|X - X'| = (2/N²) Σ_i x_{(i)} * (2i - N + 1)   (i = 0 … N-1, sorted)
-    abs_err    = np.abs(at_pred - truth_min[None, :]).mean(axis=0)       # (n_burned,)
-    sorted_p   = np.sort(at_pred, axis=0)                                # (N, n_burned)
-    weights    = (2 * np.arange(N, dtype=np.float32) - N + 1)           # (N,)
-    spread_crps = (sorted_p * weights[:, None]).sum(axis=0) / (N * N)   # (n_burned,)
-    crps_min   = float(np.mean(abs_err - spread_crps))
+    abs_err     = np.abs(at_pred - truth_rel_min[None, :]).mean(axis=0)
+    sorted_p    = np.sort(at_pred, axis=0)
+    weights     = (2 * np.arange(N, dtype=np.float64) - N + 1)
+    spread_crps = (sorted_p * weights[:, None]).sum(axis=0) / (N * N)
+    crps_min    = float(np.mean(abs_err - spread_crps))
 
     # --- RMSE of ensemble mean ---
     mean_pred = at_pred.mean(axis=0)
-    rmse_min  = float(np.sqrt(np.mean((mean_pred - truth_min) ** 2)))
+    rmse_min  = float(np.sqrt(np.mean((mean_pred - truth_rel_min) ** 2)))
 
     # --- Spread-skill ratio ---
-    spread    = float(at_pred.std(axis=0).mean())
+    spread       = float(at_pred.std(axis=0).mean())
     spread_skill = spread / max(rmse_min, 1e-10)
 
     return max(crps_min, 0.0), rmse_min, spread_skill
