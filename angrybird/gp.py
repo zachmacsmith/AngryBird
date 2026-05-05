@@ -227,6 +227,14 @@ class IGNISGPPrior:
         self._cached_shape:  Optional[tuple[int, int]] = None
         self._cached_X_grid: Optional[np.ndarray] = None
 
+        # V_grid cache for conditional_variance — the expensive triangular solve
+        # solve_triangular(L_, K_train_grid) depends only on the GP's training set
+        # and the fixed grid, so it is valid for all greedy selector iterations
+        # within a cycle.  Invalidated by id(gp.X_train_) when fit() replaces the
+        # training array.
+        self._cv_V_grid:     Optional[np.ndarray] = None  # (n_train, n_grid) float64
+        self._cv_V_grid_key: Optional[int]        = None  # id(gp.X_train_) at cache fill
+
         # Physics-informed prior means.
         # When set, observations are fitted as residuals (obs - prior) and
         # predictions add the prior back. See set_nelson_mean() and
@@ -654,10 +662,19 @@ class IGNISGPPrior:
         K_prior_cross_norm = kernel(X_grid, X_new).ravel()
         K_prior_self_norm  = float(kernel(X_new, X_new)[0, 0])
 
-        K_train_new  = kernel(gp.X_train_, X_new)
-        K_train_grid = kernel(gp.X_train_, X_grid)
-        V_new  = solve_triangular(gp.L_, K_train_new,  lower=True)
-        V_grid = solve_triangular(gp.L_, K_train_grid, lower=True)
+        K_train_new = kernel(gp.X_train_, X_new)
+        V_new = solve_triangular(gp.L_, K_train_new, lower=True)
+
+        # V_grid = solve_triangular(L_, K_train_grid) is the dominant cost
+        # (300×80k triangular solve).  It depends only on the training set and
+        # fixed grid, so cache it and reuse across all greedy selector iterations
+        # within a cycle.  Invalidate when fit() replaces X_train_ (new id).
+        x_train_id = id(gp.X_train_)
+        if self._cv_V_grid is None or self._cv_V_grid_key != x_train_id:
+            K_train_grid = kernel(gp.X_train_, X_grid)
+            self._cv_V_grid     = solve_triangular(gp.L_, K_train_grid, lower=True)
+            self._cv_V_grid_key = x_train_id
+        V_grid = self._cv_V_grid
 
         k_post_cross = (K_prior_cross_norm - (V_grid * V_new).sum(axis=0)) * y_var
         k_post_self  = (K_prior_self_norm  - float((V_new ** 2).sum()))     * y_var
