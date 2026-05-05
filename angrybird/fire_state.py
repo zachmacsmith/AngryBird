@@ -428,6 +428,7 @@ class EnsembleFireState:
 
     def initialize_from_ignition(self, ignition_cell: tuple[int, int]) -> None:
         """First cycle: all members start from the same known ignition point."""
+        self._carry_forward_time_s = 0.0
         sdf = self._compute_sdf_from_point(ignition_cell)
         self.member_phi = np.tile(sdf, (self.n_members, 1, 1)).copy()
         self.member_arrival_times = np.full(
@@ -444,6 +445,7 @@ class EnsembleFireState:
 
         fire_state: bool/float32[rows, cols], 1 = burned, 0 = unburned.
         """
+        self._carry_forward_time_s = 0.0
         burned = fire_state > 0.5
         if not burned.any():
             r0, c0 = self.grid_shape[0] // 2, self.grid_shape[1] // 2
@@ -472,6 +474,7 @@ class EnsembleFireState:
         Members agree in well-observed regions and diverge at the uncertain
         perimeter.
         """
+        self._carry_forward_time_s = 0.0
         self.member_arrival_times = np.zeros(
             (self.n_members, *self.grid_shape), dtype=np.float32)
 
