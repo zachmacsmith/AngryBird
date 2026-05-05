@@ -232,16 +232,11 @@ def _read_and_reproject(
             dst_transform = ref_transform
             dst_h, dst_w  = ref_shape
         else:
-            # Keep native CRS when already projected (metric units, no rotation).
-            # Only convert to UTM when source is geographic (lat/lon degrees).
-            if src_crs.is_geographic:
-                cx = (src.bounds.left + src.bounds.right) / 2
-                cy = (src.bounds.bottom + src.bounds.top) / 2
-                t = Transformer.from_crs(src_crs, "EPSG:4326", always_xy=True)
-                lon_c, lat_c = t.transform(cx, cy)
-                dst_crs = _utm_epsg(lat_c, lon_c)
-            else:
-                dst_crs = src_crs
+            cx = (src.bounds.left + src.bounds.right) / 2
+            cy = (src.bounds.bottom + src.bounds.top) / 2
+            t = Transformer.from_crs(src_crs, "EPSG:4326", always_xy=True)
+            lon_c, lat_c = t.transform(cx, cy)
+            dst_crs = _utm_epsg(lat_c, lon_c)
 
             dst_transform, dst_w, dst_h = calculate_default_transform(
                 src_crs, dst_crs, src.width, src.height, *src.bounds,

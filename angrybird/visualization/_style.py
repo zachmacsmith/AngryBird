@@ -98,7 +98,7 @@ def _imshow(
         data, origin="upper", cmap=cmap,
         vmin=vmin, vmax=vmax,
         alpha=alpha, interpolation=interpolation,
-        extent=extent,
+        extent=extent, aspect="auto",
     )
     ax.set_title(title, fontsize=VIZ_CONFIG["font_size"], fontweight="bold")
     xlabel = "Easting (km) →" if extent is not None else "Easting (px) →"
