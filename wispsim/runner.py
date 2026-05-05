@@ -169,6 +169,11 @@ class SimulationConfig:
     # Small background loss, because path loss is already modeled by link quality.
     mesh_packet_loss_probability: float = 0.015
     selector_name: str = IGNIS_SELECTOR
+    # Per-drone spawn times (seconds).  drone_spawn_times_s[i] is the simulation
+    # time at which drone i activates and leaves the ground station.  Drones with
+    # no entry (or entry=0) activate immediately at t=0.  Shorter list than
+    # n_drones → remaining drones default to 0.
+    drone_spawn_times_s: list = field(default_factory=list)
 
 # ---------------------------------------------------------------------------
 # LiveEstimator
@@ -735,17 +740,19 @@ class SimulationRunner:
         self._prev_gp_var_sum: float = (GP_DEFAULT_FMC_VARIANCE + GP_DEFAULT_WIND_SPEED_VARIANCE) * _n
 
         base_pos = cell_to_pos_m(config.base_cell, terrain.resolution_m)
+        _spawn_times = list(config.drone_spawn_times_s) + [0.0] * config.n_drones
         self.drones = [
             DroneState(
                 drone_id=f"drone_{i}",
                 position=base_pos.copy(),
                 speed=config.drone_speed_ms,
-                status="idle",
+                status="pending" if _spawn_times[i] > 0.0 else "idle",
                 waypoint_queue=[],
                 current_target=None,
                 path_history=[base_pos.copy()],
                 endurance_remaining_s=config.drone_endurance_s,
                 base_position=base_pos.copy(),
+                spawn_time_s=_spawn_times[i],
             )
             for i in range(config.n_drones)
         ]
@@ -960,6 +967,18 @@ class SimulationRunner:
             # 3. Move drones + collect observations
             _t0 = _time.perf_counter()
             for drone in self.drones:
+                # Activate pending drones whose spawn time has arrived.
+                if drone.status == "pending" and self.current_time >= drone.spawn_time_s:
+                    drone.status = "idle"
+                    drone.position = drone.base_position.copy()
+                    logger.info(
+                        "Drone %s activated at t=%.0fs (spawn_time=%.0fs)",
+                        drone.drone_id, self.current_time, drone.spawn_time_s,
+                    )
+
+                if drone.status == "pending":
+                    continue  # not yet active — skip movement and observations
+
                 move_drone(drone, self.config.dt)
                 self._refuel_if_home(drone)
 
@@ -1226,6 +1245,31 @@ class SimulationRunner:
             if sat_obs:
                 self.orchestrator.obs_store.add_batch(sat_obs)
 
+        # Sync physical drone positions into the orchestrator's DroneFlightState so
+        # that the path planner starts each drone's route from its actual location,
+        # not from the predicted end-of-last-cycle domain centroid.
+        # Pending (not-yet-spawned) drones are pinned to the base position so the
+        # path planner correctly treats them as starting from the ground station.
+        if self.orchestrator._drone_states is not None:
+            from angrybird.types import DroneFlightState as _DFS
+            synced = []
+            for phys, flight in zip(self.drones, self.orchestrator._drone_states):
+                actual_pos = (
+                    phys.base_position.copy()
+                    if phys.status == "pending"
+                    else phys.position.copy()
+                )
+                synced.append(_DFS(
+                    drone_id      = flight.drone_id,
+                    position_m    = actual_pos,
+                    remaining_range_m = flight.remaining_range_m,
+                    mode          = flight.mode,
+                    target_gs_idx = flight.target_gs_idx,
+                    sortie_distance_m = flight.sortie_distance_m,
+                    returned      = flight.returned,
+                ))
+            self.orchestrator._drone_states = synced
+
         # No fire_state argument — orchestrator derives fire state from obs_store
         # (drone thermal detections + GOES/VIIRS satellite passes).
         mission_queue, cycle_report = self.orchestrator.run_cycle(
@@ -1407,9 +1451,11 @@ class SimulationRunner:
 
         New WISP cycle plans preempt whatever the drone is currently flying —
         the drone drops its remaining waypoints and starts the new route from
-        its current position.
+        its current position.  Pending (not-yet-spawned) drones are skipped.
         """
         for drone, plan in zip(self.drones, drone_plans):
+            if drone.status == "pending":
+                continue
             path = plan.waypoints[1:] if len(plan.waypoints) > 1 else []
             if path:
                 assign_waypoints(drone, path, self.terrain.resolution_m)
