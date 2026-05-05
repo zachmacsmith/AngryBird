@@ -255,6 +255,7 @@ if __name__ == "__main__":
     parser.add_argument("--targets", type=int, default=6,
                         help="Waypoints selected per cycle (default: 6)")
     parser.add_argument("--members", type=int, default=20,
+    parser.add_argument("--members", type=int, default=200,
                         help="Ensemble size (default: 20)")
     parser.add_argument("--hours",   type=float, default=1.0,
                         help="Simulation duration in hours (default: 1.0)")

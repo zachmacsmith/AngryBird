@@ -27,6 +27,7 @@ import numpy as np
 from angrybird.gp import IGNISGPPrior
 from angrybird.types import (
     DronePlan,
+    EnsembleResult,
     GPPrior,
     InformationField,
     SelectionResult,
@@ -138,3 +139,51 @@ class CounterfactualEvaluator:
             perr=perr,
             cells_observed=all_cells,
         )
+
+
+def compute_arrival_accuracy(
+    ensemble: EnsembleResult,
+    truth_arrival_s: np.ndarray,
+    horizon_s: float,
+) -> tuple[float, float, float]:
+    """
+    Compute CRPS, RMSE, and spread-skill ratio for ensemble arrival-time forecasts.
+
+    Parameters
+    ----------
+    ensemble       : EnsembleResult — member_arrival_times in minutes
+    truth_arrival_s: (rows, cols) ground-truth arrival times in seconds
+    horizon_s      : planning horizon in seconds (unburned sentinel threshold)
+
+    Returns
+    -------
+    (crps_minutes, rmse_minutes, spread_skill_ratio)
+    Returns (0.0, 0.0, 0.0) when no ground-truth cells have burned yet.
+    """
+    burned_truth = truth_arrival_s < horizon_s
+    if not burned_truth.any():
+        return 0.0, 0.0, 0.0
+
+    truth_min = truth_arrival_s[burned_truth] / 60.0          # (n_burned,)
+    at_pred   = ensemble.member_arrival_times[:, burned_truth] # (N, n_burned)
+    N         = ensemble.n_members
+
+    # --- CRPS (fair energy-score form) ---
+    # CRPS = E|X - y| - ½ E|X - X'|
+    # Efficient O(N log N) computation via sorted ensemble:
+    #   E|X - X'| = (2/N²) Σ_i x_{(i)} * (2i - N + 1)   (i = 0 … N-1, sorted)
+    abs_err    = np.abs(at_pred - truth_min[None, :]).mean(axis=0)       # (n_burned,)
+    sorted_p   = np.sort(at_pred, axis=0)                                # (N, n_burned)
+    weights    = (2 * np.arange(N, dtype=np.float32) - N + 1)           # (N,)
+    spread_crps = (sorted_p * weights[:, None]).sum(axis=0) / (N * N)   # (n_burned,)
+    crps_min   = float(np.mean(abs_err - spread_crps))
+
+    # --- RMSE of ensemble mean ---
+    mean_pred = at_pred.mean(axis=0)
+    rmse_min  = float(np.sqrt(np.mean((mean_pred - truth_min) ** 2)))
+
+    # --- Spread-skill ratio ---
+    spread    = float(at_pred.std(axis=0).mean())
+    spread_skill = spread / max(rmse_min, 1e-10)
+
+    return max(crps_min, 0.0), rmse_min, spread_skill

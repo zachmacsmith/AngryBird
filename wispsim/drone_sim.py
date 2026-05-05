@@ -35,6 +35,7 @@ from angrybird.config import (
     OBS_WIND_SPEED_SIGMA,
     SENSOR_FMC_R2,
 )
+from angrybird.observations import FireDetectionObservation
 from angrybird.types import DroneObservation
 
 
@@ -218,6 +219,44 @@ def collect_observations(
                 ))
 
     return observations
+
+
+def collect_fire_observation(
+    drone: DroneState,
+    fire_arrival_times: np.ndarray,
+    terrain_shape: tuple[int, int],
+    resolution_m: float,
+    current_time: float,
+    rng: Optional[np.random.Generator] = None,
+    confidence: float = 0.85,
+) -> Optional[FireDetectionObservation]:
+    """
+    Thermal camera fire detection at the drone's nadir cell.
+
+    Returns a FireDetectionObservation (fire or no-fire) with the given
+    confidence, or None if the drone is outside the grid.  A small fraction
+    of detections are flipped to model sensor errors.
+    """
+    if rng is None:
+        rng = np.random.default_rng()
+
+    r, c = pos_m_to_cell(drone.position, resolution_m, terrain_shape)
+    rows, cols = terrain_shape
+    if not (0 <= r < rows and 0 <= c < cols):
+        return None
+
+    is_burning = float(fire_arrival_times[r, c]) <= current_time
+    # Sensor error: flip detection with probability (1 - confidence)
+    if rng.random() > confidence:
+        is_burning = not is_burning
+
+    return FireDetectionObservation(
+        _source_id="drone_thermal",
+        _timestamp=current_time,
+        location=(r, c),
+        is_fire=is_burning,
+        confidence=confidence,
+    )
 
 
 # ---------------------------------------------------------------------------

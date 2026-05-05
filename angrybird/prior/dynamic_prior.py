@@ -348,6 +348,25 @@ class DynamicPrior:
                 fire_observations_last_observed,
             )
 
+    def compute_cycle(
+        self,
+        source,
+        terrain,
+        current_time: float,
+        ensemble_result=None,
+    ) -> None:
+        """
+        Update dynamic prior from an EnvironmentalDataSource object.
+        Delegates to update_cycle using weather data provided by the source.
+        """
+        weather = source.get_weather_at(current_time) if hasattr(source, "get_weather_at") else None
+        self.update_cycle(
+            current_time=current_time,
+            terrain=terrain,
+            weather_source=weather,
+            ensemble_result=ensemble_result,
+        )
+
     # ----------------------------------------------------------------
     # GP interface
     # ----------------------------------------------------------------
