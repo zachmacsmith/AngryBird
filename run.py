@@ -160,8 +160,15 @@ _setup_logging()
 # Project imports
 # ---------------------------------------------------------------------------
 
-from angrybird.config import TAU_FMC_S, TAU_WIND_SPEED_S, TAU_WIND_DIR_S
+from angrybird.config import (
+    TAU_FMC_S, TAU_WIND_SPEED_S, TAU_WIND_DIR_S,
+    GP_DEFAULT_FMC_VARIANCE,
+    GP_DEFAULT_WIND_SPEED_MEAN, GP_DEFAULT_WIND_SPEED_VARIANCE,
+    GP_DEFAULT_WIND_DIR_MEAN, GP_DEFAULT_WIND_DIR_VARIANCE,
+)
 from angrybird.gp import IGNISGPPrior
+from angrybird.nelson import nelson_fmc_field
+from angrybird.types import GPPrior
 from angrybird.observations import (
     FireDetectionObservation,
     ObservationStore,
@@ -697,6 +704,33 @@ def main(args: argparse.Namespace) -> None:  # noqa: C901
         live_fire_horizon_h  = float(args.horizon_min) / 60.0,
     )
 
+    # ── Initial prior snapshot (no observations) for static baseline ───────
+    # Build Nelson FMC field at pre-observation GP state and construct a
+    # GPPrior directly (without calling gp.predict() which would trigger a fit
+    # on the empty training set).  This is the "what if we had no drones?"
+    # baseline: Nelson FMC + default background wind, full prior variance.
+    _init_lat = (
+        float(terrain.origin_latlon[0])
+        if (not scenario_mode and terrain.origin_latlon is not None)
+        else 37.5
+    )
+    _nelson_init = nelson_fmc_field(
+        terrain,
+        T_C=args.temperature,
+        RH=args.humidity,
+        hour_of_day=14.0,
+        latitude_deg=_init_lat,
+    )
+    initial_gp_prior = GPPrior(
+        fmc_mean=_nelson_init.astype(np.float32),
+        fmc_variance=np.full(terrain.shape, GP_DEFAULT_FMC_VARIANCE, dtype=np.float32),
+        wind_speed_mean=np.full(terrain.shape, GP_DEFAULT_WIND_SPEED_MEAN, dtype=np.float32),
+        wind_speed_variance=np.full(terrain.shape, GP_DEFAULT_WIND_SPEED_VARIANCE, dtype=np.float32),
+        wind_dir_mean=np.full(terrain.shape, GP_DEFAULT_WIND_DIR_MEAN, dtype=np.float32),
+        wind_dir_variance=np.full(terrain.shape, GP_DEFAULT_WIND_DIR_VARIANCE, dtype=np.float32),
+    )
+    initial_fire_state = ground_truth.fire.fire_state.copy()
+
     # ── Runner ─────────────────────────────────────────────────────────────
     log.info(
         "Starting SimulationRunner: %.1f h | dt=10 s | %d drone(s) | "
@@ -712,6 +746,93 @@ def main(args: argparse.Namespace) -> None:  # noqa: C901
     )
 
     reports = runner.run()
+
+    # ── Static prior baseline comparison ──────────────────────────────────
+    from wispsim.static_prior_evaluator import StaticPriorEvaluator
+    log.info("Running static prior baseline (no observations) …")
+    baseline_eval = StaticPriorEvaluator(
+        config             = config,
+        terrain            = terrain,
+        ground_truth       = ground_truth,
+        initial_gp_prior   = initial_gp_prior,
+        fire_engine        = fire_engine,
+        initial_fire_state = initial_fire_state,
+        n_members          = args.members,
+        horizon_min        = horizon_min,
+        initial_phi        = orchestrator._cycle1_initial_phi,
+    )
+    baseline_rows = baseline_eval.evaluate()
+
+    ignis_rows = runner._cycle_metrics_rows
+    paired = list(zip(ignis_rows, baseline_rows))
+    if paired:
+        log.info(
+            "\n  %-5s  %-8s  %-18s  %-18s  %s",
+            "Cycle", "Time(m)", "IGNIS CRPS/cell", "Static CRPS/cell", "Improvement %",
+        )
+        for ignis, baseline in paired:
+            ignis_v  = ignis["crps_per_cell_minutes"]
+            static_v = baseline["crps_per_cell_minutes"]
+            improvement = (
+                100.0 * (static_v - ignis_v) / static_v
+                if static_v > 1e-9 else 0.0
+            )
+            log.info(
+                "  %-5d  %-8.1f  %-18.4f  %-18.4f  %+.1f%%",
+                ignis["cycle"], ignis["time_min"], ignis_v, static_v, improvement,
+            )
+
+    # Combined CSV — IGNIS rows + static prior rows side by side.
+    import csv as _csv
+    combined_rows = (
+        [{**r, "variant": "ignis"} for r in ignis_rows]
+        + baseline_rows
+    )
+    if combined_rows:
+        out_dir = runner.renderer.out_dir
+        combined_csv = out_dir.parent / f"{config.scenario_name}_comparison.csv"
+        _all_keys = list(combined_rows[0].keys())
+        with open(combined_csv, "w", newline="") as _f:
+            _w = _csv.DictWriter(_f, fieldnames=_all_keys, extrasaction="ignore")
+            _w.writeheader()
+            _w.writerows(combined_rows)
+        log.info("Comparison CSV → %s", combined_csv.resolve())
+
+    # ── Comparison chart ───────────────────────────────────────────────────
+    if ignis_rows and baseline_rows:
+        import matplotlib.pyplot as _plt
+        _fig, _ax = _plt.subplots(figsize=(8, 4))
+        _ax.set_facecolor("#1a1a2e")
+        _fig.patch.set_facecolor("#12121f")
+
+        _t_ignis  = [r["time_min"]              for r in ignis_rows]
+        _v_ignis  = [r["crps_per_cell_minutes"]  for r in ignis_rows]
+        _t_static = [r["time_min"]              for r in baseline_rows]
+        _v_static = [r["crps_per_cell_minutes"]  for r in baseline_rows]
+
+        _ax.plot(_t_ignis,  _v_ignis,  "o-", color="#F44336", linewidth=2.0,
+                 markersize=5, label="IGNIS (with drones)")
+        _ax.plot(_t_static, _v_static, "s--", color="#9E9E9E", linewidth=1.6,
+                 markersize=4, label="Static prior (no observations)")
+        _ax.axhline(0.0, color="#555577", linestyle=":", linewidth=0.8)
+
+        _ax.set_xlabel("Simulation time (min)", color="white", fontsize=9)
+        _ax.set_ylabel("CRPS / burning cell (min)", color="white", fontsize=9)
+        _ax.set_title("Forecast accuracy: IGNIS vs static prior",
+                      color="white", fontsize=10, fontweight="bold")
+        _ax.tick_params(colors="white", labelsize=8)
+        for spine in _ax.spines.values():
+            spine.set_edgecolor("#444466")
+        _ax.legend(fontsize=8, facecolor="#22223b", labelcolor="white",
+                   edgecolor="#444466")
+        _ax.set_ylim(bottom=0.0)
+
+        _chart_path = out_dir.parent / f"{config.scenario_name}_comparison.png"
+        _fig.tight_layout()
+        _fig.savefig(_chart_path, dpi=150, bbox_inches="tight",
+                     facecolor=_fig.get_facecolor())
+        _plt.close(_fig)
+        log.info("Comparison chart → %s", _chart_path.resolve())
 
     # ── Summary ────────────────────────────────────────────────────────────
     elapsed = time.time() - t0

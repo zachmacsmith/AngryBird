@@ -213,6 +213,9 @@ class IGNISOrchestrator:
         self._last_cycle_time_s: float = 0.0
         # Last ensemble result — used by ConsistencyChecker next cycle.
         self._last_ensemble_result: Optional[EnsembleResult] = None
+        # Phi level-set used as fire-engine input on cycle 1; captured so the
+        # static-prior baseline can run the same initial fire state.
+        self._cycle1_initial_phi: Optional[np.ndarray] = None
 
     # ------------------------------------------------------------------
     # Main cycle
@@ -374,6 +377,8 @@ class IGNISOrchestrator:
 
         if self.ensemble_fire_state.initialized:
             initial_phi_for_engine = self.ensemble_fire_state.get_initial_phi(start_time)
+            if self._cycle1_initial_phi is None:
+                self._cycle1_initial_phi = initial_phi_for_engine.copy()
         _t["fire_state"] = time.perf_counter() - _t0
 
         # 4. Ensemble — use caller-provided or run fire engine
