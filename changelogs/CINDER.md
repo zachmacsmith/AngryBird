@@ -187,3 +187,68 @@ Note: `landfire-python` in `requirements.txt` does not exist on PyPI — should 
 
 #### `angrybird/visualization/core.py` + `__init__.py`
 - Removed `_visualization_old` backward-compat shim (only consumer was `demo_phase2.py`, now archived).
+
+---
+
+## Session 3 — 2026-05-05
+
+### Phase 9: SimulatedEnvironmentalSource, oracle removal, unified runner
+
+#### `angrybird/prior/sources.py` — `SimulatedEnvironmentalSource`
+- New class delivering frequency-gated, noisy sensor measurements to `DynamicPrior`:
+  - NWP weather channel (1 hr): temperature + RH from ground truth with Gaussian noise.
+  - NWP wind channel (5 min): speed + direction with spatially correlated noise.
+  - Satellite FMC channel (daily): sparse footprint observations with elevated sigma.
+- `collect_obs_store_inputs(timestamp, fire_state)` generates fire detection observations for three satellite tiers:
+  - GOES fire (5 min, 40-cell pixel footprint, TP=0.92/FP=0.02).
+  - VIIRS fire (12 hr, 7-cell pixel footprint, TP=0.95/FP=0.01).
+  - Satellite FMC obs (daily, 10-cell stride, sigma=0.04).
+- `latlon_to_cell()` helper for geographic coordinate conversion.
+
+#### `angrybird/prior/__init__.py`
+- Added `SimulatedEnvironmentalSource` to public exports.
+
+#### `wispsim/drone_sim.py` — `collect_fire_observation()`
+- One `FireDetectionObservation` per drone per timestep from thermal camera.
+- TP rate=0.90, FP rate=0.05; confidence set to instrument accuracy (not filtered by ensemble).
+- Reports both is_fire=True and is_fire=False so particle filter can reward and punish members.
+- Returns `None` for idle drones.
+
+#### `angrybird/orchestrator.py` — oracle fire state removal
+- `run_cycle()` signature: `observations` is now the first positional argument; `fire_state` is keyword-optional (default `None`).
+- Without `fire_state`: bootstraps from `obs_store.get_fire_detections()` → `reconstruct_arrival_time` → `initialize_from_reconstruction`.
+- Warning + `_neutral_ensemble` fallback if no fire obs are available and no oracle state is passed.
+
+#### `wispsim/runner.py`
+- Imports `collect_fire_observation` from `drone_sim`; one call per drone per timestep.
+- Fire detections added directly to `obs_store` (no oracle path).
+- `_run_ignis_cycle()`: `orchestrator.run_cycle(observations=observations, start_time=...)` — `fire_state` arg removed.
+- Burn probability for renderer sourced from `_last_ensemble_result.burn_probability`.
+- `SimulationRunner.__init__()`: removed hardcoded ignition seed; now warns if `obs_store` is empty (seeding responsibility transferred to caller).
+
+#### `angrybird/tests/test_dynamic_prior.py`
+- Fixed 5 tests that used old positional call form `run_cycle(fire_state, [], ...)` → `run_cycle([], fire_state=fire_state, ...)`.
+
+#### `scripts/run.py` — unified simulation entry point (NEW FILE)
+Replaces `scripts/run_landfire_wispsim.py` and `scripts/run_sim.py`.
+
+**Terrain modes:**
+- LANDFIRE mode (default): loads GeoTIFF cache via `load_from_directory`.
+- Synthetic scenario mode (`--scenario`): `hilly_heterogeneous`, `wind_shift`, `flat_homogeneous`, `dual_ignition`, `crown_fire_risk`.
+
+**Shared helpers (no duplication):**
+- `find_burnable_cell()` — spiral search from grid centre for first non-NB cell.
+- `latlon_to_cell()` — flat-earth WGS-84 → (row, col) conversion.
+- `cells_within_radius()` — all burnable cells within a report uncertainty radius.
+- `make_gp()` — matched GP + ObservationStore pair.
+- `make_registry()` — SelectorRegistry built with correct resolution and drone params.
+- `seed_fire_report()` — adds `FireDetectionObservation` entries to obs_store before runner construction.
+
+**Key args:**
+- `--fire-lat/lon/radius-m/confidence` — uncertain fire report (not oracle).
+- `--wind-speed/direction/temperature/humidity/base-fmc` — weather priors.
+- `--wind-event-*` — single optional wind shift event.
+- `--hours/cycle-min/horizon-min/seed` — simulation timing.
+- `--drones/targets/drone-speed-ms/drone-endurance-s/n-raws/mesh-network` — fleet.
+- `--members/selector/device` — ensemble and GPU.
+- `--out` — output directory.

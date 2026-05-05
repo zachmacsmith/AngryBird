@@ -759,20 +759,19 @@ class SimulationRunner:
             ground_truth, rng=np.random.default_rng(99)
         )
 
-        # Seed the obs_store with a high-confidence fire detection at the ignition
-        # location so the orchestrator can reconstruct initial fire state without oracle
-        # knowledge.  This represents the dispatch information (e.g. lookout report,
-        # initial alarm) that is always available at mission start — it is NOT oracle
-        # knowledge of the full fire perimeter.
-        from angrybird.observations import FireDetectionObservation as _FDO
-        for cell in ground_truth.ignition_cells:
-            orchestrator.obs_store.add(_FDO(
-                _source_id  = "ignition_report",
-                _timestamp  = 0.0,
-                location    = (int(cell[0]), int(cell[1])),
-                is_fire     = True,
-                confidence  = 0.99,
-            ))
+        # Fire report seeding is the caller's responsibility — add
+        # FireDetectionObservation(s) to orchestrator.obs_store before
+        # constructing SimulationRunner.  The runner script (run.py) does
+        # this with configurable confidence and radius from the CLI fire-report
+        # args.  Warn loudly if nothing is in the store so the missing seed
+        # is caught early rather than silently deferring fire state init.
+        if not orchestrator.obs_store.get_fire_detections():
+            logger.warning(
+                "SimulationRunner: obs_store contains no fire detections. "
+                "Add at least one FireDetectionObservation to obs_store before "
+                "constructing SimulationRunner, or fire state init will be deferred "
+                "until the first satellite pass (~5 min)."
+            )
 
         # Set a constant uninformed wind prior (5 m/s / 270° westerly) to:
         #   1. Activate circular arithmetic in fit() for wind direction.

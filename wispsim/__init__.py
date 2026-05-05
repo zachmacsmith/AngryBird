@@ -37,6 +37,7 @@ from .observation_buffer import ObservationBuffer
 from .observer import ObservationSource, SimulatedObserver
 from .renderer import FrameRenderer
 from .runner import CycleRunner, SimulationConfig, SimulationRunner
+from .scenario import FireReport, Scenario, WeatherPrior
 from .scenarios import crown_fire_risk, dual_ignition, flat_homogeneous, hilly_heterogeneous, wind_shift
 
 __all__ = [
@@ -63,7 +64,11 @@ __all__ = [
     "FrameRenderer",
     # evaluation
     "CounterfactualEvaluator",
-    # scenarios
+    # scenario types
+    "FireReport",
+    "Scenario",
+    "WeatherPrior",
+    # scenario factories
     "hilly_heterogeneous",
     "wind_shift",
     "flat_homogeneous",

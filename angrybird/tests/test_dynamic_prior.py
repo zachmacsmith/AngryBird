@@ -631,14 +631,14 @@ class TestOrchestratorIntegration:
             "wind_speed": 5.0, "wind_direction": 270.0,
             "source": "scenario", "latitude": 36.0,
         }
-        orch.run_cycle(fire_state, [], start_time=0.0, weather_source=weather)
+        orch.run_cycle([], fire_state=fire_state, start_time=0.0, weather_source=weather)
         assert orch.dynamic_prior.is_initialized()
 
     def test_weather_source_none_does_not_update_dynamic_prior(self, terrain):
         orch = self._make_orchestrator(terrain)
         fire_state = np.zeros(SHAPE, dtype=np.float32)
         fire_state[SHAPE[0] // 2, SHAPE[1] // 2] = 1.0
-        orch.run_cycle(fire_state, [], start_time=0.0, weather_source=None)
+        orch.run_cycle([], fire_state=fire_state, start_time=0.0, weather_source=None)
         # Without weather_source the dynamic_prior stays empty
         assert not orch.dynamic_prior.is_initialized()
 
@@ -660,7 +660,7 @@ class TestOrchestratorIntegration:
             "wind_speed": 5.0, "wind_direction": 270.0,
             "source": "scenario", "latitude": 36.0,
         }
-        orch.run_cycle(fire_state, [], start_time=0.0, weather_source=weather)
+        orch.run_cycle([], fire_state=fire_state, start_time=0.0, weather_source=weather)
         assert len(set_fmc) > 0
         np.testing.assert_array_almost_equal(set_fmc[0], orch.dynamic_prior.nelson_fmc)
 
@@ -669,7 +669,7 @@ class TestOrchestratorIntegration:
         fire_state = np.zeros(SHAPE, dtype=np.float32)
         fire_state[SHAPE[0] // 2, SHAPE[1] // 2] = 1.0
         weather = {"temperature": 25.0, "humidity": 0.25, "source": "scenario"}
-        orch.run_cycle(fire_state, [], start_time=3600.0, weather_source=weather)
+        orch.run_cycle([], fire_state=fire_state, start_time=3600.0, weather_source=weather)
         assert orch.dynamic_prior.timestamp == 3600.0
 
     def test_last_ensemble_passed_to_fire_state_update(self, terrain):
@@ -682,11 +682,11 @@ class TestOrchestratorIntegration:
             "source": "scenario",
         }
         # Cycle 1: no previous ensemble → fire state not yet populated
-        orch.run_cycle(fire_state, [], start_time=0.0, weather_source=weather)
+        orch.run_cycle([], fire_state=fire_state, start_time=0.0, weather_source=weather)
         assert orch.dynamic_prior.fire_burn_probability is None  # first cycle has no prior ensemble
 
         # Cycle 2: previous ensemble exists → fire state should now be populated
-        orch.run_cycle(fire_state, [], start_time=60.0, weather_source=weather)
+        orch.run_cycle([], fire_state=fire_state, start_time=60.0, weather_source=weather)
         assert orch.dynamic_prior.fire_burn_probability is not None
 
 
