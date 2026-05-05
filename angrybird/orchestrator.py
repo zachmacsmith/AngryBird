@@ -400,8 +400,12 @@ class IGNISOrchestrator:
                         self.cycle_count, disagreement * 100, n_eff,
                     )
 
-                    # ── Fire retrospect: update GP with weighted FMC/wind at fire front
-                    if self._domain_graph is not None:
+                    # ── Fire retrospect: update GP with weighted FMC/wind at fire front.
+                    # Gate 1: skip when weights are nearly uniform — uniform weights
+                    # mean fire obs didn't discriminate members, so the weighted mean
+                    # equals the prior mean and injecting it tightens GP for free.
+                    _retro_useful = n_eff < self.n_members * 0.8
+                    if _retro_useful and self._domain_graph is not None:
                         elapsed_min = (start_time - self._last_cycle_time_s) / 60.0
                         burn_frac   = (
                             self._last_ensemble_result.member_arrival_times < elapsed_min
@@ -410,10 +414,13 @@ class IGNISOrchestrator:
                         if fire_front.any():
                             retro_obs = generate_fire_retrospect_observations(
                                 retro_weights,
+                                fire_obs,
                                 self._last_ensemble_result,
                                 fire_front,
                                 self._domain_graph.domains,
                                 gp_prior,
+                                n_eff=n_eff,
+                                n_members=self.n_members,
                                 current_time=start_time,
                             )
                             if retro_obs:
@@ -421,9 +428,11 @@ class IGNISOrchestrator:
                                 self.obs_store.add_batch(retro_obs)
                                 self.gp.fit(start_time)
                                 gp_prior = self.gp.predict(shape)
-                                logger.debug(
-                                    "Cycle %d | fire retrospect: %d domain obs injected",
+                                logger.info(
+                                    "Cycle %d | fire retrospect: %d domain obs "
+                                    "(N_eff=%.1f, inflation=%.1f×)",
                                     self.cycle_count, len(retro_obs),
+                                    n_eff, self.n_members / max(n_eff, 1.0),
                                 )
 
         if self.ensemble_fire_state.initialized:
