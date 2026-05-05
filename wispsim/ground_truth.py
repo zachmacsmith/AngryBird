@@ -171,6 +171,10 @@ class GroundTruth:
     fire:                 GroundTruthFire
     shape:                tuple[int, int]
     ignition_cells:       list[tuple[int, int]] = dataclass_field(default_factory=list)
+    # Scenario weather — drives Nelson FMC prior and wind prior in the dynamic prior.
+    # Represents what an NWP forecast (e.g. HRRR) would provide.
+    temperature_c:        float = 30.0       # air temperature °C
+    relative_humidity:    float = 0.25       # relative humidity fraction [0, 1]
 
     @property
     def burned_mask(self) -> np.ndarray:
@@ -266,6 +270,8 @@ def generate_ground_truth(
     base_wd: float = 180.0,
     wind_events: Optional[list[WindEvent]] = None,
     seed: int = 0,
+    temperature_c: float = 30.0,
+    relative_humidity: float = 0.25,
 ) -> GroundTruth:
     """
     Generate a physically plausible ground truth.
@@ -277,13 +283,15 @@ def generate_ground_truth(
     to be stepped.
 
     Args:
-        terrain:        TerrainData
-        ignition_cell:  (row, col) or list of (row, col) fire start locations
-        base_fmc:       domain-mean FMC dead fraction (default 0.08)
-        base_ws:        domain-mean wind speed m/s (default 5.0)
-        base_wd:        prevailing wind direction degrees (default 180)
-        wind_events:    scheduled wind shifts (default: none)
-        seed:           random seed
+        terrain:            TerrainData
+        ignition_cell:      (row, col) or list of (row, col) fire start locations
+        base_fmc:           domain-mean FMC dead fraction (default 0.08)
+        base_ws:            domain-mean wind speed m/s (default 5.0)
+        base_wd:            prevailing wind direction degrees (default 180)
+        wind_events:        scheduled wind shifts (default: none)
+        seed:               random seed
+        temperature_c:      air temperature °C — drives Nelson FMC prior (default 30)
+        relative_humidity:  RH fraction [0,1]  — drives Nelson FMC prior (default 0.25)
     """
     cells: list[tuple[int, int]] = (
         [ignition_cell] if isinstance(ignition_cell, tuple) else list(ignition_cell)
@@ -304,4 +312,6 @@ def generate_ground_truth(
         fire=fire,
         shape=terrain.shape,
         ignition_cells=cells,
+        temperature_c=temperature_c,
+        relative_humidity=relative_humidity,
     )
