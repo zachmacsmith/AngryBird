@@ -22,13 +22,16 @@ class DroneFlightState:
 
     A sortie runs from GS departure to GS landing.  On landing (returned=True),
     the orchestrator resets battery and mode for the next sortie.
+
+    No visited-domain set: the info field (GP variance → w_i) already encodes
+    observation history.  The only visited tracking needed is a local variable
+    scoped to a single planning call to prevent within-path cycles.
     """
     drone_id:           int
     position_m:         np.ndarray   # (row_m, col_m) in grid-metres
     remaining_range_m:  float        # battery state as metres of flight remaining
     mode:               DroneMode
     target_gs_idx:      int          # index into ground_stations list; -1 in NORMAL
-    visited_domains:    set          # set[int] domain IDs observed this sortie
     sortie_distance_m:  float = 0.0  # cumulative distance flown this sortie
     returned:           bool  = False # True when this cycle's plan ends at a GS
 

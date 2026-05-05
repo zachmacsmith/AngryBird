@@ -35,6 +35,7 @@ from angrybird.config import (
     OBS_WIND_SPEED_SIGMA,
     SENSOR_FMC_R2,
 )
+from angrybird.observations import FireDetectionObservation
 from angrybird.types import DroneObservation
 
 
@@ -249,6 +250,61 @@ def _dist_to_fire_front_m(
     dy = fy - pos_m[0]
     dx = fx - pos_m[1]
     return float(np.sqrt(dy ** 2 + dx ** 2).min())
+
+
+def collect_fire_observation(
+    drone: DroneState,
+    fire_arrival_times: np.ndarray,
+    terrain_shape: tuple[int, int],
+    resolution_m: float,
+    current_time: float,
+    true_positive_rate: float = 0.90,
+    false_positive_rate: float = 0.05,
+    rng: Optional[np.random.Generator] = None,
+) -> Optional[FireDetectionObservation]:
+    """
+    Generate one fire detection observation from the drone's thermal camera.
+
+    Produces a single FireDetectionObservation from the drone's nadir cell.
+    Reports both is_fire=True (detected fire) and is_fire=False (clear) so
+    the particle filter can both reward and punish ensemble members as needed.
+
+    One observation per drone per timestep — no footprint expansion.  This
+    keeps the particle filter input volume bounded (N_drones × N_steps per
+    cycle) without discarding informative boundary readings.
+
+    Confidence is always set to the instrument's stated accuracy for each
+    observation type (true positive rate for fire, 1-fp for no-fire), NOT
+    filtered by ensemble-mean discrepancy.  The particle filter reweights
+    all members proportionally; well-predicted cells produce near-uniform
+    reweighting (no information loss) while genuinely new detections drive
+    meaningful weight updates.
+
+    Returns None if the drone is idle (not collecting observations).
+    """
+    if drone.status == "idle":
+        return None
+    if rng is None:
+        rng = np.random.default_rng()
+
+    r, c = pos_m_to_cell(drone.position, resolution_m, terrain_shape)
+    at = fire_arrival_times[r, c]
+    ground_truth_fire = np.isfinite(at) and float(at) < current_time
+
+    if ground_truth_fire:
+        is_fire    = bool(rng.random() < true_positive_rate)
+        confidence = true_positive_rate
+    else:
+        is_fire    = bool(rng.random() < false_positive_rate)
+        confidence = 1.0 - false_positive_rate
+
+    return FireDetectionObservation(
+        _source_id  = f"{drone.drone_id}_thermal_{current_time:.0f}_{r}_{c}",
+        _timestamp  = current_time,
+        location    = (r, c),
+        is_fire     = is_fire,
+        confidence  = confidence,
+    )
 
 
 def assign_waypoints(
