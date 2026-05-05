@@ -1,0 +1,781 @@
+\documentclass[11pt,twocolumn]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{algorithm,algpseudocode}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{bm}
+\usepackage{bbm}
+
+\title{\textbf{WISP: Wildfire Information and Sensor Planning}\\
+\large Mathematical Formulation}
+\author{}
+\date{}
+
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\norm}[1]{\left\lVert#1\right\rVert}
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\Var}{\mathrm{Var}}
+\newcommand{\given}{\,|\,}
+
+\begin{document}
+\maketitle
+
+%--------------------------------------------------------------------
+\begin{abstract}
+WISP (Wildfire Information and Sensor Planning) is a real-time
+system for autonomous drone-based wildfire monitoring.  It couples a
+GPU-accelerated ensemble fire-spread model (Rothermel~1972 surface
+ROS + Van~Wagner~1977 crown fire, propagated via a level-set PDE)
+with a Gaussian Process environmental prior, an Ensemble Kalman
+Filter for data assimilation, and an information-theoretic greedy
+orienteering planner that routes drones to maximally reduce
+uncertainty about fire arrival times.  This document derives every
+mathematical component of the system.
+\end{abstract}
+
+%====================================================================
+\section{System Overview}
+\label{sec:overview}
+
+Let $\mathcal{G} = \{(r,c) : 0\le r<R,\; 0\le c<C\}$ be a
+$R\times C$ grid at resolution $\Delta x$~m.  The hidden state
+consists of:
+\begin{itemize}
+  \item $\phi^*(r,c,t)$~-- the signed-distance field (SDF) of the
+        true fire front,
+  \item $\theta^*(r,c)$~-- static terrain (elevation, slope, aspect,
+        fuel model),
+  \item $m^*(r,c,t)$~-- dead fuel moisture content (FMC),
+  \item $\mathbf{u}^*(r,c,t)$~-- surface wind (speed~$s$, direction~$d$).
+\end{itemize}
+
+At each planning cycle (interval $\Delta T_{\mathrm{cyc}}$) the
+system:
+\begin{enumerate}
+  \item Fits a GP to accumulated sensor observations to produce
+        posterior fields $(\hat{m},\hat{s},\hat{d})$,
+  \item Runs an $N$-member ensemble of the level-set fire model to
+        obtain arrival-time distributions,
+  \item Computes an information field $w(r,c)$ weighting cells by
+        expected variance reduction,
+  \item Plans drone paths that maximise $\sum w$ subject to range
+        constraints.
+\end{enumerate}
+
+%====================================================================
+\section{Rothermel Surface Rate of Spread}
+\label{sec:rothermel}
+
+The Rothermel (1972) model predicts the no-wind, no-slope rate of
+spread $R_0$ and its amplification by wind and slope.  All fuel
+parameters are taken from the Scott--Burgan 40 (SB40) fuel catalog.
+
+\subsection{Fuel parameters}
+
+For each SB40 fuel type the catalog provides:
+\begin{align*}
+  w_0 &\quad \text{oven-dry fuel loading (kg/m}^2\text{)},\\
+  \sigma &\quad \text{surface-area-to-volume ratio (SAV, m}^{-1}\text{)},\\
+  \delta &\quad \text{fuel bed depth (m)},\\
+  M_x &\quad \text{moisture of extinction (fraction)},\\
+  h &\quad \text{heat of combustion (kJ/kg)}.
+\end{align*}
+Internal computations follow Rothermel's original SI convention;
+the SAV is converted to ft$^{-1}$ where required:
+$\sigma_{\mathrm{ft}} = \sigma / 3.2808$.
+
+\subsection{Packing ratio}
+
+\begin{align}
+  \rho_p &= 513\;\text{kg/m}^3 \quad\text{(particle density)},\notag\\
+  \beta &= \frac{w_0}{\delta\,\rho_p},\label{eq:beta}\\
+  \beta^* &= 3.348\,\sigma_{\mathrm{ft}}^{-0.8189},\label{eq:betaop}\\
+  \hat{\beta} &= \beta / \beta^*.\label{eq:betaratio}
+\end{align}
+
+\subsection{Reaction intensity}
+
+\begin{align}
+  A &= 133\,\sigma_{\mathrm{ft}}^{-0.7913},\label{eq:A}\\
+  \Gamma_{\max} &= \frac{\sigma_{\mathrm{ft}}^{1.5}}{495 + 0.0594\,\sigma_{\mathrm{ft}}^{1.5}},\label{eq:gammamax}\\
+  \Gamma &= \Gamma_{\max}\,\hat{\beta}^{A}\,\exp\!\bigl(A(1-\hat{\beta})\bigr),\label{eq:gamma}\\
+  w_n &= w_0\,(1 - s_t),\quad s_t = 0.0555,\label{eq:wn}\\
+  \eta_s &= \min\!\bigl(0.174\,s_e^{-0.19},\,1\bigr),\quad s_e=0.01,\label{eq:etas}\\
+  r_m &= \min\!\bigl(m/M_x,\,1\bigr),\label{eq:rm}\\
+  \eta_m &= \max\!\bigl(0,\;1 - 2.59\,r_m + 5.11\,r_m^2 - 3.52\,r_m^3\bigr),\label{eq:etam}\\
+  I_R &= \Gamma\,w_n\,h\,\eta_m\,\eta_s\quad\text{[kW/m}^2\text{]},\label{eq:IR}
+\end{align}
+where $m$ is the local FMC (fraction).
+
+\subsection{Propagating flux ratio}
+
+\begin{equation}
+  \xi = \frac{\exp\!\bigl[(0.792+0.681\sqrt{\sigma_{\mathrm{ft}}})(\beta+0.1)\bigr]}
+            {192 + 0.2595\,\sigma_{\mathrm{ft}}}.\label{eq:xi}
+\end{equation}
+
+\subsection{Wind and slope amplification}
+
+The midflame wind speed $U_f$ (ft/min) is obtained from the 10-m
+wind speed $U_{10}$ (m/s) via a wind adjustment factor $f_w$:
+\begin{equation}
+  U_f = U_{10}\,f_w\times 196.85,\label{eq:uf}
+\end{equation}
+where $f_w\in[0.4,\,0.6]$ depends on canopy cover fraction.
+
+\textbf{Wind factor:}
+\begin{align}
+  C &= 7.47\exp(-0.133\,\sigma_{\mathrm{ft}}^{0.55}),\label{eq:C}\\
+  B &= 0.02526\,\sigma_{\mathrm{ft}}^{0.54},\label{eq:B}\\
+  E &= 0.715\exp(-3.59\times10^{-4}\,\sigma_{\mathrm{ft}}),\label{eq:E}\\
+  \phi_w &= C\,U_f^B\,\hat{\beta}^{-E}.\label{eq:phiw}
+\end{align}
+
+\textbf{Slope factor:}
+\begin{equation}
+  \phi_s = 5.275\,\beta^{-0.3}\tan^2\!\alpha,\label{eq:phis}
+\end{equation}
+where $\alpha$ is the terrain slope angle.
+
+\subsection{Vector combination and head-fire direction}
+
+Wind and slope forces are resolved as 2-D vectors:
+\begin{align}
+  r_x &= \phi_w\sin\psi_w + \phi_s\sin\psi_s,\label{eq:rx}\\
+  r_y &= \phi_w\cos\psi_w + \phi_s\cos\psi_s,\label{eq:ry}\\
+  \phi_{\mathrm{comb}} &= \sqrt{r_x^2+r_y^2},\label{eq:phicomb}\\
+  \theta_{\max} &= \operatorname{atan2}(r_x,r_y)\mod 360^\circ,\label{eq:thetamax}
+\end{align}
+where $\psi_w = (\psi_{\mathrm{wind}}+180^\circ)\mod360^\circ$ and
+$\psi_s$ is the upslope aspect.
+
+\subsection{Head-fire ROS}
+
+\begin{align}
+  Q_{\mathrm{ig}} &= 250 + 1116\,m\quad\text{[cal/g]},\label{eq:Qig}\\
+  \varepsilon &= \exp(-138/\sigma_{\mathrm{ft}}),\label{eq:eps}\\
+  \rho_b &= w_0/\delta,\label{eq:rhob}\\
+  R_{\mathrm{head}} &= \frac{I_R\,\xi\,(1+\phi_{\mathrm{comb}})}
+                          {\rho_b\,\varepsilon\,Q_{\mathrm{ig}}\times60}
+                    \quad\text{[m/s]}.\label{eq:Rhead}
+\end{align}
+
+%====================================================================
+\section{Directional Rate of Spread}
+\label{sec:directional}
+
+Spread is modelled as an Anderson (1983) ellipse.  The
+length-to-breadth ratio and eccentricity are:
+\begin{align}
+  U_{\mathrm{mid}} &= U_{10}\,f_w\times3.6\quad\text{[km/h]},\label{eq:umid}\\
+  L/B &= \min\!\bigl(\max(1+0.25\,U_{\mathrm{mid}},\,1),\,8\bigr),\label{eq:lb}\\
+  e &= \frac{L/B-1}{L/B+1}.\label{eq:e}
+\end{align}
+
+For a local outward normal $\hat{\mathbf{n}}$ making angle $\theta$
+with the head-fire direction:
+\begin{equation}
+  R(\theta) = R_{\mathrm{head}}\,\frac{1-e}{1-e\cos\theta}.\label{eq:Rtheta}
+\end{equation}
+The angle $\theta$ is computed from the level-set gradient
+$\nabla\phi = (g_x, g_y)$:
+\begin{align}
+  \hat{n}_x &= g_x/\norm{\nabla\phi},\quad \hat{n}_y = g_y/\norm{\nabla\phi},\notag\\
+  \psi_{\mathrm{prop}} &= \operatorname{atan2}(\hat{n}_x,\hat{n}_y)\mod360^\circ,\notag\\
+  \delta &= (\psi_{\mathrm{prop}}-\theta_{\max})\mod360^\circ,\notag\\
+  \theta &= \min(\delta,\;360^\circ-\delta).\label{eq:theta}
+\end{align}
+
+%====================================================================
+\section{Crown Fire (Van Wagner 1977)}
+\label{sec:crown}
+
+Crown fire initiates when the surface fireline intensity exceeds a
+critical threshold:
+\begin{align}
+  I_{\mathrm{crit}} &= \bigl(0.01\,h_{\mathrm{CBH}}\,(460+2590)\bigr)^{1.5}
+                      \quad\text{[kW/m]},\label{eq:Icrit}\\
+  I_{\mathrm{surf}} &= I_R\,\xi\,R_{\mathrm{dir}}\times 60,\notag
+\end{align}
+where $h_{\mathrm{CBH}}$ is canopy base height (m).
+
+Crown ROS (Rothermel 1991):
+\begin{equation}
+  R_{\mathrm{crown}} = \frac{11.02\,U_{10}^{0.854}\,\rho_c^{0.19}}{60}
+                       \quad\text{[m/s]},\label{eq:Rcrown}
+\end{equation}
+where $\rho_c$ is canopy bulk density (kg/m$^3$).
+
+Effective ROS:
+\begin{equation}
+  R_{\mathrm{eff}} = \begin{cases}
+    \max(R_{\mathrm{dir}},\,R_{\mathrm{crown}}) & I_{\mathrm{surf}} > I_{\mathrm{crit}},\\
+    R_{\mathrm{dir}} & \text{otherwise.}
+  \end{cases}\label{eq:Reff}
+\end{equation}
+
+%====================================================================
+\section{Level-Set Fire Propagation}
+\label{sec:levelset}
+
+The fire front is implicitly represented by $\phi(\mathbf{x},t)$,
+the signed distance function, where $\phi<0$ inside the fire perimeter
+and $\phi>0$ outside.  The Hamilton-Jacobi PDE is:
+\begin{equation}
+  \frac{\partial\phi}{\partial t} + R(\nabla\phi/\norm{\nabla\phi})
+  \,\norm{\nabla\phi} = 0.\label{eq:HJ}
+\end{equation}
+
+\subsection{Godunov upwind discretisation}
+
+For expanding fronts ($\phi$ decreasing), the upwind approximation is:
+\begin{align}
+  D_x^- &= (\phi_{i,j}-\phi_{i-1,j})/\Delta x,\quad
+  D_x^+ = (\phi_{i+1,j}-\phi_{i,j})/\Delta x,\notag\\
+  D_y^- &= (\phi_{i,j}-\phi_{i,j-1})/\Delta x,\quad
+  D_y^+ = (\phi_{i,j+1}-\phi_{i,j})/\Delta x,\notag\\
+  |\nabla\phi|_{\mathrm{up}} &= \Bigl[\max(D_x^-,0)^2+\max(-D_x^+,0)^2\notag\\
+                &\qquad\quad+\max(D_y^-,0)^2+\max(-D_y^+,0)^2\Bigr]^{1/2}.
+  \label{eq:godunov}
+\end{align}
+
+For efficiency, replicate-padded central differences are used to
+compute the gradient components needed for the directional ROS:
+\begin{equation}
+  g_x = \frac{\phi_{i+1,j}-\phi_{i-1,j}}{2\Delta x},\quad
+  g_y = \frac{\phi_{i,j+1}-\phi_{i,j-1}}{2\Delta x}.\label{eq:cd}
+\end{equation}
+
+\subsection{Time integration}
+
+A forward-Euler step with a CFL-adaptive timestep:
+\begin{align}
+  \phi^{n+1} &= \phi^n - \Delta t\,R(\theta)\,|\nabla\phi|_{\mathrm{up}},\label{eq:euler}\\
+  \Delta t &= \min\!\Bigl(\nu\,\frac{\Delta x}{R_{\max}},\;300\;\text{s}\Bigr),\label{eq:cfl}
+\end{align}
+where $\nu\in[0.4,\,0.8]$ is the CFL safety factor and
+$R_{\max}=\max(R_{\mathrm{head}},R_{\mathrm{crown}})$ is computed
+once per ensemble member before the loop.
+
+\subsection{Arrival time recording}
+
+Cell $(i,j)$ is marked as ignited at the first timestep the front
+crosses zero.  The exact crossing time is found by linear
+interpolation:
+\begin{equation}
+  t_{\mathrm{arr}}^{i,j} = t^n + \Delta t\,
+  \frac{\phi^n_{i,j}}{\phi^n_{i,j}-\phi^{n+1}_{i,j}+\varepsilon},
+  \quad\phi^n>0,\;\phi^{n+1}\le0.\label{eq:tarr}
+\end{equation}
+
+\subsection{SDF redistancing}
+
+Every $K=20$ timesteps the SDF is restored to a unit-gradient
+field via pseudo-time iterations (Sussman, Smereka \& Osher 1994):
+\begin{align}
+  s_{i,j} &= \phi_{i,j}/\sqrt{\phi_{i,j}^2+\Delta x^2},\label{eq:sign}\\
+  \phi^{\tau+1} &= \phi^\tau - \Delta\tau\,s\,(|\nabla\phi^\tau|-1),\label{eq:redist}\\
+  \Delta\tau &= 0.5\,\Delta x,
+\end{align}
+applied for 5 iterations on cells with $|\phi|<3\Delta x$.
+
+%====================================================================
+\section{Ensemble Fire State}
+\label{sec:ensemble}
+
+The $N$-member ensemble provides a non-parametric distribution of
+arrival times.  Members share GP-mean environmental conditions but
+have independent perturbations drawn from the GP posterior.
+
+For member $n$, let $m^{(n)},\,s^{(n)},\,d^{(n)}$ be FMC, wind
+speed, and wind direction fields drawn from:
+\begin{align}
+  m^{(n)} &\sim \mathcal{N}\!\bigl(\hat{m},\,\Sigma_m\bigr),\label{eq:mpert}\\
+  s^{(n)} &\sim \mathcal{N}\!\bigl(\hat{s},\,\Sigma_s\bigr),\label{eq:spert}\\
+  d^{(n)} &\sim \mathcal{N}\!\bigl(\hat{d},\,\Sigma_d\bigr)\mod360^\circ,\label{eq:dpert}
+\end{align}
+where $\Sigma$ are diagonal matrices of GP posterior variances.
+
+The ensemble arrival time field is:
+\begin{equation}
+  T^{(n)}(r,c) =
+  \begin{cases}
+    t^{(n)}_{\mathrm{arr}}(r,c) & \text{cell ignited within horizon},\\
+    2T_{\mathrm{hor}} & \text{otherwise (sentinel)},
+  \end{cases}\label{eq:Tn}
+\end{equation}
+where $T_{\mathrm{hor}}$ is the planning horizon in minutes.
+
+Summary statistics:
+\begin{align}
+  p_{\mathrm{burn}}(r,c) &= \frac{1}{N}\sum_{n=1}^N
+    \mathbbm{1}\!\bigl[T^{(n)}<0.9\times2T_{\mathrm{hor}}\bigr],\label{eq:pburn}\\
+  \bar{T}(r,c) &= \frac{1}{|\mathcal{B}|}\sum_{n\in\mathcal{B}} T^{(n)},\label{eq:Tbar}\\
+  \sigma^2_T(r,c) &= \frac{1}{N}\sum_{n=1}^N \bigl(T^{(n)}-\bar{T}\bigr)^2,\label{eq:varT}
+\end{align}
+where $\mathcal{B}=\{n: T^{(n)}<0.9\times2T_{\mathrm{hor}}\}$.
+
+%====================================================================
+\section{Fire State Estimation}
+\label{sec:firestate}
+
+\subsection{Arrival time reconstruction via fast marching}
+
+Given a set of fire-detection observations
+$\mathcal{O}=\{(r_k,c_k,t_k,q_k)\}$ (location, time, is-fire flag),
+the arrival field is initialised at observed fire cells:
+$T_{\mathrm{arr}}(r_k,c_k)=t_k$.
+
+An 8-connected Dijkstra fast march then fills unobserved cells.  For
+a neighbour $(r',c')$ at Euclidean distance factor $\ell$:
+\begin{equation}
+  T_{\mathrm{arr}}(r',c') \leftarrow
+  \min\!\Bigl(T_{\mathrm{arr}}(r',c'),\;T_{\mathrm{arr}}(r,c)
+  + \frac{\ell\,\Delta x}{R_0(r',c')}\Bigr),\label{eq:fm}
+\end{equation}
+where $R_0$ is the scalar Rothermel ROS at GP-mean conditions
+($\ell=1$ for cardinal, $\ell=\sqrt{2}$ for diagonal neighbours).
+
+\subsection{Arrival uncertainty}
+
+\begin{align}
+  d_k(r,c) &= \Delta x\cdot\mathrm{EDT}(\sim\text{obs mask}),\label{eq:dist}\\
+  \sigma_{\mathrm{sp}}(r,c) &= 30 + 0.6\,d_k\quad\text{[s]},\label{eq:sigsp}\\
+  \sigma_{\mathrm{tp}}(r,c) &= (t_{\mathrm{now}}-t_{\mathrm{obs}})\,
+    \frac{\hat{R}_{95}}{\hat{R}_{95}+\varepsilon},\label{eq:sigtp}\\
+  \sigma_T(r,c) &= \sqrt{\sigma_{\mathrm{sp}}^2+\sigma_{\mathrm{tp}}^2},\label{eq:sigT}
+\end{align}
+where $\hat{R}_{95}$ is the 95th-percentile ROS over burnable cells.
+
+\subsection{Ensemble initialisation}
+
+Each member arrival time is perturbed by a spatially correlated field
+$\xi^{(n)}$ (zero mean, unit variance, correlation length
+$L_c=500$~m):
+\begin{align}
+  T^{(n)}_{\mathrm{init}}(r,c)
+    &= T_{\mathrm{arr}}(r,c) + \xi^{(n)}(r,c)\,\sigma_T(r,c),\label{eq:Tinit}
+\end{align}
+with deep-interior ($T<T_{\min}+3600$) and far-exterior
+($T>0.9T_{\mathrm{max}}$) cells clamped to their deterministic values.
+
+The correlated field is generated via spectral filtering:
+\begin{align}
+  \tilde{Z} &= \mathcal{F}\bigl[\varepsilon\bigr],\quad\varepsilon\sim\mathcal{N}(0,I),\notag\\
+  S(\mathbf{k}) &= \exp\!\bigl(-\tfrac{1}{2}\norm{\mathbf{k}}^2L_c^2\bigr),\notag\\
+  \xi &= \mathcal{F}^{-1}\!\bigl[\tilde{Z}\,\sqrt{S}\bigr]/\mathrm{std}(\cdot).\label{eq:corrfield}
+\end{align}
+
+\subsection{Particle filter update}
+
+Between initialisation and hard-reset events, members are reweighted
+using new fire observations.  For member $n$ and observation $(r_k,c_k,q_k)$:
+\begin{equation}
+  w_n \leftarrow w_n\times
+  \begin{cases}
+    c_k & q_k=\text{fire},\;T^{(n)}(r_k,c_k)<t_{\mathrm{now}},\\
+    1-c_k & q_k=\text{no-fire},\;T^{(n)}<t_{\mathrm{now}},\\
+    1-c_k & q_k=\text{fire},\;T^{(n)}\ge t_{\mathrm{now}},\\
+    c_k & q_k=\text{no-fire},\;T^{(n)}\ge t_{\mathrm{now}},
+  \end{cases}\label{eq:pf}
+\end{equation}
+where $c_k\in[0,1]$ is detection confidence.  Weights are normalised,
+and systematic resampling is applied when the effective sample size
+$N_{\mathrm{eff}}=1/\!\sum_n w_n^2 < N/2$.
+
+%====================================================================
+\section{Environmental GP Prior}
+\label{sec:gp}
+
+\subsection{Observation types}
+
+Each observation $y_i$ at location $(r_i,c_i,t_i)$ belongs to one of
+FMC, wind speed, or wind direction.  Drone-camera FMC is modelled as
+spectrally derived, while RAWS stations provide all three variables.
+
+\subsection{Terrain-aware Mat\'{e}rn kernel}
+
+Feature vectors include spatial and terrain information:
+\begin{equation}
+  \mathbf{x} = \bigl[\Delta\text{N},\;\Delta\text{E},\;
+                z,\;\psi_{\mathrm{asp}}\bigr]^\top,
+\end{equation}
+where $(\Delta\text{N},\Delta\text{E})$ are northing/easting offsets,
+$z$ is elevation, and $\psi_{\mathrm{asp}}$ is aspect.
+
+Terrain-aware distance:
+\begin{equation}
+  d(\mathbf{x},\mathbf{x}') =
+    \norm{\mathbf{x}_{1:2}-\mathbf{x}'_{1:2}}
+    + \alpha|z-z'|
+    + \beta\min\!\bigl(|\psi-\psi'|,\;360^\circ-|\psi-\psi'|\bigr).
+  \label{eq:tdist}
+\end{equation}
+
+Mat\'{e}rn $\nu=3/2$ kernel:
+\begin{align}
+  u &= \sqrt{3}\,d/\ell,\label{eq:matern_u}\\
+  k(\mathbf{x},\mathbf{x}') &= C\,(1+u)\,e^{-u},\label{eq:matern}
+\end{align}
+with amplitude $C$ and length scale $\ell$ optimised per-variable.
+
+\subsection{GP posterior}
+
+Given $n$ training points $\{(\mathbf{x}_i,y_i)\}$ with residuals
+$\tilde{y}_i = y_i - \mu_{\mathrm{prior}}(\mathbf{x}_i)$:
+\begin{align}
+  \mathbf{K}_{**} + \mathbf{R} &= \mathbf{L}\mathbf{L}^\top,\quad
+    R_{ii} = \sigma_{\mathrm{obs},i}^2,\label{eq:chol}\\
+  \hat{\mu}(\mathbf{x}) &= \mu_{\mathrm{prior}} +
+    \mathbf{k}_*^\top(\mathbf{L}^\top)^{-1}\mathbf{L}^{-1}\tilde{\mathbf{y}},\label{eq:gpmean}\\
+  \hat{\sigma}^2(\mathbf{x}) &= k(\mathbf{x},\mathbf{x}) -
+    \mathbf{k}_*^\top(\mathbf{L}^\top)^{-1}\mathbf{L}^{-1}\mathbf{k}_*,\label{eq:gpvar}
+\end{align}
+where $\mathbf{k}_* = [k(\mathbf{x},\mathbf{x}_i)]_i$.
+
+Wind direction is modelled with a circular GP: residuals are computed
+on the $\sin/\cos$ representation and the circular mean is
+reconstructed via $\operatorname{atan2}$.
+
+\subsection{Nelson FMC prior mean}
+
+The GP prior mean $\mu_{\mathrm{prior}}$ for FMC is the Nelson (2000)
+equilibrium moisture content, which depends on relative humidity~$H$
+(fraction), ambient temperature $T$~($^\circ$C), elevation $z$, and
+hour of day.
+
+\textbf{Fosberg-Deeming three-segment EMC:}
+\begin{equation}
+  \mathrm{EMC}(\%) =
+  \begin{cases}
+    0.03229 + 0.281073H' - 0.000578H'T &H'\!<10,\\
+    2.22749 + 0.160107H' - 0.01478T    &10\le H'\!<50,\\
+    21.0606 + 0.005565H'^2 - 0.00035H'T - 0.00199T &H'\!\ge50,
+  \end{cases}\label{eq:emc}
+\end{equation}
+where $H'=100H$.
+
+\textbf{Lapse-rate correction} ($\Gamma_L=-0.0065$~$^\circ$C/m):
+\begin{equation}
+  T_{\mathrm{loc}} = T - \Gamma_L(z-z_{\mathrm{ref}}).\label{eq:lapse}
+\end{equation}
+
+\textbf{Solar drying} uses the cosine of incidence angle:
+\begin{align}
+  \cos\iota &= \sin\!\alpha_\odot\cos\alpha_s
+               + \cos\!\alpha_\odot\sin\alpha_s\cos(\psi_\odot-\psi_s),
+  \label{eq:cosinc}
+\end{align}
+where $\alpha_\odot$ is solar elevation, $\alpha_s$ is terrain slope,
+and $\psi_\odot,\psi_s$ are solar and slope azimuths.
+
+Canopy attenuation follows Beer--Lambert:
+\begin{equation}
+  \tau = e^{-\kappa\,c_c},\label{eq:beerlambert}
+\end{equation}
+where $c_c$ is fractional canopy cover and $\kappa$ is an extinction
+coefficient.  The final FMC prior is:
+\begin{equation}
+  m_{\mathrm{prior}} = \mathrm{EMC}\times
+    (1 - w_\odot\,\cos\iota\,\tau)\times\mathrm{elev\_factor},\label{eq:fmcprior}
+\end{equation}
+clipped to $[m_{\min},m_{\max}]$.
+
+%====================================================================
+\section{Ensemble Kalman Filter}
+\label{sec:enkf}
+
+Drone observations are assimilated into the GP via an ensemble Kalman
+filter (EnKF) operating on the GP state (FMC, wind speed, wind direction).
+
+\subsection{Observation aggregation}
+
+Multiple observations at nearby locations are precision-weighted:
+\begin{align}
+  \hat{m}_{\mathrm{agg}} &=
+    \frac{\sum_i \sigma_{m,i}^{-2}\,m_i}{\sum_i \sigma_{m,i}^{-2}},\quad
+  \hat{\sigma}_{\mathrm{agg}} = \Bigl(\sum_i\sigma_{m,i}^{-2}\Bigr)^{-1/2}.
+  \label{eq:wm}
+\end{align}
+Wind direction uses circular precision weighting:
+\begin{align}
+  \bar{s} &= \frac{\sum_i w_i\sin d_i}{\sum_i w_i},\quad
+  \bar{c} = \frac{\sum_i w_i\cos d_i}{\sum_i w_i},\notag\\
+  \hat{d}_{\mathrm{agg}} &= \operatorname{atan2}(\bar{s},\bar{c})\mod360^\circ.
+  \label{eq:circmean}
+\end{align}
+
+\subsection{EnKF update}
+
+Let $\mathbf{X}\in\R^{N\times D}$ be the GP state ensemble,
+$\mathbf{y}\in\R^p$ the observation vector, and
+$\mathbf{H}\in\R^{p\times D}$ the linear observation operator (index
+gather at observed cells).
+
+\textbf{Covariance inflation:}
+\begin{equation}
+  \mathbf{A} = \lambda(\mathbf{X}-\bar{\mathbf{X}}),\quad
+  \mathbf{X}_{\mathrm{inf}} = \bar{\mathbf{X}} + \mathbf{A},
+  \label{eq:inflation}
+\end{equation}
+where $\lambda>1$ is the inflation factor.
+
+\textbf{Ensemble covariances:}
+\begin{align}
+  \mathbf{PH}^\top &= \frac{\mathbf{A}^\top(\mathbf{HA})}{N-1},\label{eq:pht}\\
+  \mathbf{HPH}^\top &= \frac{(\mathbf{HA})^\top(\mathbf{HA})}{N-1},\label{eq:hpht}\\
+  \mathbf{K} &= \mathbf{PH}^\top(\mathbf{HPH}^\top+\mathbf{R})^{-1},\label{eq:K}
+\end{align}
+where $\mathbf{R}=\mathrm{diag}(\sigma_{\mathrm{obs},1}^2,\ldots)$.
+
+\textbf{Gaspari--Cohn localisation:}
+\begin{equation}
+  K_{ij} \leftarrow K_{ij}\,\rho\!\bigl(d(i,j)/r_{\mathrm{loc}}\bigr),\label{eq:gc}
+\end{equation}
+where $\rho$ is the Gaspari--Cohn taper function and $r_{\mathrm{loc}}$ is
+the localisation radius.
+
+\textbf{Perturbed-observations update:}
+\begin{align}
+  \boldsymbol{\varepsilon}^{(n)} &\sim \mathcal{N}(\mathbf{0},\mathbf{R}),\notag\\
+  \mathbf{x}^{(n)\prime} &= \mathbf{x}_{\mathrm{inf}}^{(n)} +
+    \mathbf{K}\bigl(\mathbf{y}+\boldsymbol{\varepsilon}^{(n)}-
+    \mathbf{H}\mathbf{x}_{\mathrm{inf}}^{(n)}\bigr).\label{eq:enkfupdate}
+\end{align}
+The updated ensemble is used to refit the GP for the next cycle.
+
+%====================================================================
+\section{Information Field}
+\label{sec:information}
+
+The information field $w(r,c)$ quantifies the expected utility of
+a drone observation at cell $(r,c)$.
+
+\subsection{Binary entropy}
+
+\begin{equation}
+  H(p) = -(p\log_2 p + (1-p)\log_2(1-p)),\quad
+  p\in(0,1),\label{eq:Hbin}
+\end{equation}
+with $H(0)=H(1)=0$ and $H(0.5)=1$.
+
+\subsection{Bimodality score}
+
+The burn probability $p_b(r,c)=N^{-1}\sum_n\mathbbm{1}[T^{(n)}<T_0]$
+(with $T_0=2T_{\mathrm{hor}}$ the unburned sentinel threshold)
+measures ensemble spread about the ignition/non-ignition boundary:
+\begin{equation}
+  b(r,c) = H\!\bigl(p_b(r,c)\bigr).\label{eq:bimodal}
+\end{equation}
+
+\subsection{Sensitivity to environmental variables}
+
+Let $\mathbf{a}^{(n)}\in\R^D$ be the flattened arrival times for
+member $n$, and $\mathbf{p}^{(n)}$ a perturbation field (FMC, wind
+speed, or wind direction).  The pointwise Pearson correlation is:
+\begin{equation}
+  \rho_{\mathrm{sens}}(r,c) = \frac{\mathrm{Cov}(a_{r,c},p_{r,c})}
+    {\sigma_a(r,c)\,\sigma_p(r,c)+\varepsilon}.\label{eq:sens}
+\end{equation}
+
+\subsection{Observability degradation}
+
+Sensor performance degrades near an active fire front.  Define the
+perimeter mask $\mathcal{P}=\{(r,c): p_{\mathrm{lo}}<p_b<p_{\mathrm{hi}}\}$.
+Then:
+\begin{align}
+  d_{\mathcal{P}}(r,c) &= \Delta x\cdot\mathrm{EDT}(\sim\mathcal{P}),\notag\\
+  D(r,c) &= \min\!\bigl(d_{\mathcal{P}}(r,c)/\rho_{\mathrm{deg}},\;1\bigr),
+  \label{eq:obs}
+\end{align}
+where $\rho_{\mathrm{deg}}$ is the degradation radius.
+
+\subsection{Combined information value}
+
+\begin{align}
+  w(r,c) &= \hat{\sigma}^2_{m}\,|\rho_{\mathrm{sens},m}|\,D_m \notag\\
+          &\quad + \hat{\sigma}^2_{s}\,|\rho_{\mathrm{sens},s}|\,D_s \notag\\
+          &\quad + \alpha_b\,b(r,c) \notag\\
+          &\quad + \alpha_c\,H\!\bigl(p_{\mathrm{crown}}(r,c)\bigr),\label{eq:w}
+\end{align}
+where $\alpha_b,\alpha_c\ge0$ are weighting coefficients and
+$p_{\mathrm{crown}}=N^{-1}\sum_n\mathbbm{1}[\text{type}^{(n)}=\text{crown}]$.
+Non-burnable cells (water, urban, rock; SB40 codes $\{91$--$99\}$) are
+masked to zero before path planning.
+
+%====================================================================
+\section{Information-Theoretic Drone Path Planning}
+\label{sec:planning}
+
+\subsection{Domain decomposition}
+
+The grid is partitioned into correlated domains via Felzenszwalb
+graph-based segmentation applied to normalised terrain features
+(elevation~$1.0$, slope~$0.5$, aspect~$1.5\times$, fuel~$2.0$,
+canopy~$0.8$):
+\begin{equation}
+  \mathcal{D} = \mathrm{Felzenszwalb}\!\bigl(\mathbf{F},
+    \lambda_s,\sigma_{\mathrm{blur}},n_{\min}\bigr),\label{eq:seg}
+\end{equation}
+where $\lambda_s=L_c/(2\Delta x)$, $\sigma_{\mathrm{blur}}=0.8$, and
+$n_{\min}$ is the minimum domain size in cells.
+
+Each domain $d\in\mathcal{D}$ has a representative cell
+$c^*(d)=\arg\max_{(r,c)\in d}\,w(r,c)$.
+
+\subsection{Domain graph}
+
+An edge between adjacent domains $(d_i,d_j)$ is weighted by:
+\begin{align}
+  \ell_{ij} &= \norm{c^*(d_i)-c^*(d_j)}\,\Delta x\quad\text{[m]},\label{eq:edgelen}\\
+  \rho_{ij} &= \exp\!\bigl(-\norm{\mathbf{f}_{i}-\mathbf{f}_{j}}\bigr)
+              \quad\text{(cross-correlation proxy)},\label{eq:rho}
+\end{align}
+where $\mathbf{f}_i$ is the normalised feature vector at $c^*(d_i)$.
+
+Single-source Dijkstra from the staging area gives the minimum-distance
+path $\ell^*(d)$ to each domain.
+
+\subsection{Greedy orienteering}
+
+The drone starts at the staging area with range budget
+$B=v_{\mathrm{drone}}\,T_{\mathrm{end}}$~m.  At each step, the next
+domain is:
+\begin{equation}
+  d^* = \arg\max_{d\;\mathrm{unvisited}}
+    \frac{w(d)+g_{ij}}{\ell_{ij}+1},\label{eq:orient}
+\end{equation}
+subject to the \textit{return feasibility} constraint:
+\begin{equation}
+  \ell_{\mathrm{traveled}} + \ell_{ij} + \ell^*(d) + \ell_{\mathrm{safe}} \le B,
+  \label{eq:range}
+\end{equation}
+where $\ell_{\mathrm{safe}}$ is a 10\% safety buffer.
+
+\subsection{GP-conditioned greedy update}
+
+Within the first-cycle budget, each selected domain hypothetically
+reduces GP variance.  For domain $d_i$ just selected, the posterior
+variance at any other domain $d_j$ is updated via:
+\begin{equation}
+  \hat{\sigma}^{2\prime}(d_j) =
+    \hat{\sigma}^2(d_j) -
+    \frac{k(d_j,d_i)^2}{k(d_i,d_i)+\sigma^2_{\mathrm{sensor}}},\label{eq:gpupdate}
+\end{equation}
+and $w(d_j)$ is rescaled by $\hat{\sigma}^{2\prime}(d_j)/\hat{\sigma}^2(d_j)$.
+
+\subsection{Multi-drone deconfliction}
+
+For $K$ drones, domains already claimed by an earlier drone are
+removed from the feasible set.  Each drone plans sequentially on the
+residual information field, so the joint plan maximises:
+\begin{equation}
+  \max_{\pi_1,\ldots,\pi_K}\sum_{k=1}^K \sum_{d\in\pi_k} w'(d),\label{eq:joint}
+\end{equation}
+where $w'$ is updated after each drone plans.
+
+%====================================================================
+\section{Evaluation Metrics}
+\label{sec:eval}
+
+\subsection{Continuous Ranked Probability Score}
+
+Given ensemble members $\{x_1,\ldots,x_N\}$ and scalar truth $y$
+(both in minutes), the CRPS is:
+\begin{equation}
+  \mathrm{CRPS} = \E|X-y| - \tfrac{1}{2}\E|X-X'|,\label{eq:crps}
+\end{equation}
+computed via the sorted-member identity:
+\begin{align}
+  \E|X-y| &\approx \frac{1}{N}\sum_{n=1}^N|x_n-y|,\label{eq:crps1}\\
+  \tfrac{1}{2}\E|X-X'| &\approx
+    \frac{1}{N^2}\sum_{n=1}^N x_{(n)}(2n-N-1),\label{eq:crps2}
+\end{align}
+where $x_{(n)}$ are order statistics.  CRPS is averaged over cells
+burned within the planning horizon.
+
+\subsection{Spread-skill ratio}
+
+\begin{equation}
+  \mathrm{SSR} = \frac{\sqrt{\overline{\sigma^2_T}}}
+                      {\max(\mathrm{RMSE}_{\bar{T}},\,\varepsilon)},
+  \label{eq:ssr}
+\end{equation}
+where $\overline{\sigma^2_T}$ is the mean ensemble variance and
+$\mathrm{RMSE}_{\bar{T}}$ is the RMSE of the ensemble mean against
+ground truth.  $\mathrm{SSR}\approx1$ indicates a calibrated ensemble.
+
+\subsection{Placement Error Rate (PERR)}
+
+\begin{equation}
+  \mathrm{PERR} = 1 -
+    \frac{|\mathcal{S}_{\mathrm{pred}}\cap\mathcal{S}_{\mathrm{opt}}|}
+         {|\mathcal{S}_{\mathrm{pred}}\cup\mathcal{S}_{\mathrm{opt}}|},
+  \label{eq:perr}
+\end{equation}
+the Jaccard distance between predicted and oracle-optimal waypoint
+sets.
+
+%====================================================================
+\section{Notation Summary}
+
+\begin{table}[h]
+\centering\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+Symbol & Description & Units \\
+\midrule
+$\Delta x$ & Grid resolution & m \\
+$\phi$ & Signed-distance field & m \\
+$R_{\mathrm{head}}$ & Head-fire ROS & m/s \\
+$I_R$ & Reaction intensity & kW/m$^2$ \\
+$\phi_w,\phi_s$ & Wind/slope amplification & -- \\
+$e$ & Ellipse eccentricity & -- \\
+$T^{(n)}$ & Member arrival time & min \\
+$p_b$ & Burn probability & -- \\
+$w$ & Information value & -- \\
+$\mathbf{K}$ & Kalman gain & -- \\
+$\ell$ & GP length scale & m \\
+$\mathrm{CRPS}$ & Continuous ranked probability score & min \\
+$\mathrm{SSR}$ & Spread-skill ratio & -- \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+%====================================================================
+\section*{References}
+
+\begin{enumerate}\small
+  \item Rothermel, R.C. (1972). \textit{A Mathematical Model for
+        Predicting Fire Spread in Wildland Fuels}. USDA Forest
+        Service Research Paper INT-115.
+  \item Van Wagner, C.E. (1977). Conditions for the start and spread
+        of crown fire. \textit{Canadian Journal of Forest Research},
+        7(1), 23--34.
+  \item Anderson, H.E. (1983). \textit{Predicting Wind-Driven Wild Land
+        Fire Size and Shape}. USDA Forest Service Research Paper
+        INT-305.
+  \item Sussman, M., Smereka, P., \& Osher, S. (1994). A level set
+        approach for computing solutions to incompressible two-phase
+        flow. \textit{Journal of Computational Physics}, 114(1),
+        146--159.
+  \item Evensen, G. (1994). Sequential data assimilation with a
+        nonlinear quasi-geostrophic model using Monte Carlo methods.
+        \textit{Journal of Geophysical Research: Oceans},
+        99(C5), 10143--10162.
+  \item Nelson, R.M. (2000). Prediction of diurnal change in
+        10-h fuel stick moisture content. \textit{Canadian Journal
+        of Forest Research}, 30(7), 1071--1087.
+  \item Gaspari, G., \& Cohn, S.E. (1999). Construction of
+        correlation functions in two and three dimensions.
+        \textit{Quarterly Journal of the Royal Meteorological
+        Society}, 125(554), 723--757.
+  \item Scott, J.H., \& Burgan, R.E. (2005). \textit{Standard Fire
+        Behavior Fuel Models: a Comprehensive Set for Use with
+        Rothermel's Surface Fire Spread Model}. USDA Forest Service
+        General Technical Report RMRS-GTR-153.
+\end{enumerate}
+
+\end{document}
