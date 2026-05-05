@@ -67,11 +67,13 @@ from .drone_sim import (
     NoiseConfig,
     assign_waypoints,
     cell_to_pos_m,
+    collect_fire_observation,
     collect_observations,
     move_drone,
 )
 from .evaluator import CounterfactualEvaluator, compute_arrival_accuracy
 from .ground_truth import GroundTruth, compute_wind_field
+from angrybird.prior import SimulatedEnvironmentalSource
 from .observation_buffer import ObservationBuffer, thin_observations
 from angrybird.assimilation import aggregate_drone_observations
 from angrybird.config import (
@@ -510,6 +512,25 @@ class CycleRunner:
             for name, sel in selection_results.items()
         }
 
+        # Enrich the primary strategy's evaluation with ground-truth accuracy metrics.
+        # The ensemble was built from the GP posterior that already incorporates all
+        # observations assimilated in previous cycles (pending obs from the prior cycle
+        # were fed to orchestrator.run_cycle() which updates the GP state).
+        if self.primary_strategy in evaluations:
+            horizon_s = self.horizon_min * 60.0
+            crps_min, rmse_min, spread_skill = compute_arrival_accuracy(
+                ensemble,
+                self.ground_truth.fire.arrival_times,
+                horizon_s=horizon_s,
+            )
+            if crps_min > 0.0 or rmse_min > 0.0:
+                evaluations[self.primary_strategy] = dc_replace(
+                    evaluations[self.primary_strategy],
+                    crps_minutes=crps_min,
+                    rmse_minutes=rmse_min,
+                    spread_skill_ratio=spread_skill,
+                )
+
         if self.primary_strategy in drone_plans_by_strategy:
             primary_cells: set[tuple[int, int]] = set()
             for plan in drone_plans_by_strategy[self.primary_strategy]:
@@ -731,6 +752,28 @@ class SimulationRunner:
         )
         self.renderer._initial_gp_var_sum = self._prev_gp_var_sum
 
+        # Wire the simulated sensor source as the orchestrator's environmental data source.
+        # Produces frequency-gated, noisy NWP weather/wind and satellite FMC prior fields.
+        # Also provides collect_obs_store_inputs() for fire-detection + FMC GP observations.
+        orchestrator.data_source = SimulatedEnvironmentalSource(
+            ground_truth, rng=np.random.default_rng(99)
+        )
+
+        # Seed the obs_store with a high-confidence fire detection at the ignition
+        # location so the orchestrator can reconstruct initial fire state without oracle
+        # knowledge.  This represents the dispatch information (e.g. lookout report,
+        # initial alarm) that is always available at mission start — it is NOT oracle
+        # knowledge of the full fire perimeter.
+        from angrybird.observations import FireDetectionObservation as _FDO
+        for cell in ground_truth.ignition_cells:
+            orchestrator.obs_store.add(_FDO(
+                _source_id  = "ignition_report",
+                _timestamp  = 0.0,
+                location    = (int(cell[0]), int(cell[1])),
+                is_fire     = True,
+                confidence  = 0.99,
+            ))
+
         # Set a constant uninformed wind prior (5 m/s / 270° westerly) to:
         #   1. Activate circular arithmetic in fit() for wind direction.
         #   2. Ensure non-zero GP residuals (RAWS obs - prior ≠ 0) so the kernel
@@ -855,6 +898,21 @@ class SimulationRunner:
                     else:
                         self.obs_buffer.add(obs)
                         self._live_est.add_observations(obs)
+
+                    # Thermal camera: one fire detection per drone per timestep
+                    # from the nadir cell.  Bypasses the obs_buffer (which is for
+                    # FMC/wind thinning) and goes directly to obs_store so the
+                    # particle filter can read it at the next WISP cycle.
+                    fire_det = collect_fire_observation(
+                        drone=drone,
+                        fire_arrival_times=self.truth.fire.arrival_times,
+                        terrain_shape=self.terrain.shape,
+                        resolution_m=self.terrain.resolution_m,
+                        current_time=self.current_time,
+                        rng=rng,
+                    )
+                    if fire_det is not None:
+                        self.orchestrator.obs_store.add(fire_det)
             _step_buckets["drones"] += _time.perf_counter() - _t0
 
             # 4. Network step
@@ -1014,52 +1072,44 @@ class SimulationRunner:
         # (passed to get_data_points at fit time) so no update_time() needed.
         self.orchestrator.obs_store.prune(self.current_time)
 
-        fire_state = self.truth.fire.fire_state  # current burn mask (float32)
+        # Collect satellite/fire-detection observations from the simulated source and
+        # add them to the GP store before the cycle so the ensemble sees them.
+        # Ground truth fire state is used only here (for satellite pixel sampling),
+        # NOT passed to the orchestrator — fire state estimation is fully obs-driven.
+        data_source = self.orchestrator.data_source
+        if hasattr(data_source, "collect_obs_store_inputs"):
+            sat_obs = data_source.collect_obs_store_inputs(
+                self.current_time, self.truth.fire.fire_state
+            )
+            if sat_obs:
+                self.orchestrator.obs_store.add_batch(sat_obs)
 
-        # Build weather_source from ground truth so the dynamic prior uses the
-        # scenario's actual T/RH (not hardcoded defaults) to drive Nelson FMC and
-        # wind prior means.  In production this would come from an NWP forecast.
-        hour_of_day = (6.0 + self.current_time / 3600.0) % 24.0
-        lat = float(self.terrain.origin_latlon[0]) if self.terrain.origin_latlon else 37.5
-        weather_source = {
-            "temperature":    self.truth.temperature_c,
-            "humidity":       self.truth.relative_humidity,
-            "wind_speed":     self.truth.wind_speed,      # float32[rows, cols], current
-            "wind_direction": self.truth.wind_direction,  # float32[rows, cols], current
-            "hour_local":     hour_of_day,
-            "latitude":       lat,
-            "source":         "ground_truth",
-        }
-
+        # No fire_state argument — orchestrator derives fire state from obs_store
+        # (drone thermal detections + GOES/VIIRS satellite passes).
         mission_queue, cycle_report = self.orchestrator.run_cycle(
-            fire_state=fire_state,
             observations=observations,
             start_time=self.current_time,
-            weather_source=weather_source,
         )
 
         # Cache cycle-level outputs for the renderer (info field, targets)
         shape = self.terrain.shape
         self._gp_prior = self.orchestrator.gp.predict(shape)
-        self._burn_probability = (
-            self.orchestrator.fire_engine.run(
-                self.terrain, self._gp_prior, fire_state,
-                self.orchestrator.n_members,
-                self.orchestrator.horizon_min,
-                np.random.default_rng(len(self.cycle_reports)),
-            ).burn_probability
-            if hasattr(self.orchestrator, "fire_engine")
-            else None
-        )
+        # Use last ensemble result for burn probability if available.
+        cycle_ensemble = getattr(self.orchestrator, "_last_ensemble_result", None)
+        if cycle_ensemble is not None:
+            self._burn_probability = cycle_ensemble.burn_probability
+            self._last_ensemble    = cycle_ensemble
+        else:
+            self._burn_probability = None
 
         targets = self.orchestrator._previous_selections
         self._mission_targets = list(targets)
         self._drone_plans = list(self.orchestrator._drone_plans)
-        self._last_ensemble = self.orchestrator._last_ensemble_result
 
         # Arrival time accuracy against oracle ground truth.
-        # Computed here (not in CounterfactualEvaluator) because only the runner
-        # has access to truth.fire.arrival_times.
+        # Always uses the ensemble from THIS cycle (post-assimilation GP),
+        # including cycle 0 where the GP is seeded by RAWS only.
+        # compute_arrival_accuracy returns (0, 0, 0) if no cells have burned yet.
         crps_min = rmse_min = spread_skill = 0.0
         if self._last_ensemble is not None:
             horizon_s = self.orchestrator.horizon_min * 60.0

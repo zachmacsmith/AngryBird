@@ -3,7 +3,7 @@ Frame renderer: produces the simulation video or PNG frame sequence.
 
 Phase 4b — simulation harness only.
 
-Layout (7-panel + header):
+Layout (6-panel + 2 metric strips + header):
 
   ┌───────────────────────────────────────────────────────────────────┐
   │  SIMULATION TIME  |  CYCLE  |  OBSERVATIONS  |  LIVE UPDATES ▲   │
@@ -12,9 +12,10 @@ Layout (7-panel + header):
   │ True FMC     │ Est. FMC     │ TIME            │ GP uncertainty    │
   │ True wind    │ Est. wind    │ (single-member  │ + drone targets   │
   │ True fire    │ (per-obs)    │  per-obs)       │ (per WISP cycle) │
-  ├──────────────┴──────────────┴─────────────────┴───────────────────┤
-  │  ENTROPY CONVERGENCE  (running plot, all strategies)              │
-  └───────────────────────────────────────────────────────────────────┘
+  ├──────────────────────────┬──────────────────────────────────────┤
+  │  GP VARIANCE CONVERGENCE │  PREDICTION ACCURACY (CRPS / RMSE)  │
+  │  (RAWS + drone obs)      │  ensemble vs oracle fire arrival     │
+  └──────────────────────────┴──────────────────────────────────────┘
 
 Panels 2 and 3 update live: every render frame reflects the latest drone
 observations, NOT just the 20-minute WISP cycle boundary.  Panel 4 still
@@ -414,7 +415,7 @@ class FrameRenderer:
         # as observations arrive through the network, not just at cycle boundaries.
         self._live_gp_trace: list[tuple[float, float]] = []
 
-        # Build figure — 4 map panels + entropy strip
+        # Build figure — 4 map panels + GP variance strip + accuracy strip
         self.fig = plt.figure(figsize=figsize)
         gs = gridspec.GridSpec(
             2, 4,
@@ -426,7 +427,8 @@ class FrameRenderer:
         ax_est     = self.fig.add_subplot(gs[0, 1])
         ax_arrival = self.fig.add_subplot(gs[0, 2])
         ax_info    = self.fig.add_subplot(gs[0, 3])
-        self.ax_entropy = self.fig.add_subplot(gs[1, :])
+        self.ax_entropy  = self.fig.add_subplot(gs[1, :2])  # left: GP variance
+        self.ax_accuracy = self.fig.add_subplot(gs[1, 2:])  # right: CRPS/RMSE
 
         self.panels = {
             "truth":   MapPanel(ax_truth,   terrain, "Ground Truth: FMC + Wind + Fire"),
@@ -541,6 +543,7 @@ class FrameRenderer:
             self._live_gp_trace.append((time_s / 60.0, live_var))
 
         self._update_entropy(cycle_reports or [], time_s)
+        self._update_accuracy(cycle_reports or [])
 
         # ── Save frame ────────────────────────────────────────────────────
         frame_path = self.out_dir / f"frame_{self._frame_count:05d}.png"
@@ -602,6 +605,74 @@ class FrameRenderer:
 
         if any_plotted:
             ax.legend(fontsize=6, loc="upper right")
+
+    def _update_accuracy(self, reports: list[CycleReport]) -> None:
+        """
+        Right bottom strip — prediction accuracy vs oracle ground truth.
+
+        Plots CRPS and RMSE (minutes, left y-axis) and spread-skill ratio
+        (dimensionless, right y-axis) for each completed WISP cycle.
+
+        Both metrics come from the primary strategy's StrategyEvaluation
+        (populated by compute_arrival_accuracy in the runner).
+        Spread-skill ≈ 1.0 means the ensemble spread correctly predicts the
+        magnitude of the errors — dashed reference line drawn at 1.0.
+        """
+        ax = self.ax_accuracy
+        ax.clear()
+        ax.set_title(
+            "Prediction Accuracy vs Oracle (per WISP Cycle)",
+            fontsize=8, fontweight="bold",
+        )
+        ax.set_xlabel("Simulation Time (min)", fontsize=7)
+        ax.set_ylabel("Error (minutes)", fontsize=7)
+        ax.tick_params(labelsize=6)
+        ax.grid(True, alpha=0.3)
+
+        # Collect per-cycle accuracy metrics from the primary strategy evaluation.
+        # Falls back to any available strategy if "greedy" isn't present.
+        t_min_list: list[float] = []
+        crps_list:  list[float] = []
+        rmse_list:  list[float] = []
+        skill_list: list[float] = []
+
+        for r in reports:
+            if not r.evaluations:
+                continue
+            # Prefer primary strategy; fall back to first available
+            eval_ = r.evaluations.get("greedy") or next(iter(r.evaluations.values()))
+            if eval_.crps_minutes == 0.0 and eval_.rmse_minutes == 0.0:
+                continue  # metrics not yet computed (e.g. no fire burned cells)
+            t_min_list.append(r.start_time / 60.0)
+            crps_list.append(eval_.crps_minutes)
+            rmse_list.append(eval_.rmse_minutes)
+            skill_list.append(eval_.spread_skill_ratio)
+
+        if not t_min_list:
+            ax.text(0.5, 0.5, "Accuracy metrics\navailable once\nfire spreads",
+                    ha="center", va="center", transform=ax.transAxes,
+                    fontsize=7, color="#888888")
+            return
+
+        ax.plot(t_min_list, crps_list, "o-", color="#F44336", linewidth=1.5,
+                markersize=4, label="CRPS (↓ better)")
+        ax.plot(t_min_list, rmse_list, "s--", color="#FF9800", linewidth=1.2,
+                markersize=4, label="RMSE (ensemble mean)")
+
+        # Spread-skill on twin axis
+        ax2 = ax.twinx()
+        ax2.set_ylabel("Spread-skill ratio", fontsize=7, color="#2196F3")
+        ax2.tick_params(labelsize=6, colors="#2196F3")
+        ax2.plot(t_min_list, skill_list, "^:", color="#2196F3", linewidth=1.2,
+                 markersize=4, label="Spread-skill")
+        ax2.axhline(1.0, color="#2196F3", linestyle=":", linewidth=0.8, alpha=0.5,
+                    label="Ideal (1.0)")
+        ax2.set_ylim(bottom=0.0)
+
+        # Merge legends from both axes
+        lines1, labs1 = ax.get_legend_handles_labels()
+        lines2, labs2 = ax2.get_legend_handles_labels()
+        ax.legend(lines1 + lines2, labs1 + labs2, fontsize=6, loc="upper right")
 
     def finalize(self) -> None:
         """Close figure and optionally assemble video from PNG frames."""

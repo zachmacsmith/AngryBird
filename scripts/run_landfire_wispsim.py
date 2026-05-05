@@ -96,7 +96,7 @@ def find_ignition(terrain: TerrainData) -> tuple[int, int]:
 
 def main(
     cache_dir: str = "landfire_cache",
-    device: str = "cpu",
+    device: str = "mps",
     n_drones: int = 2,
     n_targets: int = 6,
     n_members: int = 20,
@@ -155,7 +155,7 @@ def main(
     log.info("Initialising GPUFireEngine (device=%s) …", device)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", RuntimeWarning)
-        fire_engine = GPUFireEngine(terrain, device=device)
+        fire_engine = GPUFireEngine(terrain, device=device, target_cfl=0.7)
     log.info("  Engine ready.")
 
     # ── Orchestrator ──────────────────────────────────────────────────────
@@ -248,7 +248,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="WISPsim on LANDFIRE terrain with GPU engine")
     parser.add_argument("--cache",   default="landfire_cache",
                         help="Path to LANDFIRE GeoTIFF cache directory (default: landfire_cache)")
-    parser.add_argument("--device",  default="cpu", choices=["cpu", "mps", "cuda"],
+    parser.add_argument("--device",  default="mps", choices=["cpu", "mps", "cuda"],
                         help="PyTorch device for GPUFireEngine (default: cpu)")
     parser.add_argument("--drones",  type=int, default=1,
                         help="Number of drones (default: 1)")
