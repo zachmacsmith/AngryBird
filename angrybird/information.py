@@ -140,8 +140,9 @@ def compute_sensitivity(
         std_P = np.where(std_P < 1e-10, 1e-10, std_P)
         # Use population mean (N denominator) to be consistent with std().
         # N-1 Bessel correction mixed with population std can push |corr| > 1.
-        cov = (A_c * P_c).mean(axis=0)                     # (D,) population cov
-        corr = np.clip(cov / (std_A * std_P), -1.0, 1.0)  # (D,) guaranteed in [-1, 1]
+        cov = (A_c * P_c).mean(axis=0)                              # (D,) population cov
+        corr = np.clip(cov / (std_A * std_P), -1.0, 1.0)           # (D,) guaranteed in [-1, 1]
+        corr = np.nan_to_num(corr, nan=0.0, posinf=0.0, neginf=0.0)  # guard any residual NaN
         return corr.reshape(rows, cols).astype(np.float32)
 
     # FMC perturbation = member field − prior mean
@@ -255,15 +256,24 @@ def compute_information_field(
     sensitivity = compute_sensitivity(ensemble, gp_prior, horizon_minutes)
     observability = compute_observability(ensemble, shape, resolution_m)
 
-    # Per-variable information maps
+    # Per-variable information maps.
+    # NaN-guard each GP variance field: ill-conditioned GP fits on large/heterogeneous
+    # grids (especially wind direction) can produce NaN posterior variances which would
+    # poison the entire w field.  Replace NaN/negative variance with 0 so those cells
+    # simply contribute nothing rather than collapsing the whole information field.
+    fmc_var  = np.nan_to_num(gp_prior.fmc_variance,  nan=0.0, posinf=0.0, neginf=0.0)
+    wind_var = np.nan_to_num(gp_prior.wind_speed_variance, nan=0.0, posinf=0.0, neginf=0.0)
+    fmc_var  = np.clip(fmc_var,  0.0, None)
+    wind_var = np.clip(wind_var, 0.0, None)
+
     w_fmc = (
-        gp_prior.fmc_variance
+        fmc_var
         * np.abs(sensitivity["fmc"])
         * observability["fmc"]
     ).astype(np.float32)
 
     w_wind = (
-        gp_prior.wind_speed_variance
+        wind_var
         * np.abs(sensitivity["wind_speed"])
         * observability["wind_speed"]
     ).astype(np.float32)
@@ -272,8 +282,10 @@ def compute_information_field(
 
     w_wind_dir: Optional[np.ndarray] = None
     if "wind_dir" in sensitivity:
+        wd_var = np.nan_to_num(gp_prior.wind_dir_variance, nan=0.0, posinf=0.0, neginf=0.0)
+        wd_var = np.clip(wd_var, 0.0, None)
         w_wind_dir = (
-            gp_prior.wind_dir_variance
+            wd_var
             * np.abs(sensitivity["wind_dir"])
             * observability["wind_dir"]
         ).astype(np.float32)

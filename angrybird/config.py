@@ -137,7 +137,7 @@ DRONE_SPEED_MS: float = 15.0                  # cruise speed m/s
 SENSOR_FMC_R2: float = 0.86                   # multispectral FMC measurement R²
 SENSOR_WIND_ACCURACY: float = 0.90            # anemometer baseline accuracy
 CAMERA_FOOTPRINT_CELLS: int = 1               # half-width of camera swath (cells each side)
-FIRE_DEGRADATION_RADIUS_M: float = 500.0      # sensor degrades within this distance of active fire
+FIRE_DEGRADATION_RADIUS_M: float = 75.0      # sensor degrades within this distance of active fire
 
 # ---------------------------------------------------------------------------
 # Observation noise (for simulated observer)
