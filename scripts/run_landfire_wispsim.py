@@ -97,7 +97,7 @@ def find_ignition(terrain: TerrainData) -> tuple[int, int]:
 def main(
     cache_dir: str = "landfire_cache",
     device: str = "cpu",
-    n_drones: int = 1,
+    n_drones: int = 2,
     n_targets: int = 6,
     n_members: int = 20,
     hours: float = 1.0,
@@ -197,8 +197,8 @@ def main(
         total_time_s=hours * 3600.0,
         ignis_cycle_interval_s=600.0,   # WISP every 10 min → 6 cycles/hour
         n_drones=n_drones,
-        drone_speed_ms=18.0,            # faster to cover the 249×322 grid
-        drone_endurance_s=2400.0,
+        drone_speed_ms=23.25,           # 52 mph → 23.25 m/s
+        drone_endurance_s=48462.0,      # 700 mi range @ 52 mph → 48 462 s
         camera_footprint_m=150.0,       # wider footprint for 100 m cells
         base_cell=base_cell,
         frame_interval=6,               # render every 60 s of sim time
@@ -206,6 +206,7 @@ def main(
         output_path=out_dir,
         scenario_name="landfire_1h",
         n_raws=2,
+        enable_mesh_network=False,      # instant delivery: obs added as made
     )
 
     # ── Run ───────────────────────────────────────────────────────────────

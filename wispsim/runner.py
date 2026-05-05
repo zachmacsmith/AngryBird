@@ -70,7 +70,7 @@ from .drone_sim import (
     collect_observations,
     move_drone,
 )
-from .evaluator import CounterfactualEvaluator
+from .evaluator import CounterfactualEvaluator, compute_arrival_accuracy
 from .ground_truth import GroundTruth, compute_wind_field
 from .observation_buffer import ObservationBuffer, thin_observations
 from angrybird.assimilation import aggregate_drone_observations
@@ -792,10 +792,17 @@ class SimulationRunner:
             n_steps,
         )
 
+        import time as _time
+        _step_buckets: dict[str, float] = {
+            "wind": 0.0, "fire_ca": 0.0, "drones": 0.0,
+            "network": 0.0, "wisp_cycle": 0.0, "live_est": 0.0, "render": 0.0,
+        }
+
         for step in range(n_steps):
             self.current_time = step * self.config.dt
 
             # 1. Update ground truth wind
+            _t0 = _time.perf_counter()
             ws, wd = compute_wind_field(
                 self.truth.base_wind_speed,
                 self.truth.base_wind_direction,
@@ -806,15 +813,20 @@ class SimulationRunner:
             )
             self.truth.wind_speed     = ws
             self.truth.wind_direction = wd
+            _step_buckets["wind"] += _time.perf_counter() - _t0
 
             # 2. Advance ground truth fire
+            _t0 = _time.perf_counter()
             self.truth.fire.step(
                 self.config.dt,
                 self.truth.wind_speed,
                 self.truth.wind_direction,
                 self.truth.fmc,
             )
+            _step_buckets["fire_ca"] += _time.perf_counter() - _t0
 
+            # 3. Move drones + collect observations
+            _t0 = _time.perf_counter()
             for drone in self.drones:
                 move_drone(drone, self.config.dt)
                 self._refuel_if_home(drone)
@@ -843,7 +855,10 @@ class SimulationRunner:
                     else:
                         self.obs_buffer.add(obs)
                         self._live_est.add_observations(obs)
+            _step_buckets["drones"] += _time.perf_counter() - _t0
 
+            # 4. Network step
+            _t0 = _time.perf_counter()
             if self.config.enable_mesh_network:
                 drone_positions = {}
 
@@ -878,16 +893,20 @@ class SimulationRunner:
                 if received_obs_this_step:
                     self.obs_buffer.add(received_obs_this_step)
                     self._live_est.add_observations(received_obs_this_step)
+            _step_buckets["network"] += _time.perf_counter() - _t0
 
             # 5. WISP cycle when due
+            _t0 = _time.perf_counter()
             if (self.current_time - self._last_cycle_time
                     >= self.config.ignis_cycle_interval_s):
                 self._run_ignis_cycle()
                 self._last_cycle_time = self.current_time
+            _step_buckets["wisp_cycle"] += _time.perf_counter() - _t0
 
             # 6. Update live estimate at render cadence
             #    Predict (refit if dirty) + 1 fire member — cheap enough to run
             #    every render frame (every frame_interval*dt seconds of sim time).
+            _t0 = _time.perf_counter()
             if step % self.config.frame_interval == 0:
                 fire_state = self.truth.fire.fire_state
                 self._live_gp_prior, self._live_arrival_times_h = (
@@ -918,8 +937,10 @@ class SimulationRunner:
                             )
                         except Exception:
                             pass  # fall back to last cycle's info field
+            _step_buckets["live_est"] += _time.perf_counter() - _t0
 
             # 7. Render frame
+            _t0 = _time.perf_counter()
             self.renderer.render_frame(
                 step=step,
                 time_s=self.current_time,
@@ -937,12 +958,25 @@ class SimulationRunner:
                 live_gp_prior=self._live_gp_prior,
                 live_arrival_times_h=self._live_arrival_times_h,
             )
+            _step_buckets["render"] += _time.perf_counter() - _t0
 
         self.renderer.finalize()
         logger.info(
             "SimulationRunner finished: %d WISP cycles | %d frames",
             len(self.cycle_reports),
             self.renderer._frame_count,
+        )
+
+        # ── Step-level timing summary ─────────────────────────────────────
+        total_wall = sum(_step_buckets.values())
+        logger.info(
+            "Step timing (total=%.1fs across %d steps):\n%s",
+            total_wall,
+            n_steps,
+            "\n".join(
+                f"  {k:12s}  {v:7.2f}s  ({100*v/max(total_wall,1e-9):5.1f}%)"
+                for k, v in sorted(_step_buckets.items(), key=lambda x: -x[1])
+            ),
         )
 
         if self.config.enable_mesh_network:
@@ -982,26 +1016,26 @@ class SimulationRunner:
 
         fire_state = self.truth.fire.fire_state  # current burn mask (float32)
 
-        # Update Nelson FMC prior mean for current time of day.
-        # Simulation clock starts at 06:00 local solar time by convention.
+        # Build weather_source from ground truth so the dynamic prior uses the
+        # scenario's actual T/RH (not hardcoded defaults) to drive Nelson FMC and
+        # wind prior means.  In production this would come from an NWP forecast.
         hour_of_day = (6.0 + self.current_time / 3600.0) % 24.0
-        if self.terrain.origin_latlon is not None:
-            lat = float(self.terrain.origin_latlon[0])
-        else:
-            lat = 37.5
-        nelson_field = nelson_fmc_field(
-            self.terrain,
-            T_C=NELSON_DEFAULT_T_C,
-            RH=NELSON_DEFAULT_RH,
-            hour_of_day=hour_of_day,
-            latitude_deg=lat,
-        )
-        self.orchestrator.gp.set_nelson_mean(nelson_field)
+        lat = float(self.terrain.origin_latlon[0]) if self.terrain.origin_latlon else 37.5
+        weather_source = {
+            "temperature":    self.truth.temperature_c,
+            "humidity":       self.truth.relative_humidity,
+            "wind_speed":     self.truth.wind_speed,      # float32[rows, cols], current
+            "wind_direction": self.truth.wind_direction,  # float32[rows, cols], current
+            "hour_local":     hour_of_day,
+            "latitude":       lat,
+            "source":         "ground_truth",
+        }
 
         mission_queue, cycle_report = self.orchestrator.run_cycle(
             fire_state=fire_state,
             observations=observations,
             start_time=self.current_time,
+            weather_source=weather_source,
         )
 
         # Cache cycle-level outputs for the renderer (info field, targets)
@@ -1023,10 +1057,18 @@ class SimulationRunner:
         self._drone_plans = list(self.orchestrator._drone_plans)
         self._last_ensemble = self.orchestrator._last_ensemble_result
 
-        # Mission-value metric: diff of info_field.w.sum() between cycles.
-        # w = gp_variance × |sensitivity| × observability — can INCREASE as fire
-        # spreads into new high-sensitivity cells, so is NOT a pure information-gain
-        # signal.  Use gp_var_reduction below for a monotonically-decreasing metric.
+        # Arrival time accuracy against oracle ground truth.
+        # Computed here (not in CounterfactualEvaluator) because only the runner
+        # has access to truth.fire.arrival_times.
+        crps_min = rmse_min = spread_skill = 0.0
+        if self._last_ensemble is not None:
+            horizon_s = self.orchestrator.horizon_min * 60.0
+            crps_min, rmse_min, spread_skill = compute_arrival_accuracy(
+                self._last_ensemble,
+                self.truth.fire.arrival_times,
+                horizon_s=horizon_s,
+            )
+
         evaluations: dict[str, StrategyEvaluation] = {}
 
         # Pure GP variance metric: sum of fmc_variance + wind_speed_variance.
@@ -1056,6 +1098,9 @@ class SimulationRunner:
                 gp_var_before=self._prev_gp_var_sum + gp_var_red,  # prev value
                 gp_var_after=curr_gp_var,
                 gp_var_reduction=gp_var_red,
+                crps_minutes=crps_min,
+                rmse_minutes=rmse_min,
+                spread_skill_ratio=spread_skill,
             )
 
         # CycleReport is frozen — use dataclasses.replace to attach evaluations.
@@ -1070,7 +1115,8 @@ class SimulationRunner:
 
         logger.info(
             "WISP cycle %d | t=%.0fs | obs=%d | info_w=%.2f | "
-            "mission_val_red=%.4f | gp_var=%.1f | gp_var_red=%.1f",
+            "mission_val_red=%.4f | gp_var=%.1f | gp_var_red=%.1f | "
+            "crps=%.2fmin | rmse=%.2fmin | spread_skill=%.2f",
             len(self.cycle_reports),
             self.current_time,
             len(observations),
@@ -1078,6 +1124,9 @@ class SimulationRunner:
             evaluations.get("greedy", StrategyEvaluation("greedy", [], 0., 0., 0., 0., [])).entropy_reduction,
             curr_gp_var,
             gp_var_red,
+            crps_min,
+            rmse_min,
+            spread_skill,
         )
 
     # ------------------------------------------------------------------
@@ -1087,12 +1136,13 @@ class SimulationRunner:
     def _assign_drone_waypoints(
         self, drone_plans: list[DronePlan]
     ) -> None:
-        """Assign full routed paths to idle drones from the orchestrator's DronePlans."""
-        available = [d for d in self.drones if d.status == "idle"]
-        for drone, plan in zip(available, drone_plans):
-            # waypoints = [staging, t1, t2, ..., staging]
-            # Skip the staging origin (drone is already there); include all
-            # targets and the return leg so the drone flies the full planned route.
+        """Override every drone's path with the new plan immediately.
+
+        New WISP cycle plans preempt whatever the drone is currently flying —
+        the drone drops its remaining waypoints and starts the new route from
+        its current position.
+        """
+        for drone, plan in zip(self.drones, drone_plans):
             path = plan.waypoints[1:] if len(plan.waypoints) > 1 else []
             if path:
                 assign_waypoints(drone, path, self.terrain.resolution_m)
