@@ -259,6 +259,13 @@ class LiveEstimator:
         stale.  On CUDA, Future.cancel() is a best-effort signal — if the
         worker has already started running, the result is simply discarded
         when the next collect attempt finds a fresh estimate has been queued.
+
+        NOTE: _cached_prior and _cached_arrival_times_h are intentionally
+        preserved here.  The renderer will show the previous cycle's estimate
+        for the one frame that coincides with the cycle boundary, rather than
+        flashing blank while the new async fire run completes.  The timer
+        reset below forces a fresh run on the very next compute_estimate call
+        so the display is updated within one render frame.
         """
         # Discard any in-flight run — it was seeded from the old GP snapshot.
         if self._pending_future is not None and not self._pending_future.done():
@@ -270,11 +277,15 @@ class LiveEstimator:
             min_spacing_m=OBSERVATION_THINNING_SPACING_M,
             resolution_m=self._terrain.resolution_m,
         )
-        self._has_obs                = False
-        self._cached_prior           = None
-        self._cached_arrival_times_h = None
-        # Force a fire re-run on the next compute_estimate call after a cycle.
-        self._last_fire_est_time     = -self._fire_update_interval_s
+        self._has_obs = False
+        # Invalidate the cached GP prior so the new posterior is used on the
+        # next predict() call, but keep _cached_arrival_times_h alive so the
+        # renderer has something to show on the cycle-boundary frame.
+        self._cached_prior = None
+        # Force a fire re-run on the next compute_estimate call after a cycle,
+        # but do NOT null _cached_arrival_times_h — the old estimate is still
+        # better than a blank frame for one render step.
+        self._last_fire_est_time = -self._fire_update_interval_s
 
     def add_observations(self, obs: list[DroneObservation]) -> None:
         """
@@ -334,7 +345,7 @@ class LiveEstimator:
             try:
                 result = self._pending_future.result()
                 self._cached_arrival_times_h = (
-                    result.member_arrival_times[0].astype(np.float32)
+                    (result.member_arrival_times[0].astype(np.float32) / 60.0) + (current_time / 3600.0)
                 )
                 self._last_fire_est_time = current_time
             except Exception as exc:
@@ -373,13 +384,27 @@ class LiveEstimator:
                 self._pending_future = self._backend.submit_fire_estimate(
                     _run_fire_est
                 )
+                # If we have absolutely no cached estimate (e.g. very first frame),
+                # block and wait for it so we don't render a blank frame.
+                if self._cached_arrival_times_h is None:
+                    try:
+                        result = self._pending_future.result()
+                        self._cached_arrival_times_h = (
+                            (result.member_arrival_times[0].astype(np.float32) / 60.0) + (current_time / 3600.0)
+                        )
+                        self._last_fire_est_time = current_time
+                    except Exception as exc:
+                        logger.warning("LiveEstimator first async fire run failed: %s", exc)
+                    finally:
+                        self._pending_future = None
+
             else:
                 # No backend supplied (e.g. CycleRunner / unit tests) — run
                 # blocking and store result directly.
                 try:
                     result = _run_fire_est()
                     self._cached_arrival_times_h = (
-                        result.member_arrival_times[0].astype(np.float32)
+                        (result.member_arrival_times[0].astype(np.float32) / 60.0) + (current_time / 3600.0)
                     )
                     self._last_fire_est_time = current_time
                 except Exception as exc:
@@ -866,6 +891,15 @@ class SimulationRunner:
         )
         self._live_gp_prior: Optional[GPPrior] = None
         self._live_arrival_times_h: Optional[np.ndarray] = None
+        # Oracle arrival times: fire-engine projection using true FMC/wind, same
+        # format as live_arrival_times_h so both panels are directly comparable.
+        self._truth_arrival_times_h: Optional[np.ndarray] = None
+        self._last_truth_est_time: float = -config.live_fire_update_interval_s
+        # Per-cycle metrics CSV: rows accumulated in _run_ignis_cycle, written at end.
+        self._cycle_metrics_rows: list[dict] = []
+        self._cumulative_obs: int = 0   # drone obs delivered to GP (excluding RAWS)
+        # Per-cycle accuracy trace for the renderer (WispSim-only; not stored in CycleReport).
+        self._accuracy_trace: list[dict] = []
         self.network_log_rows = []
 
     # ------------------------------------------------------------------
@@ -1030,6 +1064,39 @@ class SimulationRunner:
                         current_time=self.current_time,
                     )
                 )
+                # Oracle arrival time: same fire-engine projection as the estimate
+                # but seeded with the true FMC and wind fields instead of the GP
+                # posterior.  Uses the same update interval as the live estimate.
+                fire_engine = getattr(self.orchestrator, "fire_engine", None)
+                if (fire_engine is not None and (
+                    self._truth_arrival_times_h is None or
+                    (self.current_time - self._last_truth_est_time)
+                        >= self.config.live_fire_update_interval_s
+                )):
+                    try:
+                        _zero = np.zeros(self.terrain.shape, dtype=np.float32)
+                        _truth_prior = GPPrior(
+                            fmc_mean=self.truth.fmc.astype(np.float32),
+                            fmc_variance=_zero,
+                            wind_speed_mean=self.truth.wind_speed.astype(np.float32),
+                            wind_speed_variance=_zero,
+                            wind_dir_mean=self.truth.wind_direction.astype(np.float32),
+                            wind_dir_variance=_zero,
+                        )
+                        _truth_result = fire_engine.run(
+                            self.terrain, _truth_prior,
+                            fire_state.copy(),
+                            n_members=1,
+                            horizon_min=int(self._live_est.horizon_h * 60),
+                            rng=np.random.default_rng(step + 1),
+                        )
+                        self._truth_arrival_times_h = (
+                            _truth_result.member_arrival_times[0].astype(np.float32)
+                            / 60.0
+                        ) + (self.current_time / 3600.0)
+                        self._last_truth_est_time = self.current_time
+                    except Exception as _exc:
+                        logger.warning("Oracle fire estimate failed: %s", _exc)
                 # Recompute the info field only when the ensemble or GP prior has
                 # changed (i.e., just after a WISP cycle).  Between cycles the
                 # ensemble and prior are both constant, so the result is identical
@@ -1073,6 +1140,8 @@ class SimulationRunner:
                 cycle_reports=self.cycle_reports,
                 live_gp_prior=self._live_gp_prior,
                 live_arrival_times_h=self._live_arrival_times_h,
+                truth_arrival_times_h=self._truth_arrival_times_h,
+                accuracy_trace=self._accuracy_trace,
             )
             _step_buckets["render"] += _time.perf_counter() - _t0
 
@@ -1098,6 +1167,15 @@ class SimulationRunner:
         if self.config.enable_mesh_network:
             logger.info("Mesh network metrics: %s", self.network.get_metrics())
             logger.info("Final drone buffer sizes: %s", self.network.get_buffer_sizes())
+
+        # Write per-cycle metrics CSV (used by demo/compare_runs.py).
+        if self._cycle_metrics_rows:
+            metrics_csv = self.renderer.out_dir.parent / f"{self.config.scenario_name}_metrics.csv"
+            with open(metrics_csv, "w", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=self._cycle_metrics_rows[0].keys())
+                writer.writeheader()
+                writer.writerows(self._cycle_metrics_rows)
+            logger.info("Cycle metrics saved to %s", metrics_csv)
 
         if hasattr(self, "network_log_rows"):
             output_dir = Path("out")
@@ -1130,6 +1208,7 @@ class SimulationRunner:
     def _run_ignis_cycle(self) -> None:
         """Flush observation buffer, run orchestrator, dispatch drones."""
         observations = self.obs_buffer.flush_thinned()
+        self._cumulative_obs += len(observations)
 
         # Prune expired observations; temporal decay is query-time-parameterized
         # (passed to get_data_points at fit time) so no update_time() needed.
@@ -1172,15 +1251,59 @@ class SimulationRunner:
         # Arrival time accuracy against oracle ground truth.
         # Always uses the ensemble from THIS cycle (post-assimilation GP),
         # including cycle 0 where the GP is seeded by RAWS only.
-        # compute_arrival_accuracy returns (0, 0, 0) if no cells have burned yet.
+        # compute_arrival_accuracy returns (0, 0, 0) if no cells will burn in horizon.
+        horizon_s = self.orchestrator.horizon_min * 60.0
         crps_min = rmse_min = spread_skill = 0.0
         if self._last_ensemble is not None:
-            horizon_s = self.orchestrator.horizon_min * 60.0
             crps_min, rmse_min, spread_skill = compute_arrival_accuracy(
                 self._last_ensemble,
                 self.truth.fire.arrival_times,
                 horizon_s=horizon_s,
+                current_time_s=self.current_time,
             )
+
+        # Per-burning-cell CRPS: divide by the number of cells that will burn
+        # within the planning horizon from now.  Removes the confound where raw
+        # CRPS grows simply because the fire is larger; ideal value is 0.
+        _active_mask = (
+            (self.truth.fire.arrival_times >= self.current_time) &
+            ((self.truth.fire.arrival_times - self.current_time) < horizon_s) &
+            np.isfinite(self.truth.fire.arrival_times)
+        )
+        n_active_cells = int(_active_mask.sum())
+        crps_per_cell_min = crps_min / max(n_active_cells, 1)
+
+        # Oracle CRPS: 1-member fire run seeded with true FMC + wind (zero GP
+        # uncertainty).  Gives the irreducible model-error floor — the best CRPS
+        # achievable even with perfect observations.
+        oracle_crps_min = 0.0
+        _fire_engine = getattr(self.orchestrator, "fire_engine", None)
+        if _fire_engine is not None:
+            try:
+                _zero = np.zeros(self.terrain.shape, dtype=np.float32)
+                _oracle_prior = GPPrior(
+                    fmc_mean=self.truth.fmc.astype(np.float32),
+                    fmc_variance=_zero,
+                    wind_speed_mean=self.truth.wind_speed.astype(np.float32),
+                    wind_speed_variance=_zero,
+                    wind_dir_mean=self.truth.wind_direction.astype(np.float32),
+                    wind_dir_variance=_zero,
+                )
+                _oracle_result = _fire_engine.run(
+                    self.terrain, _oracle_prior,
+                    self.truth.fire.fire_state.copy(),
+                    n_members=1,
+                    horizon_min=self.orchestrator.horizon_min,
+                    rng=np.random.default_rng(0),
+                )
+                oracle_crps_min, _, _ = compute_arrival_accuracy(
+                    _oracle_result,
+                    self.truth.fire.arrival_times,
+                    horizon_s=horizon_s,
+                    current_time_s=self.current_time,
+                )
+            except Exception as _exc:
+                logger.warning("Oracle CRPS computation failed: %s", _exc)
 
         evaluations: dict[str, StrategyEvaluation] = {}
 
@@ -1214,11 +1337,39 @@ class SimulationRunner:
                 crps_minutes=crps_min,
                 rmse_minutes=rmse_min,
                 spread_skill_ratio=spread_skill,
+                oracle_crps_minutes=oracle_crps_min,
             )
 
         # CycleReport is frozen — use dataclasses.replace to attach evaluations.
         cycle_report = dc_replace(cycle_report, evaluations=evaluations)
         self.cycle_reports.append(cycle_report)
+
+        # Accumulate per-cycle metrics row for CSV export.
+        _n_cells = self.terrain.shape[0] * self.terrain.shape[1]
+        _n_burned = int((self.truth.fire.arrival_times < self.current_time).sum())
+        self._accuracy_trace.append({
+            "time_min":              round(self.current_time / 60.0, 3),
+            "crps_per_cell_minutes": round(crps_per_cell_min, 6),
+            "n_active_cells":        n_active_cells,
+        })
+        self._cycle_metrics_rows.append({
+            "scenario_name":         self.config.scenario_name,
+            "n_drones":              self.config.n_drones,
+            "cycle":                 len(self.cycle_reports),
+            "time_min":              round(self.current_time / 60.0, 3),
+            "n_obs_cumulative":      self._cumulative_obs,
+            "crps_minutes":          round(crps_min, 4),
+            "crps_per_cell_minutes": round(crps_per_cell_min, 6),
+            "n_active_cells":        n_active_cells,
+            "oracle_crps_minutes":   round(oracle_crps_min, 4),
+            "spread_skill":          round(spread_skill, 4),
+            "gp_var_fmc_mean":       round(float(self._gp_prior.fmc_variance.mean()), 6)
+                                     if self._gp_prior is not None else 0.0,
+            "gp_var_wind_mean":      round(float(self._gp_prior.wind_speed_variance.mean()), 6)
+                                     if self._gp_prior is not None else 0.0,
+            "n_burned_cells":        _n_burned,
+            "burn_fraction":         round(_n_burned / max(_n_cells, 1), 6),
+        })
 
         # Sync live estimator to the updated orchestrator GP state so the next
         # inter-cycle live estimate starts from the freshest posterior.
