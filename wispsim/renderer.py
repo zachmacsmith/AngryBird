@@ -254,19 +254,17 @@ class MapPanel:
                 color = _DRONE_COLORS[i % len(_DRONE_COLORS)]
                 rows_ = [wp[0] for wp in plan.waypoints]
                 cols_ = [wp[1] for wp in plan.waypoints]
-                # Path line
+                # Planned path: solid line, no waypoint markers — the line shows
+                # the intended trajectory clearly without cluttering the map.
                 ln, = ax.plot(cols_, rows_, "-", color=color,
-                              alpha=0.75, linewidth=1.4, zorder=10)
+                              alpha=0.90, linewidth=2.2, zorder=10)
                 self._dyn.append(ln)
-                # Waypoint markers (skip first staging origin, keep rest)
-                for j, (wr, wc) in enumerate(plan.waypoints[1:], start=1):
-                    is_return = j == len(plan.waypoints) - 1
-                    marker = "x" if is_return else "s"
-                    kw = dict(c=color, s=45, zorder=11, linewidths=0.8)
-                    if not is_return:
-                        kw["edgecolors"] = "white"
-                    sc = ax.scatter([wc], [wr], marker=marker, **kw)
-                    self._dyn.append(sc)
+                # Mark only the final endpoint with a small arrow/dot so the
+                # destination is visible without obscuring intermediate domains.
+                sc = ax.scatter([cols_[-1]], [rows_[-1]], marker=">",
+                                c=color, s=55, zorder=11,
+                                edgecolors="white", linewidths=0.8)
+                self._dyn.append(sc)
 
         # ── Drone positions + trails ──────────────────────────────────────
 
@@ -279,13 +277,13 @@ class MapPanel:
                                 edgecolors="white", linewidths=1.0)
                 self._dyn.append(sc)
 
-                trail = drone.path_history[-30:]
+                trail = drone.path_history[-60:]   # longer look-back
                 if len(trail) > 1:
                     cells = [pos_m_to_cell(p, resolution_m, shape) for p in trail]
                     ty = [c_[0] for c_ in cells]
                     tx_ = [c_[1] for c_ in cells]
-                    ln, = ax.plot(tx_, ty, "-", color=color, alpha=0.35,
-                                  linewidth=0.8, zorder=8)
+                    ln, = ax.plot(tx_, ty, "-", color=color, alpha=0.55,
+                                  linewidth=1.5, zorder=8)
                     self._dyn.append(ln)
 
 

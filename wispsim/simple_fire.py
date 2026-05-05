@@ -109,10 +109,24 @@ class SimpleFire:
         rows, cols = terrain.shape
         res        = terrain.resolution_m
 
-        ignition = fire_state.astype(bool)
+        # When the orchestrator uses obs-driven fire state estimation it passes
+        # initial_phi (N, rows, cols) signed-distance field instead of fire_state.
+        # SimpleFire doesn't support per-member level-set seeding, so collapse
+        # to a single 2D ignition mask: union of cells burned in ANY member.
+        if fire_state is None:
+            if initial_phi is not None:
+                phi = np.asarray(initial_phi)
+                if phi.ndim == 3:          # (N, rows, cols)
+                    ignition = (phi <= 0.0).any(axis=0).astype(bool)
+                else:                       # (rows, cols)
+                    ignition = (phi <= 0.0).astype(bool)
+            else:
+                ignition = np.zeros((rows, cols), dtype=bool)
+        else:
+            ignition = np.asarray(fire_state).astype(bool)
         if not ignition.any():
             ignition[rows // 2, cols // 2] = True
-        ig_r, ig_c = np.where(ignition)
+        ig_r, ig_c = np.where(ignition)  # always 2D now → always 2 arrays
 
         fuel_arr = np.vectorize(self._FUEL_SPREAD.get)(terrain.fuel_model, 1.0)
         fmc_std  = np.maximum(
