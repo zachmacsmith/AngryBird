@@ -278,8 +278,6 @@ def compute_information_field(
         * observability["wind_speed"]
     ).astype(np.float32)
 
-    w = w_fmc + w_wind
-
     w_wind_dir: Optional[np.ndarray] = None
     if "wind_dir" in sensitivity:
         wd_var = np.nan_to_num(gp_prior.wind_dir_variance, nan=0.0, posinf=0.0, neginf=0.0)
@@ -289,9 +287,36 @@ def compute_information_field(
             * np.abs(sensitivity["wind_dir"])
             * observability["wind_dir"]
         ).astype(np.float32)
-        w = (w + w_wind_dir).astype(np.float32)
 
-    # Bimodal entropy augmentation (Extended Fire Physics §3)
+    # ── Normalization (Fix 1) ──────────────────────────────────────────────
+    # The raw continuous terms (GP variance × sensitivity × observability) have
+    # magnitude ~0.001–0.05, while binary entropy is 0–1 by definition.  Without
+    # normalization, any bimodal_alpha > 0.05 causes entropy to completely dominate,
+    # making the 20-100× magnitude difference between terms determine weighting
+    # rather than the user-specified alphas.
+    #
+    # We normalise the continuous term to [0, 1] using its 99th-percentile value
+    # (robust to single outlier cells).  Binary/fire-state entropy is already [0,1]
+    # so alpha=0.5 genuinely means "at most half the peak continuous weight."
+    w_continuous = w_fmc + w_wind
+    if w_wind_dir is not None:
+        w_continuous = w_continuous + w_wind_dir
+
+    pos_vals = w_continuous[w_continuous > 0]
+    norm_scale = float(np.percentile(pos_vals, 99)) if pos_vals.size > 0 else 1.0
+    norm_scale = max(norm_scale, 1e-10)
+
+    w_fmc      = (w_fmc      / norm_scale).astype(np.float32)
+    w_wind     = (w_wind     / norm_scale).astype(np.float32)
+    if w_wind_dir is not None:
+        w_wind_dir = (w_wind_dir / norm_scale).astype(np.float32)
+    w = (w_continuous / norm_scale).astype(np.float32)
+    # ── End normalization ──────────────────────────────────────────────────
+
+    # Bimodal entropy augmentation — future burn uncertainty.
+    # Binary entropy of ensemble burn fraction: peaks at 0.5 (genuine disagreement
+    # about whether cell will burn in horizon), zero at 0 or 1 (consensus).
+    # Already [0,1] by definition; alpha controls weight relative to continuous term.
     max_arrival = _max_arrival_sentinel(horizon_minutes)
     if bimodal_alpha > 0.0:
         burn_frac, _ = detect_bimodality(ensemble.member_arrival_times, max_arrival)
@@ -301,9 +326,9 @@ def compute_information_field(
         crown_frac, _ = detect_regime_split(ensemble.member_fire_types)
         w = (w + bimodal_beta * _binary_entropy(crown_frac)).astype(np.float32)
 
-    # Fire location uncertainty (from EnsembleFireState per-member fronts)
-    # High entropy at cells where members disagree about current fire position.
-    # Drives drones to confirm fire perimeter when location is the key uncertainty.
+    # Current fire location uncertainty — diagnostic: where is the perimeter NOW?
+    # High entropy where ensemble members disagree about current fire boundary.
+    # After normalization, fire_state_alpha=0.3 gives 30% of peak continuous weight.
     if fire_state_alpha > 0.0 and fire_state_burn_prob is not None:
         w_fire_state = (fire_state_alpha * _binary_entropy(fire_state_burn_prob)).astype(np.float32)
         w = (w + w_fire_state).astype(np.float32)
@@ -331,14 +356,17 @@ def compute_information_field(
         if w_wind_dir is not None:
             w_wind_dir[exclusion_mask] = 0.0
 
+    # Sanitize gp_variance before exposing outside this function.
+    # gp_prior variances may contain NaN on ill-conditioned GP fits; downstream
+    # consumers (greedy selector, visualization) assume finite values.
     w_by_variable: dict[str, np.ndarray] = {"fmc": w_fmc, "wind_speed": w_wind}
     gp_variance: dict[str, np.ndarray] = {
-        "fmc": gp_prior.fmc_variance,
-        "wind_speed": gp_prior.wind_speed_variance,
+        "fmc":        np.nan_to_num(gp_prior.fmc_variance,        nan=0.0, posinf=0.0, neginf=0.0),
+        "wind_speed": np.nan_to_num(gp_prior.wind_speed_variance, nan=0.0, posinf=0.0, neginf=0.0),
     }
     if w_wind_dir is not None:
         w_by_variable["wind_dir"] = w_wind_dir
-        gp_variance["wind_dir"] = gp_prior.wind_dir_variance
+        gp_variance["wind_dir"] = np.nan_to_num(gp_prior.wind_dir_variance, nan=0.0, posinf=0.0, neginf=0.0)
 
     return InformationField(
         w=w,

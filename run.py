@@ -263,6 +263,90 @@ def cells_within_radius(
     return result if result else [centre]
 
 
+def crop_terrain(
+    terrain: TerrainData,
+    centre: tuple[int, int],
+    factor: float = 3.0,
+) -> tuple[TerrainData, tuple[int, int]]:
+    """
+    Return a cropped TerrainData whose shape is 1/factor of the original,
+    centred on `centre`.
+
+    Also returns the new (row, col) of `centre` in the cropped grid.
+    All terrain arrays are sliced; origin_latlon is adjusted to the new NW corner.
+    """
+    R, C    = terrain.shape
+    new_R   = max(10, int(R / factor))
+    new_C   = max(10, int(C / factor))
+    r0, c0  = centre
+
+    # Clamp the crop window to grid bounds
+    r_start = max(0, r0 - new_R // 2)
+    c_start = max(0, c0 - new_C // 2)
+    r_end   = min(R, r_start + new_R)
+    c_end   = min(C, c_start + new_C)
+    # Shift start back if we hit the far edge
+    r_start = max(0, r_end - new_R)
+    c_start = max(0, c_end - new_C)
+
+    def _sl(arr):
+        return arr[r_start:r_end, c_start:c_end]
+
+    # Adjust origin lat/lon to new NW corner
+    new_origin = None
+    if terrain.origin_latlon is not None:
+        orig_lat, orig_lon = terrain.origin_latlon
+        res = terrain.resolution_m
+        new_lat = orig_lat - r_start * res / 111_000.0
+        new_lon = orig_lon + c_start * res / (111_000.0 * math.cos(math.radians(orig_lat)))
+        new_origin = (new_lat, new_lon)
+
+    cropped = TerrainData(
+        elevation          = _sl(terrain.elevation),
+        slope              = _sl(terrain.slope),
+        aspect             = _sl(terrain.aspect),
+        fuel_model         = _sl(terrain.fuel_model),
+        canopy_cover       = _sl(terrain.canopy_cover)       if terrain.canopy_cover       is not None else None,
+        canopy_height      = _sl(terrain.canopy_height)      if terrain.canopy_height      is not None else None,
+        canopy_base_height = _sl(terrain.canopy_base_height) if terrain.canopy_base_height is not None else None,
+        canopy_bulk_density= _sl(terrain.canopy_bulk_density)if terrain.canopy_bulk_density is not None else None,
+        shape              = (r_end - r_start, c_end - c_start),
+        resolution_m       = terrain.resolution_m,
+        origin_latlon      = new_origin,
+    )
+    new_centre = (r0 - r_start, c0 - c_start)
+    return cropped, new_centre
+
+
+def random_ignition_cells(
+    centre: tuple[int, int],
+    n: int,
+    terrain: TerrainData,
+    rng: np.random.Generator,
+    min_radius_m: float = 200.0,
+) -> list[tuple[int, int]]:
+    """
+    Sample `n` random burnable cells around `centre` to use as simultaneous
+    ignition points.
+
+    The search radius expands in 100 m increments until at least `n` burnable
+    candidates exist, so the cluster is always as compact as the terrain allows.
+    Returns exactly `n` cells (or all available if the whole grid has fewer).
+    """
+    res    = terrain.resolution_m
+    radius = max(min_radius_m, math.sqrt(n / math.pi) * res * 1.5)
+
+    candidates: list[tuple[int, int]] = []
+    while len(candidates) < n:
+        candidates = cells_within_radius(centre, radius, terrain)
+        if len(candidates) >= n:
+            break
+        radius += res  # expand by one cell and retry
+
+    indices = rng.choice(len(candidates), size=min(n, len(candidates)), replace=False)
+    return [candidates[i] for i in indices]
+
+
 def make_gp(terrain: TerrainData) -> tuple[IGNISGPPrior, ObservationStore]:
     """Build a fresh GP + ObservationStore pair matched to terrain resolution."""
     decay_config = {
@@ -449,6 +533,35 @@ def main(args: argparse.Namespace) -> None:  # noqa: C901
             terrain.elevation[ignition_cell],
         )
 
+        # ── Terrain crop (optional) ───────────────────────────────────────
+        if args.crop_factor > 1.0:
+            terrain, ignition_cell = crop_terrain(terrain, ignition_cell, args.crop_factor)
+            R, C = terrain.shape
+            log.info(
+                "  Terrain cropped ×%.0f → %d×%d  (%.1f km × %.1f km)  "
+                "new ignition cell (%d, %d)",
+                args.crop_factor, R, C,
+                R * terrain.resolution_m / 1000,
+                C * terrain.resolution_m / 1000,
+                *ignition_cell,
+            )
+
+        # ── Multi-cell ignition (optional) ────────────────────────────────
+        rng_seed = np.random.default_rng(args.seed)
+        if args.ignition_cells > 1:
+            ignition_cells = random_ignition_cells(
+                centre    = ignition_cell,
+                n         = args.ignition_cells,
+                terrain   = terrain,
+                rng       = rng_seed,
+            )
+            log.info(
+                "  Multi-cell ignition: %d cells sampled around (%d, %d)",
+                len(ignition_cells), *ignition_cell,
+            )
+        else:
+            ignition_cells = [ignition_cell]
+
         # ── Ground truth (LANDFIRE mode) ──────────────────────────────────
         wind_events = []
         if args.wind_event_time_s is not None:
@@ -459,7 +572,6 @@ def main(args: argparse.Namespace) -> None:  # noqa: C901
                 ramp_duration_s  = args.wind_event_ramp_s,
             ))
         else:
-            # Default: a moderate wind shift at 30 min (matches prior landfire runs)
             wind_events = [
                 WindEvent(
                     time_s=1800.0,
@@ -470,14 +582,14 @@ def main(args: argparse.Namespace) -> None:  # noqa: C901
             ]
 
         ground_truth = generate_ground_truth(
-            terrain         = terrain,
-            ignition_cell   = ignition_cell,
-            base_fmc        = args.base_fmc,
-            base_ws         = args.wind_speed,
-            base_wd         = args.wind_direction,
-            wind_events     = wind_events,
-            seed            = args.seed,
-            temperature_c   = args.temperature,
+            terrain           = terrain,
+            ignition_cell     = ignition_cells if len(ignition_cells) > 1 else ignition_cells[0],
+            base_fmc          = args.base_fmc,
+            base_ws           = args.wind_speed,
+            base_wd           = args.wind_direction,
+            wind_events       = wind_events,
+            seed              = args.seed,
+            temperature_c     = args.temperature,
             relative_humidity = args.humidity,
         )
 
@@ -485,19 +597,26 @@ def main(args: argparse.Namespace) -> None:  # noqa: C901
     gp, obs_store = make_gp(terrain)
 
     # ── Seed fire observations BEFORE building the runner ─────────────────
-    n_seeded = seed_fire_report(
-        obs_store    = obs_store,
-        centre_cell  = ignition_cell,
-        terrain      = terrain,
-        radius_m     = args.fire_radius_m,
-        confidence   = args.fire_confidence,
-        timestamp    = 0.0,
-    )
+    # With multi-cell ignition each ignition cell is seeded individually.
+    total_seeded = 0
+    seed_centres = ignition_cells if not scenario_mode else [ignition_cell]
+    for sc in seed_centres:
+        total_seeded += seed_fire_report(
+            obs_store    = obs_store,
+            centre_cell  = sc,
+            terrain      = terrain,
+            radius_m     = args.fire_radius_m,
+            confidence   = args.fire_confidence,
+            timestamp    = 0.0,
+        )
     log.info(
         "  Seeded %d fire detection observation(s) in obs_store "
-        "(radius=%.0f m, confidence=%.2f)",
-        n_seeded, args.fire_radius_m, args.fire_confidence,
+        "(%d ignition point(s), radius=%.0f m, confidence=%.2f)",
+        total_seeded, len(seed_centres), args.fire_radius_m, args.fire_confidence,
     )
+
+    # Refresh shape in case terrain was cropped
+    R, C = terrain.shape
 
     # ── Fire engine ────────────────────────────────────────────────────────
     log.info("Initialising fire engine (device=%s) …", args.device)
@@ -534,8 +653,13 @@ def main(args: argparse.Namespace) -> None:  # noqa: C901
     )
 
     # ── Drone base ─────────────────────────────────────────────────────────
-    # 10% inset from the south (high row index) edge, centred column.
-    base_cell = (int(R * 0.90), C // 2)
+    # Place the staging area 25% of the grid height south of the primary
+    # ignition cell, clamped to [10%, 85%] of the grid so it stays well inside
+    # the map even after terrain cropping.
+    _ic_row = ignition_cell[0] if not scenario_mode else (R // 2)
+    _base_row = int(np.clip(_ic_row + R * 0.25, R * 0.10, R * 0.85))
+    base_cell = (_base_row, C // 2)
+    log.info("Staging area: cell (%d, %d)  [map is %d×%d]", *base_cell, R, C)
 
     # ── Orchestrator ───────────────────────────────────────────────────────
     orchestrator = IGNISOrchestrator(
@@ -649,6 +773,12 @@ def _build_parser() -> argparse.ArgumentParser:
                     help="Uncertainty radius around fire report (metres)")
     fg.add_argument("--fire-confidence", type=float, default=0.80,
                     help="Detection confidence for seeded fire observations [0, 1]")
+    fg.add_argument("--ignition-cells",  type=int,   default=1,
+                    help="Number of simultaneous ignition cells (randomly sampled "
+                         "around the fire report centre). 1 = single-point ignition.")
+    fg.add_argument("--crop-factor",     type=float, default=1.0,
+                    help="Crop terrain to 1/N of original size centred on the fire "
+                         "report. 3 = 1/3 size. 1 = no crop (default).")
 
     # ── Weather priors (LANDFIRE mode) ─────────────────────────────────────
     wg = p.add_argument_group("weather priors (LANDFIRE mode)")
@@ -706,8 +836,10 @@ def _build_parser() -> argparse.ArgumentParser:
 
     # ── Ensemble / selector ────────────────────────────────────────────────
     eg = p.add_argument_group("ensemble / selector")
-    eg.add_argument("--members",  type=int,   default=20,
-                    help="Ensemble size for GPUFireEngine")
+    eg.add_argument("--members",  type=int,   default=50,
+                    help="Ensemble size for GPUFireEngine (default 50; N<20 makes binary "
+                         "entropy noisy — single outlier member gives burn_prob=0.05 → "
+                         "entropy=0.29, comparable to genuine 50/50 split at N=200)")
     eg.add_argument("--selector", default="correlation_path",
                     choices=["correlation_path", "greedy", "uniform", "fire_front"],
                     help="Waypoint selection strategy")

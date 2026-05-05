@@ -133,7 +133,12 @@ class IGNISOrchestrator:
         resolution_m: float = GRID_RESOLUTION_M,
         base_seed: int = 0,
         bimodal_alpha: float = 0.5,
-        bimodal_beta: float = 0.3,
+        bimodal_beta: float = 0.0,   # DISABLED: member_fire_types is a static terrain
+                                      # crown-susceptibility map, not conditioned on fire
+                                      # reaching cells — its binary entropy contaminates
+                                      # ~50% of the domain with terrain noise unrelated
+                                      # to fire dynamics.  Re-enable only once crown fire
+                                      # is gated on burn_probability > 0 per cell.
         ground_stations: Optional[list[tuple[int, int]]] = None,
         data_source: Optional[EnvironmentalDataSource] = None,
     ) -> None:

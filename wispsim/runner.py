@@ -428,7 +428,7 @@ class CycleRunner:
         resolution_m: float = GRID_RESOLUTION_M,
         obs_source: Optional[ObservationSource] = None,
         bimodal_alpha: float = 0.5,
-        bimodal_beta: float = 0.3,
+        bimodal_beta: float = 0.0,   # disabled — see orchestrator.py comment
         nelson_T_C: float = NELSON_DEFAULT_T_C,
         nelson_RH: float = NELSON_DEFAULT_RH,
         nelson_hour: float = 14.0,

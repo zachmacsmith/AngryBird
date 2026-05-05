@@ -205,7 +205,11 @@ class DynamicPrior:
         """Confidence-weighted blend with existing Nelson FMC field."""
         mask = m.confidence > 0.3
         if self.nelson_fmc is None:
-            self.nelson_fmc = np.where(mask, m.fmc, np.nan).astype(np.float32)
+            # No Nelson field yet: use a physically sensible fallback (GP default dead
+            # FMC = 0.08) for low-confidence cells rather than NaN, which would
+            # propagate into the GP prediction and poison the information field.
+            _default_fmc = 0.08
+            self.nelson_fmc = np.where(mask, m.fmc, _default_fmc).astype(np.float32)
         else:
             self.nelson_fmc = np.where(
                 mask,
@@ -277,7 +281,13 @@ class DynamicPrior:
             )
             emc_fraction += 0.015 * np.clip(elev_norm, -2.0, 2.0)
 
-        nelson = np.clip(emc_fraction, 0.02, 0.40).astype(np.float32)
+        # Final guard: emc_fraction can carry NaN if T/RH contain NaN
+        # (e.g. from an external scalar that was np.nan). np.clip propagates NaN
+        # silently, so sanitize before storage.
+        nelson = np.clip(
+            np.nan_to_num(emc_fraction, nan=0.08, posinf=0.08, neginf=0.08),
+            0.02, 0.40,
+        ).astype(np.float32)
 
         # If satellite FMC was already blended in, preserve it; otherwise replace.
         self.nelson_fmc = nelson
