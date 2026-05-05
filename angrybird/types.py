@@ -3,8 +3,34 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Tuple, Optional
 import numpy as np
+
+
+class DroneMode(str, Enum):
+    """Operating mode for continuous-flight drone path planning (docs/Drone Path.md)."""
+    NORMAL    = "NORMAL"    # free exploration, budget = d_cycle
+    RETURN    = "RETURN"    # info-gathering with reachability invariant, target GS locked
+    EMERGENCY = "EMERGENCY" # direct flight to target GS, no optimisation
+
+
+@dataclass
+class DroneFlightState:
+    """
+    Persistent drone state across planning cycles within a single sortie.
+
+    A sortie runs from GS departure to GS landing.  On landing (returned=True),
+    the orchestrator resets battery and mode for the next sortie.
+    """
+    drone_id:           int
+    position_m:         np.ndarray   # (row_m, col_m) in grid-metres
+    remaining_range_m:  float        # battery state as metres of flight remaining
+    mode:               DroneMode
+    target_gs_idx:      int          # index into ground_stations list; -1 in NORMAL
+    visited_domains:    set          # set[int] domain IDs observed this sortie
+    sortie_distance_m:  float = 0.0  # cumulative distance flown this sortie
+    returned:           bool  = False # True when this cycle's plan ends at a GS
 
 
 @dataclass(frozen=True)
@@ -74,6 +100,7 @@ class PathSelectionResult:
     compute_time_s: float
     total_info: float
     marginal_gains: list[float]       # per-drone info contribution
+    updated_drone_states: Optional[list] = None  # list[DroneFlightState]; set by mode planner
 
 
 @dataclass(frozen=True)
@@ -108,6 +135,8 @@ class DronePlan:
     drone_id: int
     waypoints: list[tuple[int, int]]   # ordered (row, col) grid indices
     cells_observed: list[tuple[int, int]]  # all cells overflown (including path)
+    plan_distance_m: float = 0.0       # total flight distance for this plan
+    drone_mode: str = "NORMAL"         # DroneMode value used when this plan was made
 
 
 @dataclass(frozen=True)
@@ -125,6 +154,11 @@ class StrategyEvaluation:
     gp_var_before: float = 0.0
     gp_var_after: float = 0.0
     gp_var_reduction: float = 0.0
+    # Ground-truth arrival time accuracy metrics (only populated by SimulationRunner,
+    # which has access to oracle arrival times; CounterfactualEvaluator leaves these 0).
+    crps_minutes: float = 0.0        # proper scoring rule over full ensemble distribution
+    rmse_minutes: float = 0.0        # RMSE of ensemble mean vs ground truth
+    spread_skill_ratio: float = 0.0  # sqrt(mean variance) / RMSE; ~1.0 = well-calibrated
 
 
 @dataclass(frozen=True)

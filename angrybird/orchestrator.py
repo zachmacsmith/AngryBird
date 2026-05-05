@@ -17,6 +17,7 @@ cycle_id is created each cycle so all strategies see an identical ensemble.
 from __future__ import annotations
 
 import logging
+import time
 from typing import Optional, Protocol, runtime_checkable
 
 import numpy as np
@@ -24,6 +25,7 @@ import numpy as np
 from .assimilation import assimilate_observations
 from .prior import DynamicPrior
 from .config import (
+    DRONE_RANGE_M,
     ENSEMBLE_SIZE,
     GP_DEFAULT_FMC_MEAN,
     GP_DEFAULT_WIND_DIR_MEAN,
@@ -47,6 +49,8 @@ from .selectors.base import SelectorRegistry
 from .types import (
     CycleReport,
     DronePlan,
+    DroneFlightState,
+    DroneMode,
     DroneObservation,
     EnsembleResult,
     GPPrior,
@@ -111,6 +115,7 @@ class IGNISOrchestrator:
         staging_area:      (row, col) drone launch/return point
         resolution_m:      grid cell size in metres
         base_seed:         base random seed; cycle_id is added each cycle
+        ground_stations:   additional (row, col) GS positions; staging_area always included
     """
 
     def __init__(
@@ -130,6 +135,7 @@ class IGNISOrchestrator:
         base_seed: int = 0,
         bimodal_alpha: float = 0.5,
         bimodal_beta: float = 0.3,
+        ground_stations: Optional[list[tuple[int, int]]] = None,
     ) -> None:
         self.terrain          = terrain
         self.gp               = gp
@@ -153,6 +159,24 @@ class IGNISOrchestrator:
         self.cycle_count      = 0
         self._previous_selections: list[tuple[int, int]] = []
         self._drone_plans: list[DronePlan] = []
+
+        # ── Ground stations (always include staging_area) ─────────────────
+        _all_gs = [staging_area] + (ground_stations or [])
+        # Deduplicate while preserving order (staging_area first)
+        seen: set[tuple[int, int]] = set()
+        self._ground_stations: list[tuple[int, int]] = []
+        for gs in _all_gs:
+            if gs not in seen:
+                seen.add(gs)
+                self._ground_stations.append(gs)
+        self._ground_stations_m: list[np.ndarray] = [
+            np.array([r * resolution_m, c * resolution_m], dtype=np.float64)
+            for r, c in self._ground_stations
+        ]
+
+        # ── Persistent drone flight states (mode-based planner) ──────────
+        # Initialised lazily on first cycle (need graph to be built).
+        self._drone_states: Optional[list[DroneFlightState]] = None
 
         # ── Dynamic prior ─────────────────────────────────────────────
         self.dynamic_prior = DynamicPrior(
@@ -216,9 +240,11 @@ class IGNISOrchestrator:
         self.cycle_count += 1
         rng   = np.random.default_rng(self.base_seed + self.cycle_count)
         shape = self.terrain.shape
+        _t = {}  # phase timing: name → wall seconds
 
         # 0. Update dynamic prior from weather + last cycle's ensemble, then
         #    push derived fields into the GP as prior means.
+        _t0 = time.perf_counter()
         if weather_source is not None:
             self.dynamic_prior.update_cycle(
                 current_time=start_time,
@@ -231,14 +257,18 @@ class IGNISOrchestrator:
                 self.gp.set_nelson_mean(means["fmc"])
             if means["wind_speed"] is not None and means["wind_direction"] is not None:
                 self.gp.set_wind_prior_mean(means["wind_speed"], means["wind_direction"])
+        _t["dynamic_prior"] = time.perf_counter() - _t0
 
         # 1. Snapshot GP prior before assimilation (used for replan-flag comparison)
+        _t0 = time.perf_counter()
         self.gp.fit(start_time)
         gp_prior_before = self.gp.predict(shape)
+        _t["gp_fit_pre"] = time.perf_counter() - _t0
 
         # 2. Assimilate previous cycle's observations
         #    If ensemble not yet available use a neutral placeholder so the EnKF
         #    still works (thinned obs will be empty on cycle 1 anyway).
+        _t0 = time.perf_counter()
         assim_ensemble = ensemble if ensemble is not None else _neutral_ensemble(shape, self.n_members)
         assim = assimilate_observations(
             self.gp,
@@ -250,19 +280,19 @@ class IGNISOrchestrator:
             gp_prior=gp_prior_before,
             rng=rng,
         )
+        _t["assimilation"] = time.perf_counter() - _t0
 
         # 3. Updated GP prior (post-assimilation; used for ensemble + info field)
+        _t0 = time.perf_counter()
         self.gp.fit(start_time)
         gp_prior = self.gp.predict(shape)
+        _t["gp_fit_post"] = time.perf_counter() - _t0
 
         # ── Fire state management ─────────────────────────────────────────
-        # Initialise EnsembleFireState on the first cycle from the caller-
-        # supplied burn mask.  Subsequent cycles use per-member carry-forward
-        # or hard-reset from fire observations.
+        _t0 = time.perf_counter()
         if not self.ensemble_fire_state.initialized:
             self.ensemble_fire_state.initialize_from_fire_state(fire_state)
 
-        # Check for new fire observations and decide: hard reset or continue.
         initial_phi_for_engine: Optional[np.ndarray] = None
         fire_obs = self.obs_store.get_fire_detections(
             since=self._last_cycle_time_s)
@@ -298,15 +328,17 @@ class IGNISOrchestrator:
         if self.ensemble_fire_state.initialized:
             initial_phi_for_engine = self.ensemble_fire_state.get_initial_phi(
                 start_time)
-        # ── End fire state management ─────────────────────────────────────
+        _t["fire_state"] = time.perf_counter() - _t0
 
         # 4. Ensemble — use caller-provided or run fire engine
+        _t0 = time.perf_counter()
         if ensemble is None:
             ensemble = self.fire_engine.run(
                 self.terrain, gp_prior, fire_state,
                 self.n_members, self.horizon_min, rng,
                 initial_phi=initial_phi_for_engine,
             )
+        _t["ensemble"] = time.perf_counter() - _t0
 
         # Carry forward per-member fire state for next cycle.
         self.ensemble_fire_state.carry_forward(ensemble.member_arrival_times)
@@ -314,8 +346,7 @@ class IGNISOrchestrator:
         self._last_cycle_time_s    = start_time
 
         # 5. Information field
-        # Compute fire location burn probability for the fire entropy term.
-        # P(cell currently burning) from per-member arrival times at cycle start.
+        _t0 = time.perf_counter()
         fire_state_burn_prob: Optional[np.ndarray] = None
         if self.fire_state_alpha > 0.0 and self.ensemble_fire_state.initialized:
             mat = self.ensemble_fire_state.member_arrival_times
@@ -333,20 +364,31 @@ class IGNISOrchestrator:
             fire_state_alpha=self.fire_state_alpha,
             fire_state_burn_prob=fire_state_burn_prob,
         )
+        _t["info_field"] = time.perf_counter() - _t0
 
         # 6. Primary strategy selection
+        _t0 = time.perf_counter()
         primary_result = self.registry.run(
             self.selector_name, info_field, self.gp, ensemble, k=self.n_targets,
-            terrain=self.terrain, staging_area=self.staging_area, resolution_m=self.resolution_m,
+            terrain=self.terrain,
+            staging_area=self.staging_area,
+            resolution_m=self.resolution_m,
+            drone_states=self._drone_states,
+            ground_stations_m=self._ground_stations_m,
         )
+        _t["selection"] = time.perf_counter() - _t0
 
         # 7. Plan paths + build mission queue
-        # Path selectors produce DronePlans directly; point selectors need the extra step.
+        _t0 = time.perf_counter()
         if isinstance(primary_result, PathSelectionResult):
             drone_plans = primary_result.drone_plans
             selected_locations = [
-                p.waypoints[1] for p in drone_plans if len(p.waypoints) > 2
+                p.waypoints[1] for p in drone_plans if len(p.waypoints) > 1
             ]
+            if primary_result.updated_drone_states is not None:
+                self._drone_states = self._advance_drone_states(
+                    primary_result.updated_drone_states
+                )
         else:
             drone_plans = plan_paths(
                 primary_result.selected_locations,
@@ -360,6 +402,15 @@ class IGNISOrchestrator:
         mission_queue = selections_to_mission_queue(
             drone_plans,
             info_field, self.terrain, self.resolution_m,
+        )
+        _t["path_plan"] = time.perf_counter() - _t0
+
+        total = sum(_t.values())
+        logger.info(
+            "Cycle %d timing (total=%.2fs): %s",
+            self.cycle_count,
+            total,
+            "  ".join(f"{k}={v:.2f}s" for k, v in _t.items() if v > 0.001),
         )
 
         # 8. Placement stability metric
@@ -389,10 +440,51 @@ class IGNISOrchestrator:
         logger.info(
             "Cycle %d | strategy=%s | selected=%d | stability=%.2f | obs=%d",
             self.cycle_count, self.selector_name,
-            len(primary_result.selected_locations),
+            len(selected_locations),
             stability, assim["n_obs_used"],
         )
         return mission_queue, cycle_report
+
+    # ------------------------------------------------------------------
+    # Drone state lifecycle
+    # ------------------------------------------------------------------
+
+    def _advance_drone_states(
+        self,
+        updated_states: list[DroneFlightState],
+    ) -> list[DroneFlightState]:
+        """
+        Process updated drone states after a cycle:
+        - Drones that landed (returned=True) are reset to full battery + NORMAL.
+        - Others carry forward their state unchanged.
+        """
+        staging_m = self._ground_stations_m[0]
+        result = []
+        for state in updated_states:
+            if state.returned:
+                # Drone has landed — reset for next sortie
+                landed_gs_m = (
+                    self._ground_stations_m[state.target_gs_idx]
+                    if 0 <= state.target_gs_idx < len(self._ground_stations_m)
+                    else staging_m
+                )
+                logger.info(
+                    "Drone %d: landed at GS%d — sortie %.0f m | resetting",
+                    state.drone_id, state.target_gs_idx, state.sortie_distance_m,
+                )
+                result.append(DroneFlightState(
+                    drone_id=state.drone_id,
+                    position_m=landed_gs_m.copy(),
+                    remaining_range_m=DRONE_RANGE_M,
+                    mode=DroneMode.NORMAL,
+                    target_gs_idx=-1,
+                    visited_domains=set(),
+                    sortie_distance_m=0.0,
+                    returned=False,
+                ))
+            else:
+                result.append(state)
+        return result
 
 
 # ---------------------------------------------------------------------------

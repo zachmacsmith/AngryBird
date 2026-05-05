@@ -158,6 +158,21 @@ RAWS_WIND_SPEED_SIGMA: float = 0.5  # cup anemometer (vs 1.0 m/s drone)
 RAWS_WIND_DIR_SIGMA: float = 5.0    # wind vane (vs 10° drone)
 
 # ---------------------------------------------------------------------------
+# Mode-based continuous flight path planner (docs/Drone Path.md)
+# ---------------------------------------------------------------------------
+
+DRONE_CYCLE_DURATION_S: float   = 1200.0  # T_cycle — fire model update interval (20 min)
+DRONE_RETURN_THRESHOLD: float   = 0.35    # R_threshold — reserve_on_arrival triggers RETURN
+DRONE_SAFETY_FRACTION: float    = 0.10    # α — fraction of d_max reserved as safety buffer
+DRONE_HOVER_POWER_RATIO: float  = 0.85    # P_hover/P_cruise — battery drain during loiter
+DRONE_MIN_USEFUL_INFO: float    = 1e-4    # below this expected info → loiter instead of fly
+DRONE_REVISIT_PERCENTILE: float = 95.0    # re-admit visited domain if w_i > this percentile
+
+# Derived — updated automatically when DRONE_SPEED_MS or cycle/safety parameters change
+DRONE_CYCLE_DISTANCE_M: float  = DRONE_SPEED_MS * DRONE_CYCLE_DURATION_S   # ~18,000 m
+DRONE_SAFETY_MARGIN_M: float   = DRONE_SAFETY_FRACTION * DRONE_RANGE_M     # 2,000 m
+
+# ---------------------------------------------------------------------------
 # Selector parameters
 # ---------------------------------------------------------------------------
 
