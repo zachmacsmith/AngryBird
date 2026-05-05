@@ -54,16 +54,20 @@ class StaticPriorEvaluator:
         n_members: int,
         horizon_min: int,
         initial_phi: np.ndarray | None = None,
+        oracle_arrival_times: np.ndarray | None = None,
     ) -> None:
-        self.config             = config
-        self.terrain            = terrain
-        self.ground_truth       = ground_truth
-        self.initial_gp_prior   = initial_gp_prior
-        self.fire_engine        = fire_engine
-        self.initial_fire_state = initial_fire_state
-        self.n_members          = n_members
-        self.horizon_min        = horizon_min
-        self.initial_phi        = initial_phi
+        self.config               = config
+        self.terrain              = terrain
+        self.ground_truth         = ground_truth
+        self.initial_gp_prior     = initial_gp_prior
+        self.fire_engine          = fire_engine
+        self.initial_fire_state   = initial_fire_state
+        self.n_members            = n_members
+        self.horizon_min          = horizon_min
+        self.initial_phi          = initial_phi
+        # Use pre-computed oracle arrival times when provided so the same cell set
+        # is scored as IGNIS uses.  Falls back to ground truth at evaluation time.
+        self._oracle_arrival_times = oracle_arrival_times
 
     # ------------------------------------------------------------------
 
@@ -100,13 +104,18 @@ class StaticPriorEvaluator:
         cycle_s   = self.config.ignis_cycle_interval_s
         total_s   = self.config.total_time_s
         horizon_s = self.horizon_min * 60.0
-        truth_arr = self.ground_truth.fire.arrival_times  # seconds from t=0
+        # Use oracle arrival times if provided; fall back to live ground truth.
+        truth_arr = (
+            self._oracle_arrival_times
+            if self._oracle_arrival_times is not None
+            else self.ground_truth.fire.arrival_times
+        )
 
         t         = 0.0
         cycle_idx = 0
         while t <= total_s:
             cycle_idx += 1
-            crps_per_cell, n_active = self._score_at_time(
+            crps_per_cell_min, n_active = self._score_at_time(
                 ensemble, truth_arr, horizon_s, current_time_s=t
             )
             rows.append({
@@ -115,8 +124,8 @@ class StaticPriorEvaluator:
                 "cycle":                 cycle_idx,
                 "time_min":              round(t / 60.0, 3),
                 "n_obs_cumulative":      0,
-                "crps_minutes":          0.0,
-                "crps_per_cell_minutes": round(crps_per_cell, 6),
+                "crps_minutes":          round(crps_per_cell_min, 4),
+                "crps_per_cell_minutes": round(crps_per_cell_min, 6),
                 "n_active_cells":        n_active,
                 "oracle_crps_minutes":   0.0,
                 "spread_skill":          0.0,
@@ -174,4 +183,6 @@ class StaticPriorEvaluator:
         crps_min    = float(np.mean(abs_err - spread_crps))
         crps_min    = max(crps_min, 0.0)
 
-        return crps_min / max(n_active, 1), n_active
+        # crps_min is already the per-cell mean (via np.mean over cells).
+        # Return it directly — no second division by n_active.
+        return crps_min, n_active

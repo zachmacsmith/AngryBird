@@ -117,7 +117,7 @@ def _save_chart(
     for label, rows in completed.items():
         color, ls = _COLORS.get(label, ("#ffffff", "-"))
         t = [r["time_min"] for r in rows]
-        v = [r["crps_per_cell_minutes"] for r in rows]
+        v = [r["crps_minutes"] for r in rows]
         lw = 1.6 if label == "static prior" else 2.0
         ms = 3   if label == "static prior" else 4
         marker = "s" if label == "static prior" else "o"
@@ -126,7 +126,7 @@ def _save_chart(
 
     ax.axhline(0.0, color="#555577", linestyle=":", linewidth=0.8)
     ax.set_xlabel("Simulation time (min)", color="white", fontsize=9)
-    ax.set_ylabel("CRPS / burning cell (min)", color="white", fontsize=9)
+    ax.set_ylabel("Per-cell CRPS (min)", color="white", fontsize=9)
     ax.set_title("Forecast accuracy vs drone fleet size",
                  color="white", fontsize=10, fontweight="bold")
     ax.tick_params(colors="white", labelsize=8)
@@ -259,7 +259,7 @@ def run_variant(
     rows = [{**r, "variant": label} for r in runner._cycle_metrics_rows]
     log.info("Variant '%s' done in %.0fs — %d cycles",
              label, time.time() - t_start, len(rows))
-    return rows, orchestrator, ground_truth
+    return rows, orchestrator, ground_truth, runner
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -315,7 +315,7 @@ def main(args: argparse.Namespace) -> None:
 
     # ── Run each variant ──────────────────────────────────────────────────
     for v in _VARIANTS:
-        rows, orchestrator, ground_truth = run_variant(
+        rows, orchestrator, ground_truth, runner = run_variant(
             label          = v["label"],
             n_drones       = v["n_drones"],
             spawn_times    = v["spawn_times"],
@@ -329,26 +329,24 @@ def main(args: argparse.Namespace) -> None:
         completed[v["label"]] = rows
 
         # Compute static prior after first variant (needs _cycle1_initial_phi
-        # and the completed ground_truth fire arrival times).
+        # and the oracle arrival times for consistent cell-set scoring).
         if static_rows is None:
             log.info("Computing static prior baseline …")
-            # initial_fire_state: ground truth at t=0 before simulation stepped it.
-            # We don't have the t=0 snapshot any more, but _cycle1_initial_phi is the
-            # obs-derived phi — that's the correct starting point anyway.
             _se = StaticPriorEvaluator(
-                config             = SimulationConfig(
+                config               = SimulationConfig(
                     ignis_cycle_interval_s = args.cycle_min * 60.0,
                     total_time_s           = args.hours * 3600.0,
                     scenario_name          = "static_prior",
                 ),
-                terrain            = terrain,
-                ground_truth       = ground_truth,
-                initial_gp_prior   = initial_gp_prior,
-                fire_engine        = fire_engine,
-                initial_fire_state = ground_truth.fire.fire_state.copy(),
-                n_members          = args.members,
-                horizon_min        = args.horizon_min,
-                initial_phi        = orchestrator._cycle1_initial_phi,
+                terrain              = terrain,
+                ground_truth         = ground_truth,
+                initial_gp_prior     = initial_gp_prior,
+                fire_engine          = fire_engine,
+                initial_fire_state   = ground_truth.fire.fire_state.copy(),
+                n_members            = args.members,
+                horizon_min          = args.horizon_min,
+                initial_phi          = orchestrator._cycle1_initial_phi,
+                oracle_arrival_times = runner._oracle_arrival_times,
             )
             static_rows = _se.evaluate()
             completed["static prior"] = static_rows

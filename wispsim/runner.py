@@ -712,6 +712,20 @@ class SimulationRunner:
         self.truth        = ground_truth
         self.orchestrator = orchestrator
 
+        # Pre-compute full oracle arrival times for consistent CRPS evaluation.
+        # Uses a fresh GroundTruthFire so self.truth.fire stays at t=0.
+        # One large step (Dijkstra wavefront) is sufficient — all cells are
+        # processed in correct arrival-time order regardless of step size.
+        from .fire_oracle import GroundTruthFire as _GTF
+        _pre = _GTF(terrain, ground_truth.ignition_cells)
+        _pre.step(
+            config.total_time_s,
+            ground_truth.wind_speed,
+            ground_truth.wind_direction,
+            ground_truth.fmc,
+        )
+        self._oracle_arrival_times: np.ndarray = _pre.arrival_times.copy()
+
         horizon_h = getattr(orchestrator, "horizon_min", SIMULATION_HORIZON_MIN) / 60.0
 
         self.obs_buffer = ObservationBuffer(
@@ -1296,26 +1310,29 @@ class SimulationRunner:
         # Always uses the ensemble from THIS cycle (post-assimilation GP),
         # including cycle 0 where the GP is seeded by RAWS only.
         # compute_arrival_accuracy returns (0, 0, 0) if no cells will burn in horizon.
+        # Uses _oracle_arrival_times (pre-computed full run) so both IGNIS and the
+        # static prior baseline are scored against the same set of cells at every
+        # cycle — incremental truth would give n_active≈0 at early cycles (unfair).
         horizon_s = self.orchestrator.horizon_min * 60.0
         crps_min = rmse_min = spread_skill = 0.0
         if self._last_ensemble is not None:
             crps_min, rmse_min, spread_skill = compute_arrival_accuracy(
                 self._last_ensemble,
-                self.truth.fire.arrival_times,
+                self._oracle_arrival_times,
                 horizon_s=horizon_s,
                 current_time_s=self.current_time,
             )
 
-        # Per-burning-cell CRPS: divide by the number of cells that will burn
-        # within the planning horizon from now.  Removes the confound where raw
-        # CRPS grows simply because the fire is larger; ideal value is 0.
+        # Active cells within the horizon from oracle truth (consistent denominator).
+        # compute_arrival_accuracy already returns the per-cell mean; crps_per_cell_min
+        # mirrors that value so both CSV columns carry the same information.
         _active_mask = (
-            (self.truth.fire.arrival_times >= self.current_time) &
-            ((self.truth.fire.arrival_times - self.current_time) < horizon_s) &
-            np.isfinite(self.truth.fire.arrival_times)
+            (self._oracle_arrival_times >= self.current_time) &
+            ((self._oracle_arrival_times - self.current_time) < horizon_s) &
+            np.isfinite(self._oracle_arrival_times)
         )
         n_active_cells = int(_active_mask.sum())
-        crps_per_cell_min = crps_min / max(n_active_cells, 1)
+        crps_per_cell_min = crps_min  # already per-cell mean from compute_arrival_accuracy
 
         # Oracle CRPS: 1-member fire run seeded with true FMC + wind (zero GP
         # uncertainty).  Gives the irreducible model-error floor — the best CRPS
@@ -1342,7 +1359,7 @@ class SimulationRunner:
                 )
                 oracle_crps_min, _, _ = compute_arrival_accuracy(
                     _oracle_result,
-                    self.truth.fire.arrival_times,
+                    self._oracle_arrival_times,
                     horizon_s=horizon_s,
                     current_time_s=self.current_time,
                 )

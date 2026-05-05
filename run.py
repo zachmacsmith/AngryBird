@@ -751,15 +751,16 @@ def main(args: argparse.Namespace) -> None:  # noqa: C901
     from wispsim.static_prior_evaluator import StaticPriorEvaluator
     log.info("Running static prior baseline (no observations) …")
     baseline_eval = StaticPriorEvaluator(
-        config             = config,
-        terrain            = terrain,
-        ground_truth       = ground_truth,
-        initial_gp_prior   = initial_gp_prior,
-        fire_engine        = fire_engine,
-        initial_fire_state = initial_fire_state,
-        n_members          = args.members,
-        horizon_min        = horizon_min,
-        initial_phi        = orchestrator._cycle1_initial_phi,
+        config                = config,
+        terrain               = terrain,
+        ground_truth          = ground_truth,
+        initial_gp_prior      = initial_gp_prior,
+        fire_engine           = fire_engine,
+        initial_fire_state    = initial_fire_state,
+        n_members             = args.members,
+        horizon_min           = horizon_min,
+        initial_phi           = orchestrator._cycle1_initial_phi,
+        oracle_arrival_times  = runner._oracle_arrival_times,
     )
     baseline_rows = baseline_eval.evaluate()
 
