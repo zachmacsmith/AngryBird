@@ -44,10 +44,10 @@ Products are created at a 30 meter raster; however, the applicability of product
     </status>
     <spdom>
       <bounding>
-        <westbc>-121.1610</westbc>
-        <eastbc>-120.8295</eastbc>
-        <northbc>39.1963</northbc>
-        <southbc>39.0348</southbc>
+        <westbc>-118.9000</westbc>
+        <eastbc>-118.4500</eastbc>
+        <northbc>34.1800</northbc>
+        <southbc>33.9950</southbc>
       </bounding>
     </spdom>
     <keywords>
