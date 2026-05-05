@@ -161,7 +161,7 @@ RAWS_WIND_DIR_SIGMA: float = 5.0    # wind vane (vs 10° drone)
 # Selector parameters
 # ---------------------------------------------------------------------------
 
-IGNIS_SELECTOR: str = "greedy"  # "greedy"|"qubo"|"uniform"|"fire_front" (points) | "correlation_path" (paths)
+IGNIS_SELECTOR: str = "correlation_path"  # "greedy"|"qubo"|"uniform"|"fire_front" (points) | "correlation_path" (paths)
 MIN_SELECTION_SPACING_M: float = 500.0   # minimum distance between selected locations
 QUBO_MAX_CANDIDATES: int = 300           # M: top-M candidates passed to QUBO
 
@@ -268,4 +268,141 @@ CANOPY_COVER_FRACTION: dict[int, float] = {
     1: 0.00, 2: 0.10, 3: 0.05,
     4: 0.30, 5: 0.40, 6: 0.20, 7: 0.20,
     8: 0.80, 9: 0.75, 10: 0.70, 11: 0.50, 12: 0.40, 13: 0.30,
+}
+
+# Source: Scott & Burgan 2005 (RMRS-GTR-153), Table 7
+# "Standard Fire Behavior Fuel Models: A Comprehensive Set for Use
+#  with Rothermel's Surface Fire Spread Model"
+#
+# All 40 burnable fuel models + 5 non-burnable models.
+#
+# Units in table: load in tons/acre, SAV in 1/ft, depth in ft,
+#   heat content in BTU/lb, moisture of extinction in percent.
+# Converted here to SI: load in kg/m², SAV in 1/m, depth in m,
+#   heat content in J/kg, moisture of extinction as fraction.
+#
+# Constant parameters (not per-model, per Rothermel 1972):
+#   10-hr dead fuel SAV: 109 1/ft  (357.6 1/m)
+#   100-hr dead fuel SAV: 30 1/ft  (98.4 1/m)
+#   Total mineral content: 0.0555
+#   Effective (silica-free) mineral content: 0.0100
+#   Ovendry fuel particle density: 32 lb/ft³ (512.7 kg/m³)
+
+T_ACRE_TO_KG_M2 = 0.22417  # tons/acre -> kg/m²
+FT_TO_M = 0.3048           # feet -> meters
+INV_FT_TO_INV_M = 3.28084  # 1/ft -> 1/m
+BTU_LB_TO_J_KG = 2326.0    # BTU/lb -> J/kg
+
+H_STD = 8000 * BTU_LB_TO_J_KG   # 18,608,000 J/kg
+H_GR6 = 9000 * BTU_LB_TO_J_KG   # 20,934,000 J/kg  (GR6 is the only exception)
+
+# Per-model constants
+SAV_10H = 109 * INV_FT_TO_INV_M   # ~357.6 1/m
+SAV_100H = 30 * INV_FT_TO_INV_M   # ~98.4 1/m
+MINERAL_TOTAL = 0.0555
+MINERAL_EFFECTIVE = 0.0100
+PARTICLE_DENSITY = 32 * 16.0185    # lb/ft³ -> kg/m³ ≈ 512.6 kg/m³
+
+
+def _fm(load_1h, load_10h, load_100h, load_herb, load_woody,
+        sav_1h, sav_herb, sav_woody,
+        depth, mx, h, dynamic):
+    """Build a fuel model dict with unit conversions applied."""
+    return {
+        # Fuel loads (tons/acre -> kg/m²)
+        "load_1h":          load_1h   * T_ACRE_TO_KG_M2,
+        "load_10h":         load_10h  * T_ACRE_TO_KG_M2,
+        "load_100h":        load_100h * T_ACRE_TO_KG_M2,
+        "load_live_herb":   load_herb * T_ACRE_TO_KG_M2,
+        "load_live_woody":  load_woody * T_ACRE_TO_KG_M2,
+        # Surface-area-to-volume ratios (1/ft -> 1/m)
+        "sav_1h":           sav_1h   * INV_FT_TO_INV_M,
+        "sav_live_herb":    sav_herb * INV_FT_TO_INV_M,
+        "sav_live_woody":   sav_woody * INV_FT_TO_INV_M,
+        "sav_10h":          SAV_10H,
+        "sav_100h":         SAV_100H,
+        # Fuelbed depth (ft -> m)
+        "depth":            depth * FT_TO_M,
+        # Dead fuel moisture of extinction (percent -> fraction)
+        "mx":               mx / 100.0,
+        # Heat content (BTU/lb -> J/kg), same for live and dead
+        "h":                h * BTU_LB_TO_J_KG,
+        # Fuel model type
+        "dynamic":          dynamic,
+    }
+
+
+def _nb():
+    """Non-burnable: all zeros."""
+    return {
+        "load_1h": 0, "load_10h": 0, "load_100h": 0,
+        "load_live_herb": 0, "load_live_woody": 0,
+        "sav_1h": 0, "sav_live_herb": 0, "sav_live_woody": 0,
+        "sav_10h": 0, "sav_100h": 0,
+        "depth": 0, "mx": 0, "h": 0,
+        "dynamic": False,
+    }
+
+
+SB40_FUEL_PARAMS: dict[int, dict] = {
+
+    # ── Non-burnable (NB) ────────────────────────────────────────────
+    91:  _nb(),  # NB1  Urban/Developed
+    92:  _nb(),  # NB2  Snow/Ice
+    93:  _nb(),  # NB3  Agricultural
+    98:  _nb(),  # NB8  Open Water
+    99:  _nb(),  # NB9  Bare Ground
+
+    # ── Grass (GR) — all dynamic ─────────────────────────────────────
+    #         1h    10h   100h  herb  woody  sav1h  savH   savW   depth  mx   h     dyn
+    101: _fm( 0.10, 0.00, 0.00, 0.30, 0.00,  2200,  2000,  9999,  0.4,  15,  8000, True),   # GR1
+    102: _fm( 0.10, 0.00, 0.00, 1.00, 0.00,  2000,  1800,  9999,  1.0,  15,  8000, True),   # GR2
+    103: _fm( 0.10, 0.40, 0.00, 1.50, 0.00,  1500,  1300,  9999,  2.0,  30,  8000, True),   # GR3
+    104: _fm( 0.25, 0.00, 0.00, 1.90, 0.00,  2000,  1800,  9999,  2.0,  15,  8000, True),   # GR4
+    105: _fm( 0.40, 0.00, 0.00, 2.50, 0.00,  1800,  1600,  9999,  1.5,  40,  8000, True),   # GR5
+    106: _fm( 0.10, 0.00, 0.00, 3.40, 0.00,  2200,  2000,  9999,  1.5,  40,  9000, True),   # GR6
+    107: _fm( 1.00, 0.00, 0.00, 5.40, 0.00,  2000,  1800,  9999,  3.0,  15,  8000, True),   # GR7
+    108: _fm( 0.50, 1.00, 0.00, 7.30, 0.00,  1500,  1300,  9999,  4.0,  30,  8000, True),   # GR8
+    109: _fm( 1.00, 1.00, 0.00, 9.00, 0.00,  1800,  1600,  9999,  5.0,  40,  8000, True),   # GR9
+
+    # ── Grass-Shrub (GS) — all dynamic ──────────────────────────────
+    121: _fm( 0.20, 0.00, 0.00, 0.50, 0.65,  2000,  1800,  1800,  0.9,  15,  8000, True),   # GS1
+    122: _fm( 0.50, 0.50, 0.00, 0.60, 1.00,  2000,  1800,  1800,  1.5,  15,  8000, True),   # GS2
+    123: _fm( 0.30, 0.25, 0.00, 1.45, 1.25,  1800,  1600,  1600,  1.8,  40,  8000, True),   # GS3
+    124: _fm( 1.90, 0.30, 0.10, 3.40, 7.10,  1800,  1600,  1600,  2.1,  40,  8000, True),   # GS4
+
+    # ── Shrub (SH) — SH1 & SH9 are dynamic, rest are static ────────
+    141: _fm( 0.25, 0.25, 0.00, 0.15, 1.30,  2000,  1800,  1600,  1.0,  15,  8000, True),   # SH1
+    142: _fm( 1.35, 2.40, 0.75, 0.00, 3.85,  2000,  9999,  1600,  1.0,  15,  8000, False),  # SH2
+    143: _fm( 0.45, 3.00, 0.00, 0.00, 6.20,  1600,  9999,  1400,  2.4,  40,  8000, False),  # SH3
+    144: _fm( 0.85, 1.15, 0.20, 0.00, 2.55,  2000,  1800,  1600,  3.0,  30,  8000, False),  # SH4
+    145: _fm( 3.60, 2.10, 0.00, 0.00, 2.90,   750,  9999,  1600,  6.0,  15,  8000, False),  # SH5
+    146: _fm( 2.90, 1.45, 0.00, 0.00, 1.40,   750,  9999,  1600,  2.0,  30,  8000, False),  # SH6
+    147: _fm( 3.50, 5.30, 2.20, 0.00, 3.40,   750,  9999,  1600,  6.0,  15,  8000, False),  # SH7
+    148: _fm( 2.05, 3.40, 0.85, 0.00, 4.35,   750,  9999,  1600,  3.0,  40,  8000, False),  # SH8
+    149: _fm( 4.50, 2.45, 0.00, 1.55, 7.00,   750,  1800,  1500,  4.4,  40,  8000, True),   # SH9
+
+    # ── Timber-Understory (TU) — TU1 & TU3 are dynamic ──────────────
+    161: _fm( 0.20, 0.90, 1.50, 0.20, 0.90,  2000,  1800,  1600,  0.6,  20,  8000, True),   # TU1
+    162: _fm( 0.95, 1.80, 1.25, 0.00, 0.20,  2000,  9999,  1600,  1.0,  30,  8000, False),  # TU2
+    163: _fm( 1.10, 0.15, 0.25, 0.65, 1.10,  1800,  1600,  1400,  1.3,  30,  8000, True),   # TU3
+    164: _fm( 4.50, 0.00, 0.00, 0.00, 2.00,  2300,  9999,  2000,  0.5,  12,  8000, False),  # TU4
+    165: _fm( 4.00, 4.00, 3.00, 0.00, 3.00,  1500,  9999,   750,  1.0,  25,  8000, False),  # TU5
+
+    # ── Timber Litter (TL) — all static ──────────────────────────────
+    181: _fm( 1.00, 2.20, 3.60, 0.00, 0.00,  2000,  9999,  9999,  0.2,  30,  8000, False),  # TL1
+    182: _fm( 1.40, 2.30, 2.20, 0.00, 0.00,  2000,  9999,  9999,  0.2,  25,  8000, False),  # TL2
+    183: _fm( 0.50, 2.20, 2.80, 0.00, 0.00,  2000,  9999,  9999,  0.3,  20,  8000, False),  # TL3
+    184: _fm( 0.50, 1.50, 4.20, 0.00, 0.00,  2000,  9999,  9999,  0.4,  25,  8000, False),  # TL4
+    185: _fm( 1.15, 2.50, 4.40, 0.00, 0.00,  2000,  9999,  1600,  0.6,  25,  8000, False),  # TL5
+    186: _fm( 2.40, 1.20, 1.20, 0.00, 0.00,  2000,  9999,  9999,  0.3,  25,  8000, False),  # TL6
+    187: _fm( 0.30, 1.40, 8.10, 0.00, 0.00,  2000,  9999,  9999,  0.4,  25,  8000, False),  # TL7
+    188: _fm( 5.80, 1.40, 1.10, 0.00, 0.00,  1800,  9999,  9999,  0.3,  35,  8000, False),  # TL8
+    189: _fm( 6.65, 3.30, 4.15, 0.00, 0.00,  1800,  9999,  1600,  0.6,  35,  8000, False),  # TL9
+
+    # ── Slash-Blowdown (SB) — all static ─────────────────────────────
+    201: _fm( 1.50, 3.00, 11.00, 0.00, 0.00, 2000,  9999,  9999,  1.0,  25,  8000, False),  # SB1
+    202: _fm( 4.50, 4.25,  4.00, 0.00, 0.00, 2000,  9999,  9999,  1.0,  25,  8000, False),  # SB2
+    203: _fm( 5.50, 2.75,  3.00, 0.00, 0.00, 2000,  9999,  9999,  1.2,  25,  8000, False),  # SB3
+    204: _fm( 5.25, 3.50,  5.25, 0.00, 0.00, 2000,  9999,  9999,  2.7,  25,  8000, False),  # SB4
 }
