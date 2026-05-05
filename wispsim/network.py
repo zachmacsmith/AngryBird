@@ -64,7 +64,7 @@ class DroneBuffer:
 
     def get_send_candidates(self, max_packets: int) -> list[TelemetryPacket]:
         # Lower priority number means more urgent.
-        self.packets.sort(key=lambda packet: (packet.priority, packet.created_time))
+        self.packets.sort(key=lambda packet: (packet.priority, -packet.created_time))
         return self.packets[:max_packets]
 
     def remove_packets(self, packet_ids: set[str]) -> None:
@@ -159,6 +159,9 @@ class MeshNetworkConfig:
     relay_id: Optional[str] = None
     relay_range_m: Optional[float] = None
 
+    retransmit_attempts_per_packet: int = 2
+    urgent_retransmit_attempts_per_packet: int = 3
+
 def make_pams_like_mesh_config() -> MeshNetworkConfig:
         return MeshNetworkConfig(
             mesh_range_m=1200.0,
@@ -186,7 +189,7 @@ def make_improved_mesh_config() -> MeshNetworkConfig:
             max_packets_per_drone_per_tick=8,
             background_packet_loss_probability=0.015,
             quality_smoothing_alpha=0.70,
-            max_packet_age_s=300.0,
+            max_packet_age_s=1000.0,
             relay_id=None,
             relay_range_m=None,
         )
@@ -404,9 +407,20 @@ class PingMeshNetwork:
 
             for j in range(len(candidates)):
                 packet = candidates[j]
-                packet.retry_count += 1
 
-                delivered = self._try_transmit_packet_along_path(packet, path)
+                if packet.priority == 1:
+                    max_attempts = self.config.urgent_retransmit_attempts_per_packet
+                else:
+                    max_attempts = self.config.retransmit_attempts_per_packet
+
+                delivered = False
+
+                for attempt in range(max_attempts):
+                    packet.retry_count += 1
+
+                    if self._try_transmit_packet_along_path(packet, path):
+                        delivered = True
+                        break
 
                 if delivered:
                     packet.delivered = True
