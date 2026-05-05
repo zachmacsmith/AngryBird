@@ -223,9 +223,9 @@ def _build_correlation_graph(
 
         centroid_m = np.array([rs.mean() * resolution_m, cs.mean() * resolution_m])
 
-        dom_var = max(
-            w_by_variable,
-            key=lambda v: float(w_by_variable[v][rep[0], rep[1]]),
+        dom_var = (
+            max(w_by_variable, key=lambda v: float(w_by_variable[v][rep[0], rep[1]]))
+            if w_by_variable else "fmc"
         )
 
         # Burnable fraction: fraction of cells with SB40 codes NOT in NB set
