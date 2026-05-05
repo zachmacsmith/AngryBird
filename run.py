@@ -44,7 +44,7 @@ Usage examples
     PYTHONPATH=. python scripts/run.py --scenario hilly_heterogeneous
 
     # Full custom run
-    PYTHONPATH=. python scripts/run.py \\
+    PYTHONPATH=. python run.py \\
         --terrain landfire_cache --device mps \\
         --drones 2 --targets 6 --members 30 \\
         --hours 2 --cycle-min 10 --horizon-min 240 \\
@@ -694,6 +694,7 @@ def main(args: argparse.Namespace) -> None:  # noqa: C901
         n_raws               = args.n_raws,
         enable_mesh_network  = args.mesh_network,
         selector_name        = args.selector,
+        live_fire_horizon_h  = float(args.horizon_min) / 60.0,
     )
 
     # ── Runner ─────────────────────────────────────────────────────────────

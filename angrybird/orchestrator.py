@@ -432,6 +432,7 @@ class IGNISOrchestrator:
             resolution_m=self.resolution_m,
             drone_states=self._drone_states,
             ground_stations_m=self._ground_stations_m,
+            n_drones=self.n_drones,
         )
         _t["selection"] = time.perf_counter() - _t0
 
