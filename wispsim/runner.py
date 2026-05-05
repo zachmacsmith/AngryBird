@@ -54,8 +54,11 @@ from angrybird.selectors import registry as _default_registry
 from angrybird.selectors.base import SelectorRegistry
 from angrybird.types import (
     CycleReport,
+    DronePlan,
     DroneObservation,
+    EnsembleResult,
     GPPrior,
+    InformationField,
     SelectionResult,
     StrategyEvaluation,
 )
@@ -752,6 +755,10 @@ class SimulationRunner:
         self._gp_prior: Optional[GPPrior] = None
         self._burn_probability: Optional[np.ndarray] = None
         self._mission_targets: list[tuple[int, int]] = []
+        self._drone_plans: list[DronePlan] = []
+        # Last ensemble result — used to recompute info field live at render cadence.
+        self._last_ensemble: Optional[EnsembleResult] = None
+        self._live_info_field: Optional[InformationField] = None
 
         # Live estimator — updates between cycles with raw per-step observations
         self._live_est = LiveEstimator(
@@ -890,6 +897,27 @@ class SimulationRunner:
                         rng=np.random.default_rng(step),
                     )
                 )
+                # Recompute the info field live: reuse the cached ensemble from
+                # the last WISP cycle but with the freshest GP prior so that the
+                # panel reflects new observations as they arrive through the network.
+                if self._last_ensemble is not None:
+                    live_prior = (
+                        self._live_gp_prior
+                        if self._live_gp_prior is not None
+                        else self._gp_prior
+                    )
+                    if live_prior is not None:
+                        try:
+                            self._live_info_field = compute_information_field(
+                                self._last_ensemble,
+                                live_prior,
+                                resolution_m=self.terrain.resolution_m,
+                                horizon_minutes=self.orchestrator.horizon_min,
+                                bimodal_alpha=self.orchestrator.bimodal_alpha,
+                                bimodal_beta=self.orchestrator.bimodal_beta,
+                            )
+                        except Exception:
+                            pass  # fall back to last cycle's info field
 
             # 7. Render frame
             self.renderer.render_frame(
@@ -899,9 +927,12 @@ class SimulationRunner:
                 drones=self.drones,
                 gp_prior=self._gp_prior,
                 burn_probability=self._burn_probability,
-                info_field=(self.cycle_reports[-1].info_field
-                            if self.cycle_reports else None),
+                info_field=(self._live_info_field
+                            if self._live_info_field is not None
+                            else (self.cycle_reports[-1].info_field
+                                  if self.cycle_reports else None)),
                 mission_targets=self._mission_targets,
+                drone_plans=self._drone_plans or None,
                 cycle_reports=self.cycle_reports,
                 live_gp_prior=self._live_gp_prior,
                 live_arrival_times_h=self._live_arrival_times_h,
@@ -989,6 +1020,8 @@ class SimulationRunner:
 
         targets = self.orchestrator._previous_selections
         self._mission_targets = list(targets)
+        self._drone_plans = list(self.orchestrator._drone_plans)
+        self._last_ensemble = self.orchestrator._last_ensemble_result
 
         # Mission-value metric: diff of info_field.w.sum() between cycles.
         # w = gp_variance × |sensitivity| × observability — can INCREASE as fire
@@ -1033,7 +1066,7 @@ class SimulationRunner:
         # inter-cycle live estimate starts from the freshest posterior.
         self._live_est.snapshot_from_cycle()
 
-        self._assign_drone_waypoints(targets)
+        self._assign_drone_waypoints(self.orchestrator._drone_plans)
 
         logger.info(
             "WISP cycle %d | t=%.0fs | obs=%d | info_w=%.2f | "
@@ -1052,12 +1085,17 @@ class SimulationRunner:
     # ------------------------------------------------------------------
 
     def _assign_drone_waypoints(
-        self, targets: list[tuple[int, int]]
+        self, drone_plans: list[DronePlan]
     ) -> None:
-        """Assign mission targets to idle or recently-returned drones."""
+        """Assign full routed paths to idle drones from the orchestrator's DronePlans."""
         available = [d for d in self.drones if d.status == "idle"]
-        for drone, target_cell in zip(available, targets):
-            assign_waypoints(drone, target_cell, self.terrain.resolution_m)
+        for drone, plan in zip(available, drone_plans):
+            # waypoints = [staging, t1, t2, ..., staging]
+            # Skip the staging origin (drone is already there); include all
+            # targets and the return leg so the drone flies the full planned route.
+            path = plan.waypoints[1:] if len(plan.waypoints) > 1 else []
+            if path:
+                assign_waypoints(drone, path, self.terrain.resolution_m)
 
     def _refuel_if_home(self, drone: DroneState) -> None:
         """Reset endurance when a drone returns to its base cell."""

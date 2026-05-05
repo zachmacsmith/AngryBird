@@ -543,7 +543,9 @@ class EnsembleFireState:
         self.member_phi = np.zeros(
             (self.n_members, *self.grid_shape), dtype=np.float32)
         for n in range(self.n_members):
-            burned = self.member_arrival_times[n] < current_time_s
+            # Use <= so cells with arrival_time == current_time_s (including
+            # ignition cells at t=0 with arrival=0.0) are treated as burned.
+            burned = self.member_arrival_times[n] <= current_time_s
             if not burned.any():
                 self.member_phi[n] = np.full(self.grid_shape, self.dx, dtype=np.float32)
                 continue

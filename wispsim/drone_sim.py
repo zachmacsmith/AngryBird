@@ -253,11 +253,13 @@ def _dist_to_fire_front_m(
 
 def assign_waypoints(
     drone: DroneState,
-    target_cell: tuple[int, int],
+    path_cells: list[tuple[int, int]],
     resolution_m: float,
 ) -> None:
-    """Replace a drone's waypoint queue with a single new target."""
-    target_pos = cell_to_pos_m(target_cell, resolution_m)
-    drone.waypoint_queue = [target_pos]
-    drone.current_target = target_pos
+    """Replace a drone's waypoint queue with an ordered sequence of cells."""
+    positions = [cell_to_pos_m(cell, resolution_m) for cell in path_cells]
+    if not positions:
+        return
+    drone.waypoint_queue = positions
+    drone.current_target = positions[0]
     drone.status = "transit"

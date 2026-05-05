@@ -39,7 +39,7 @@ import matplotlib.colors as mcolors
 import matplotlib.patches as mpatches
 from matplotlib.figure import Figure
 
-from angrybird.types import CycleReport, InformationField, GPPrior
+from angrybird.types import CycleReport, DronePlan, InformationField, GPPrior
 from angrybird.visualization._style import compute_hillshade, STRATEGY_STYLES
 from .drone_sim import DroneState, pos_m_to_cell
 from .ground_truth import GroundTruth
@@ -146,6 +146,7 @@ class MapPanel:
         arrival_times_h: Optional[np.ndarray] = None,
         horizon_h: float = 6.0,
         drone_targets: Optional[list[tuple[int, int]]] = None,
+        drone_plans: Optional[list] = None,
         drones: Optional[list[DroneState]] = None,
         resolution_m: float = 50.0,
         shape: Optional[tuple[int, int]] = None,
@@ -240,6 +241,31 @@ class MapPanel:
                 tx = ax.text(c + 1, r - 1, str(i + 1), fontsize=6,
                              color="cyan", fontweight="bold", zorder=8)
                 self._dyn += [sc, tx]
+
+        # ── Planned drone paths ──────────────────────────────────────────
+        # Draw the full multi-waypoint route for each drone, color-coded by
+        # drone index.  Waypoints are (row, col) grid cells from DronePlan.
+
+        if drone_plans:
+            for i, plan in enumerate(drone_plans):
+                if not plan.waypoints or len(plan.waypoints) < 2:
+                    continue
+                color = _DRONE_COLORS[i % len(_DRONE_COLORS)]
+                rows_ = [wp[0] for wp in plan.waypoints]
+                cols_ = [wp[1] for wp in plan.waypoints]
+                # Path line
+                ln, = ax.plot(cols_, rows_, "-", color=color,
+                              alpha=0.75, linewidth=1.4, zorder=10)
+                self._dyn.append(ln)
+                # Waypoint markers (skip first staging origin, keep rest)
+                for j, (wr, wc) in enumerate(plan.waypoints[1:], start=1):
+                    is_return = j == len(plan.waypoints) - 1
+                    marker = "x" if is_return else "s"
+                    kw = dict(c=color, s=45, zorder=11, linewidths=0.8)
+                    if not is_return:
+                        kw["edgecolors"] = "white"
+                    sc = ax.scatter([wc], [wr], marker=marker, **kw)
+                    self._dyn.append(sc)
 
         # ── Drone positions + trails ──────────────────────────────────────
 
@@ -383,6 +409,11 @@ class FrameRenderer:
         self._raws_only_gp_var_sum: float = 0.0
         self._initial_gp_var_sum: float = 0.0
 
+        # Continuous GP variance trace: sampled every render frame from live_gp_prior.
+        # Each entry is (time_min, gp_var_sum).  Gives a smooth curve that updates
+        # as observations arrive through the network, not just at cycle boundaries.
+        self._live_gp_trace: list[tuple[float, float]] = []
+
         # Build figure — 4 map panels + entropy strip
         self.fig = plt.figure(figsize=figsize)
         gs = gridspec.GridSpec(
@@ -414,6 +445,7 @@ class FrameRenderer:
         burn_probability: Optional[np.ndarray] = None,
         info_field: Optional[InformationField] = None,
         mission_targets: Optional[list[tuple[int, int]]] = None,
+        drone_plans: Optional[list[DronePlan]] = None,
         cycle_reports: Optional[list[CycleReport]] = None,
         live_gp_prior: Optional[GPPrior] = None,
         live_arrival_times_h: Optional[np.ndarray] = None,
@@ -461,6 +493,7 @@ class FrameRenderer:
             wind_direction=ground_truth.wind_direction,
             fire_arrival=ground_truth.fire.arrival_times.astype(np.float32),
             current_time=time_s,
+            drone_plans=drone_plans,
             drones=drones, resolution_m=res, shape=sh,
             raws_locations=rl,
         )
@@ -470,6 +503,7 @@ class FrameRenderer:
             fmc=est_prior.fmc_mean if est_prior is not None else None,
             wind_speed=(est_prior.wind_speed_mean if est_prior is not None else None),
             wind_direction=(est_prior.wind_dir_mean if est_prior is not None else None),
+            drone_plans=drone_plans,
             drones=drones, resolution_m=res, shape=sh,
             raws_locations=rl,
         )
@@ -479,6 +513,7 @@ class FrameRenderer:
             arrival_times_h=live_arrival_times_h,
             current_time=time_s,
             horizon_h=self.horizon_h,
+            drone_plans=drone_plans,
             drones=drones, resolution_m=res, shape=sh,
             raws_locations=rl,
         )
@@ -490,12 +525,22 @@ class FrameRenderer:
         self.panels["info"].update(
             uncertainty=info_field.w if info_field is not None else None,
             drone_targets=mission_targets or [],
+            drone_plans=drone_plans,
             drones=drones, resolution_m=res, shape=sh,
             raws_locations=rl,
         )
 
-        # ── Bottom: entropy convergence ───────────────────────────────────
-        self._update_entropy(cycle_reports or [])
+        # ── Bottom: GP variance convergence ──────────────────────────────
+        # Sample live GP variance every render frame so the curve updates
+        # as observations arrive through the network between WISP cycles.
+        live_prior = live_gp_prior if live_gp_prior is not None else gp_prior
+        if live_prior is not None:
+            live_var = float(
+                live_prior.fmc_variance.sum() + live_prior.wind_speed_variance.sum()
+            )
+            self._live_gp_trace.append((time_s / 60.0, live_var))
+
+        self._update_entropy(cycle_reports or [], time_s)
 
         # ── Save frame ────────────────────────────────────────────────────
         frame_path = self.out_dir / f"frame_{self._frame_count:05d}.png"
@@ -503,52 +548,60 @@ class FrameRenderer:
         self._frame_count += 1
         logger.debug("Frame %d saved (t=%.0fs)", self._frame_count, time_s)
 
-    def _update_entropy(self, reports: list[CycleReport]) -> None:
+    def _update_entropy(self, reports: list[CycleReport], current_time_s: float = 0.0) -> None:
         ax = self.ax_entropy
         ax.clear()
         ax.set_title(
-            "Cumulative GP Variance Reduction — Full Model vs RAWS-Only Baseline",
+            "GP Variance (FMC + Wind) — Live vs RAWS-Only Baseline",
             fontsize=8, fontweight="bold",
         )
-        ax.set_xlabel("WISP Cycle", fontsize=7)
-        ax.set_ylabel("Cumulative GP Variance Reduction (FMC + wind)", fontsize=7)
+        ax.set_xlabel("Simulation Time (min)", fontsize=7)
+        ax.set_ylabel("Total GP Variance (FMC + wind)", fontsize=7)
         ax.tick_params(labelsize=6)
         ax.grid(True, alpha=0.3)
 
-        # Full model: cumulative gp_var_reduction per cycle (greedy strategy).
-        # This is the sum of FMC+wind GP variance reduced by RAWS seeding + each
-        # successive round of drone observations.
-        gp_var_reds = [
-            r.evaluations["greedy"].gp_var_reduction
-            for r in reports
-            if "greedy" in r.evaluations
-        ]
         any_plotted = False
-        if gp_var_reds:
-            cumulative = np.cumsum(gp_var_reds)
-            ax.plot(
-                range(1, len(cumulative) + 1), cumulative,
-                color="#2196F3", linestyle="-", linewidth=1.5,
-                label="Full model (RAWS + drones)",
-            )
+
+        # Continuous live GP variance trace — updates every render frame as
+        # observations arrive through the network, not just at cycle boundaries.
+        if len(self._live_gp_trace) >= 2:
+            t_min = [pt[0] for pt in self._live_gp_trace]
+            v     = [pt[1] for pt in self._live_gp_trace]
+            ax.plot(t_min, v, color="#2196F3", linewidth=1.5,
+                    label="Live GP variance (RAWS + drones)")
             any_plotted = True
 
-        # RAWS-only baseline: how much variance a static RAWS network alone
-        # removes from the flat uninformed prior.  This is a constant horizontal
-        # line — RAWS stations are at fixed locations so their posterior-variance
-        # reduction does not grow with additional cycles.
-        if self._initial_gp_var_sum > 0 and self._raws_only_gp_var_sum > 0:
-            raws_reduction = self._initial_gp_var_sum - self._raws_only_gp_var_sum
-            n_x = max(len(gp_var_reds), 1)
+        # WISP cycle boundary markers — vertical dashed lines at each cycle time.
+        for r in reports:
+            t_cyc = r.start_time / 60.0
+            ax.axvline(t_cyc, color="#9C27B0", linestyle=":", linewidth=0.8, alpha=0.7)
+
+        # Per-cycle assimilation dots — show the GP variance *after* each full
+        # EnKF assimilation pass, colour-coded to the cycle number.
+        for r in reports:
+            if "greedy" in r.evaluations:
+                e = r.evaluations["greedy"]
+                t_cyc = r.start_time / 60.0
+                ax.scatter([t_cyc], [e.gp_var_after], marker="D",
+                           color="#9C27B0", s=28, zorder=6)
+        if reports and any("greedy" in r.evaluations for r in reports):
+            ax.scatter([], [], marker="D", color="#9C27B0", s=28,
+                       label="Post-assimilation (WISP cycle)")
+            any_plotted = True
+
+        # RAWS-only baseline: constant horizontal line showing how much variance
+        # the static RAWS network alone would leave behind.
+        if self._raws_only_gp_var_sum > 0:
+            x_max = max(current_time_s / 60.0, 1.0)
             ax.hlines(
-                raws_reduction, xmin=1, xmax=n_x,
+                self._raws_only_gp_var_sum, xmin=0, xmax=x_max,
                 colors="#FF9800", linestyles="--", linewidth=1.5,
-                label=f"RAWS-only baseline ({raws_reduction:.1f})",
+                label=f"RAWS-only floor ({self._raws_only_gp_var_sum:.0f})",
             )
             any_plotted = True
 
         if any_plotted:
-            ax.legend(fontsize=6, loc="lower right")
+            ax.legend(fontsize=6, loc="upper right")
 
     def finalize(self) -> None:
         """Close figure and optionally assemble video from PNG frames."""

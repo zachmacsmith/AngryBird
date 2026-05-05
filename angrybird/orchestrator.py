@@ -46,6 +46,7 @@ from .selectors import registry as _default_registry
 from .selectors.base import SelectorRegistry
 from .types import (
     CycleReport,
+    DronePlan,
     DroneObservation,
     EnsembleResult,
     GPPrior,
@@ -121,6 +122,7 @@ class IGNISOrchestrator:
         selector_name: str = "greedy",
         selector_registry: SelectorRegistry = _default_registry,
         n_drones: int = N_DRONES,
+        n_targets: Optional[int] = None,
         horizon_min: int = SIMULATION_HORIZON_MIN,
         n_members: int = ENSEMBLE_SIZE,
         staging_area: tuple[int, int] = (0, 0),
@@ -136,6 +138,10 @@ class IGNISOrchestrator:
         self.selector_name    = selector_name
         self.registry         = selector_registry
         self.n_drones         = n_drones
+        # n_targets: how many locations the selector picks each cycle.
+        # Defaults to n_drones so each drone gets 1 target; set higher for
+        # multi-waypoint paths when n_drones=1.
+        self.n_targets        = n_targets if n_targets is not None else n_drones
         self.horizon_min      = horizon_min
         self.n_members        = n_members
         self.staging_area     = staging_area
@@ -146,6 +152,7 @@ class IGNISOrchestrator:
         self.fire_state_alpha = 0.0   # set > 0 to enable fire location entropy term
         self.cycle_count      = 0
         self._previous_selections: list[tuple[int, int]] = []
+        self._drone_plans: list[DronePlan] = []
 
         # ── Dynamic prior ─────────────────────────────────────────────
         self.dynamic_prior = DynamicPrior(
@@ -329,7 +336,7 @@ class IGNISOrchestrator:
 
         # 6. Primary strategy selection
         primary_result = self.registry.run(
-            self.selector_name, info_field, self.gp, ensemble, k=self.n_drones,
+            self.selector_name, info_field, self.gp, ensemble, k=self.n_targets,
             terrain=self.terrain, staging_area=self.staging_area, resolution_m=self.resolution_m,
         )
 
@@ -358,6 +365,7 @@ class IGNISOrchestrator:
         # 8. Placement stability metric
         stability = jaccard(selected_locations, self._previous_selections)
         self._previous_selections = selected_locations
+        self._drone_plans = drone_plans
 
         ensemble_summary = {
             "mean_burn_probability":      float(ensemble.burn_probability.mean()),
