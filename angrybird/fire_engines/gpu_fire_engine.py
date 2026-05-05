@@ -54,6 +54,7 @@ from angrybird.config import (
     FUEL_MINERAL_SILICA_FREE,
     FUEL_PARAMS,
     FUEL_PARTICLE_DENSITY,
+    SB40_FUEL_PARAMS,
     WIND_SPEED_MAX_MS,
     WIND_SPEED_MIN_MS,
 )
@@ -71,7 +72,9 @@ except ImportError:
 # Module-level constants
 # ---------------------------------------------------------------------------
 
-_N_MODELS = 14   # rows 0-13; row 0 unused (no FM 0)
+# Unified table covers Anderson-13 (codes 1-13) AND SB40 (codes 91-204).
+# Row index = fuel code; rows 0 and 14-90 are zero (unused).
+_N_MODELS = 205   # codes 0-204; only occupied rows contribute
 _N_PARAMS = 8
 _COL_W0, _COL_SIGMA, _COL_DELTA = 0, 1, 2
 _COL_MX, _COL_HEAT, _COL_RHOP   = 3, 4, 5
@@ -102,21 +105,63 @@ def _array_from_lookup(
 
 def _build_fuel_table() -> np.ndarray:
     """
-    (14, 8) float32 parameter table.  Row index = fuel model ID.
-    SAV values are in 1/m as stored in config.py — no unit conversion needed.
+    (205, 8) float32 parameter table indexed by fuel model code.
+
+    Anderson-13 (codes 1-13) use the simple {"load", "sav", "depth", "mx", "h"}
+    schema from FUEL_PARAMS.
+
+    Scott & Burgan 40 (codes 91-204) use the per-class schema from SB40_FUEL_PARAMS:
+    load_1h/10h/100h/live_herb/live_woody, sav_1h/sav_10h/sav_100h/sav_live_herb/
+    sav_live_woody, depth, mx, h.  These are aggregated to a single-sigma Rothermel
+    input using the area-weighted characteristic SAV from Rothermel (1972):
+
+        sigma = Σ(w_i · σ_i²) / Σ(w_i · σ_i)   (dead fuel classes)
+        w0    = Σ w_i                              (total dead load)
+
+    Live fuels (herb, woody) are omitted from the simplified dead-fuel Rothermel.
     """
     tbl = np.zeros((_N_MODELS, _N_PARAMS), dtype=np.float32)
+
+    # ── Anderson-13 (simple format) ───────────────────────────────────────
     for fid, p in FUEL_PARAMS.items():
-        if not (1 <= fid < _N_MODELS):
+        if not (0 <= fid < _N_MODELS):
             continue
         tbl[fid, _COL_W0]    = p["load"]
-        tbl[fid, _COL_SIGMA] = p["sav"]   # already 1/m per config.py header
+        tbl[fid, _COL_SIGMA] = p["sav"]
         tbl[fid, _COL_DELTA] = p["depth"]
         tbl[fid, _COL_MX]    = p["mx"]
         tbl[fid, _COL_HEAT]  = p["h"]
         tbl[fid, _COL_RHOP]  = FUEL_PARTICLE_DENSITY
         tbl[fid, _COL_ST]    = FUEL_MINERAL_CONTENT
         tbl[fid, _COL_SE]    = FUEL_MINERAL_SILICA_FREE
+
+    # ── SB40 (multi-class format) ─────────────────────────────────────────
+    for fid, p in SB40_FUEL_PARAMS.items():
+        if not (0 <= fid < _N_MODELS):
+            continue
+        w_1h   = float(p.get("load_1h",   0.0))
+        w_10h  = float(p.get("load_10h",  0.0))
+        w_100h = float(p.get("load_100h", 0.0))
+        s_1h   = float(p.get("sav_1h",    0.0))
+        s_10h  = float(p.get("sav_10h",   0.0))
+        s_100h = float(p.get("sav_100h",  0.0))
+
+        w0 = w_1h + w_10h + w_100h
+        # Area-weighted characteristic SAV (Rothermel 1972, eq. 31-33):
+        # σ̄ = Σ(w_i σ_i²) / Σ(w_i σ_i)
+        num   = w_1h * s_1h**2 + w_10h * s_10h**2 + w_100h * s_100h**2
+        denom = w_1h * s_1h    + w_10h * s_10h    + w_100h * s_100h
+        sigma = num / denom if denom > 0 else 0.0
+
+        tbl[fid, _COL_W0]    = w0
+        tbl[fid, _COL_SIGMA] = sigma
+        tbl[fid, _COL_DELTA] = float(p.get("depth", 0.0))
+        tbl[fid, _COL_MX]    = float(p.get("mx",    0.0))
+        tbl[fid, _COL_HEAT]  = float(p.get("h",     0.0))
+        tbl[fid, _COL_RHOP]  = FUEL_PARTICLE_DENSITY
+        tbl[fid, _COL_ST]    = FUEL_MINERAL_CONTENT
+        tbl[fid, _COL_SE]    = FUEL_MINERAL_SILICA_FREE
+
     return tbl
 
 
@@ -158,12 +203,18 @@ def _rothermel_ros(
     st    = fp[..., _COL_ST]
     se    = fp[..., _COL_SE]
 
+    # Rothermel (1972) empirical constants are calibrated for σ in 1/ft.
+    # Our fuel table stores σ in 1/m (SI).  Convert at the boundary so all
+    # coefficient formulas (beta_op, A, gamma_max, xi, phi_w, ε) use 1/ft.
+    _INV_FT_TO_INV_M = 3.28084
+    sigma_ft = sigma / _INV_FT_TO_INV_M
+
     beta       = w0 / (delta * rho_p + 1e-10)
-    beta_op    = 3.348 * sigma.pow(-0.8189)
+    beta_op    = 3.348 * sigma_ft.pow(-0.8189)
     beta_ratio = beta / (beta_op + 1e-10)
 
-    A         = 133.0 * sigma.pow(-0.7913)
-    gamma_max = sigma.pow(1.5) / (495.0 + 0.0594 * sigma.pow(1.5))
+    A         = 133.0 * sigma_ft.pow(-0.7913)
+    gamma_max = sigma_ft.pow(1.5) / (495.0 + 0.0594 * sigma_ft.pow(1.5))
     gamma     = gamma_max * beta_ratio.pow(A) * (A * (1.0 - beta_ratio)).exp()
 
     wn    = w0 * (1.0 - st)
@@ -173,16 +224,20 @@ def _rothermel_ros(
 
     I_R = gamma * wn * heat * eta_m * eta_s
 
-    xi = ((0.792 + 0.681 * sigma.pow(0.5)) * (beta + 0.1)).exp() \
-         / (192.0 + 0.2595 * sigma)
+    xi = ((0.792 + 0.681 * sigma_ft.pow(0.5)) * (beta + 0.1)).exp() \
+         / (192.0 + 0.2595 * sigma_ft)
 
-    C = 7.47 * (-0.133 * sigma.pow(0.55)).exp()
-    B = 0.02526 * sigma.pow(0.54)
-    E = 0.715 * (-3.59e-4 * sigma).exp()
-    ws_midflame = ws * 60.0 * wind_adj   # m/min
-    phi_w = C * ws_midflame.pow(B) * beta_ratio.pow(-E)
+    # phi_w uses sigma in 1/ft AND wind in ft/min (Rothermel empirical calibration)
+    C = 7.47 * (-0.133 * sigma_ft.pow(0.55)).exp()
+    B = 0.02526 * sigma_ft.pow(0.54)
+    E = 0.715 * (-3.59e-4 * sigma_ft).exp()
+    ws_midflame = ws * (60.0 / 0.3048) * wind_adj   # m/s → ft/min
+    # NB cells: sigma=0 → beta_ratio→0 → beta_ratio^(-E)=inf; phi_s also inf at β=0.
+    # inf×sin(θ)=NaN when sin(θ)=0, propagating through theta_max into ros_dir.
+    # Zero out both multipliers for non-burnable cells; ros is nan_to_num'd below.
+    phi_w = torch.nan_to_num(C * ws_midflame.pow(B) * beta_ratio.pow(-E), nan=0.0, posinf=0.0)
 
-    phi_s = 5.275 * beta.pow(-0.3) * tan_slope_sq
+    phi_s = torch.nan_to_num(5.275 * beta.pow(-0.3) * tan_slope_sq, nan=0.0, posinf=0.0)
 
     # ── Vector wind + slope combination ───────────────────────────────────
     wind_to_rad = ((wind_dir + 180.0) % 360.0) * _DEG2RAD   # (N,R,C)
@@ -194,12 +249,16 @@ def _rothermel_ros(
     phi_combined = (rx.pow(2) + ry.pow(2) + 1e-10).sqrt()
     theta_max    = (torch.atan2(rx, ry) * _RAD2DEG) % 360.0
 
-    Q_ig  = 250.0 + 1116.0 * fmc
-    eps   = (-138.0 / (sigma + 1e-10)).exp()
+    # Q_ig: Rothermel formula gives BTU/lb → convert to J/kg so ROS comes out m/s
+    Q_ig  = (250.0 + 1116.0 * fmc) * 2326.0
+    eps   = (-138.0 / (sigma_ft + 1e-10)).exp()
     rho_b = w0 / (delta + 1e-10)
 
     ros = ((I_R * xi * (1.0 + phi_combined)) / (rho_b * eps * Q_ig + 1e-10) / 60.0
            ).clamp(min=0.0)
+    # Non-burnable cells (sigma=0, w0=0) produce NaN via 0^inf intermediates.
+    # Replace with 0 — no fire spread in non-burnable pixels.
+    ros = torch.nan_to_num(ros, nan=0.0)
 
     return ros, I_R, theta_max
 
@@ -292,18 +351,22 @@ def _redistance(
     phi: "torch.Tensor", dx: float, n_iters: int = 5
 ) -> "torch.Tensor":
     """
-    Restore |∇φ| = 1 without moving φ = 0 (narrowband, smeared sign).
+    Restore |∇φ| = 1 on the exterior (unburned) side without moving φ = 0.
 
-    Only cells within n_iters grid cells of the front are updated.  Far-field
-    cells are excluded because:
-      (a) they don't affect front propagation, and
-      (b) zero-flux BCs give |∇φ|=0 at domain edges, which causes a divergent
-          cascade if unconstrained redistancing updates propagate outward.
+    Only cells with φ > 0 (ahead of the fire front) are updated.  The Godunov
+    upwind scheme used by _phi_gradient is calibrated for an EXPANDING front
+    (the exterior, φ > 0 side).  Applying it to φ < 0 cells uses the wrong
+    characteristic direction and incorrectly pushes burned cells back toward
+    zero, which undoes crossings detected in the level-set loop.
+
+    Additionally, only cells within n_iters grid spacings of the front are
+    updated (narrowband restriction) to avoid divergent edge artefacts.
     """
     eps     = dx
     s       = phi / (phi.pow(2) + eps ** 2).sqrt()
     dt_τ    = 0.5 * dx
-    in_band = phi.abs() < (n_iters * dx + dx)
+    # Exterior narrowband: positive phi within n_iters cells of the front
+    in_band = (phi > 0) & (phi < (n_iters * dx + dx))
     zero    = torch.zeros_like(phi)
     for _ in range(n_iters):
         update = dt_τ * s * (_phi_gradient(phi, dx) - 1.0)
@@ -407,11 +470,17 @@ class GPUFireEngine:
         self._cbh = torch.tensor(cbh_np, dtype=torch.float32, device=self.device)
         self._cbd = torch.tensor(cbd_np, dtype=torch.float32, device=self.device)
 
-        cc_np  = _array_from_lookup(terrain.fuel_model, _CC_PROXY)
+        # Wind adjustment factor: prefer direct canopy_cover field (available from
+        # both LANDFIRE and synthetic_terrain); fall back to proxy lookup.
+        if hasattr(terrain, "canopy_cover") and terrain.canopy_cover is not None:
+            cc_np = np.asarray(terrain.canopy_cover, dtype=np.float32)
+        else:
+            cc_np = _array_from_lookup(terrain.fuel_model, _CC_PROXY)
         waf_np = np.where(cc_np > 0.5, 0.4, np.where(cc_np > 0.1, 0.5, 0.6)).astype(np.float32)
         self._wind_adj = torch.tensor(waf_np, dtype=torch.float32, device=self.device)
 
         fuel_table = torch.tensor(_build_fuel_table(), dtype=torch.float32, device=self.device)
+        # Clamp to valid table range; any unknown code maps to row 0 (zero load = no fire).
         fuel_idx   = torch.tensor(
             np.clip(terrain.fuel_model.astype(np.int64), 0, _N_MODELS - 1),
             dtype=torch.long, device=self.device,
