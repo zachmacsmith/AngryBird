@@ -83,25 +83,7 @@ def plot_terrain_overview(
     h_km = rows * res / 1000
     ext = [0, w_km, h_km, 0]
 
-    # Tight data bbox: fuel_model==0 is always nodata-fill (no valid SB40 code is 0)
-    valid = terrain.fuel_model != 0
-    r_valid = np.where(valid.any(axis=1))[0]
-    c_valid = np.where(valid.any(axis=0))[0]
-    if len(r_valid) and len(c_valid):
-        pad = 3
-        r0 = max(0, r_valid[0] - pad)
-        r1 = min(rows - 1, r_valid[-1] + pad)
-        c0 = max(0, c_valid[0] - pad)
-        c1 = min(cols - 1, c_valid[-1] + pad)
-        data_rows = r1 - r0 + 1
-        data_cols = c1 - c0 + 1
-        xlim = (c0 * res / 1000, (c1 + 1) * res / 1000)
-        ylim = ((r1 + 1) * res / 1000, r0 * res / 1000)
-    else:
-        data_rows, data_cols = rows, cols
-        xlim = ylim = None
-
-    data_aspect = data_rows / data_cols
+    data_aspect = rows / cols
     panel_w = 18 / 4
     fig_h = max(6, 2 * panel_w * data_aspect + 1.5)
     fig, axes = plt.subplots(
@@ -155,12 +137,6 @@ def plot_terrain_overview(
 
     _imshow(axes[1, 3], terrain.canopy_bulk_density, "Canopy Bulk Density", "Blues",
             vmin=0, colorbar_label="kg/m³", extent=ext)
-
-    if xlim is not None:
-        for row_axes in axes:
-            for ax in row_axes:
-                ax.set_xlim(*xlim)
-                ax.set_ylim(*ylim)
 
     _domain_footnote(fig, rows, cols, res)
 

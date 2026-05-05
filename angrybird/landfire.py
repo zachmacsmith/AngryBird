@@ -194,10 +194,36 @@ def _build_terrain_data(
     canopy_base_height  = np.clip(_clean(load("canopy_base_height"))  / 10.0,  0, None)
     canopy_bulk_density = np.clip(_clean(load("canopy_bulk_density")) / 100.0, 0, None)
 
-    transformer = Transformer.from_crs(ref_crs, "EPSG:4326", always_xy=True)
-    lon_nw, lat_nw = transformer.transform(ref_transform.c, ref_transform.f)
+    # Crop all arrays to the bounding box of valid (non-zero) fuel_model cells.
+    # Reprojection fills areas outside the source extent with NaN → _clean() converts
+    # to 0, leaving large borders of zeroed-out non-burnable data.  SB40 codes are
+    # always ≥ 91, so fuel_model == 0 reliably identifies these nodata cells.
+    valid = fuel_model != 0
+    row_valid = np.where(valid.any(axis=1))[0]
+    col_valid = np.where(valid.any(axis=0))[0]
+    if len(row_valid) and len(col_valid):
+        r0, r1 = int(row_valid[0]), int(row_valid[-1]) + 1
+        c0, c1 = int(col_valid[0]), int(col_valid[-1]) + 1
+        s = np.s_[r0:r1, c0:c1]
+        elevation           = elevation[s]
+        slope               = slope[s]
+        aspect              = aspect[s]
+        fuel_model          = fuel_model[s]
+        canopy_cover        = canopy_cover[s]
+        canopy_height       = canopy_height[s]
+        canopy_base_height  = canopy_base_height[s]
+        canopy_bulk_density = canopy_bulk_density[s]
+        # Shift origin to NW corner of the cropped domain (rasterio affine convention:
+        # T.c = west edge x, T.f = north edge y, pixel size = resolution_m).
+        new_x = ref_transform.c + c0 * resolution_m
+        new_y = ref_transform.f - r0 * resolution_m
+        transformer = Transformer.from_crs(ref_crs, "EPSG:4326", always_xy=True)
+        lon_nw, lat_nw = transformer.transform(new_x, new_y)
+    else:
+        transformer = Transformer.from_crs(ref_crs, "EPSG:4326", always_xy=True)
+        lon_nw, lat_nw = transformer.transform(ref_transform.c, ref_transform.f)
 
-    rows, cols = ref_shape
+    rows, cols = elevation.shape
     return TerrainData(
         elevation=elevation,
         slope=slope,
