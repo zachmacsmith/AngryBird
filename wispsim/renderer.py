@@ -277,14 +277,7 @@ class MapPanel:
                                 edgecolors="white", linewidths=1.0)
                 self._dyn.append(sc)
 
-                trail = drone.path_history[-60:]   # longer look-back
-                if len(trail) > 1:
-                    cells = [pos_m_to_cell(p, resolution_m, shape) for p in trail]
-                    ty = [c_[0] for c_ in cells]
-                    tx_ = [c_[1] for c_ in cells]
-                    ln, = ax.plot(tx_, ty, "-", color=color, alpha=0.55,
-                                  linewidth=1.5, zorder=8)
-                    self._dyn.append(ln)
+                # Historical trail suppressed — planned path lines are sufficient.
 
 
 # ---------------------------------------------------------------------------
