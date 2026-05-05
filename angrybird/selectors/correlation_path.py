@@ -57,6 +57,7 @@ from ..types import (
     SelectionResult,
     TerrainData,
 )
+from .greedy import GreedySelector
 
 if TYPE_CHECKING:
     from ..gp import IGNISGPPrior
@@ -66,6 +67,12 @@ logger = logging.getLogger(__name__)
 # 10 % budget buffer: covers comms delay, wind drift, and autopilot lag
 # between receiving the new plan and executing the first waypoint.
 BUDGET_BUFFER = 1.10
+
+# SB40 non-burnable fuel-model codes (91–99 = urban/water/ag/snow/bare)
+# and 0 (no-data / open ocean).  Domains whose burnable fraction falls
+# below NB_BURNABLE_THRESHOLD are excluded from the greedy search.
+_NB_FUEL_CODES: frozenset[int] = frozenset(range(91, 100)) | {0}
+NB_BURNABLE_THRESHOLD: float = 0.10   # 10 % burnable → treat as non-burnable
 
 
 # ---------------------------------------------------------------------------
@@ -81,6 +88,7 @@ class CorrelationDomain:
     info_value: float
     dominant_variable: str
     area_cells: int
+    burnable_fraction: float = 1.0  # fraction of cells with burnable SB40 fuel code
 
 
 @dataclass
@@ -198,6 +206,7 @@ def _build_correlation_graph(
     w_field: np.ndarray,
     w_by_variable: dict[str, np.ndarray],
     resolution_m: float,
+    fuel_model: Optional[np.ndarray] = None,   # SB40 fuel codes; None → all burnable
 ) -> CorrelationGraph:
     rows, cols = label_map.shape
     unique_ids = np.unique(label_map)
@@ -219,6 +228,14 @@ def _build_correlation_graph(
             key=lambda v: float(w_by_variable[v][rep[0], rep[1]]),
         )
 
+        # Burnable fraction: fraction of cells with SB40 codes NOT in NB set
+        if fuel_model is not None:
+            codes = fuel_model[rs, cs]
+            nb_count = int(np.isin(codes, list(_NB_FUEL_CODES)).sum())
+            burn_frac = 1.0 - nb_count / max(len(cells), 1)
+        else:
+            burn_frac = 1.0
+
         domain_dict[int(d_id)] = CorrelationDomain(
             domain_id=int(d_id),
             cells=cells,
@@ -227,9 +244,13 @@ def _build_correlation_graph(
             info_value=float(w_vals.max()),
             dominant_variable=dom_var,
             area_cells=len(cells),
+            burnable_fraction=burn_frac,
         )
 
-    # 4-connected adjacency scan
+    # 4-connected adjacency scan — also collects one boundary-cell pair per
+    # domain pair (used later for representative-cell-to-representative-cell
+    # distance, which is far more accurate than centroid-to-centroid for
+    # irregular terrain-adaptive domains).
     adjacency: set[tuple[int, int]] = set()
     for r in range(rows - 1):
         for c in range(cols - 1):
@@ -255,9 +276,12 @@ def _build_correlation_graph(
     for d_i, d_j in adjacency:
         di = domain_dict[d_i]
         dj = domain_dict[d_j]
-        real_dist = float(np.linalg.norm(di.centroid_m - dj.centroid_m))
+        # Use rep-cell-to-rep-cell distance: this is the actual flight distance
+        # the drone covers when hopping between representative (highest-w) cells,
+        # much more accurate than centroid-to-centroid for irregular domains.
         ri, ci = di.representative_cell
         rj, cj = dj.representative_cell
+        real_dist = float(np.sqrt((ri - rj) ** 2 + (ci - cj) ** 2) * resolution_m)
         feat_diff = features[ri, ci] - features[rj, cj]
         dissimilarity = float(np.sqrt((feat_diff ** 2).sum()))
         cross_corr = float(np.exp(-dissimilarity))
@@ -471,6 +495,8 @@ def _plan_greedy_path(
     gp_update_budget_m: Optional[float] = None,        # distance up to which the expensive
                                                        # GP conditional-variance update runs;
                                                        # hops beyond this get cheap zeroing only
+    blocked_domains: Optional[set[int]] = None,        # domains permanently excluded from
+                                                       # selection (e.g. ocean / non-burnable)
 ) -> tuple[list[int], float]:
     """
     Greedy orienteering from start_domain up to budget_m metres.
@@ -512,6 +538,8 @@ def _plan_greedy_path(
         for edge in graph.adj.get(current, []):
             nxt = edge.target
             if nxt in visited:
+                continue
+            if blocked_domains and nxt in blocked_domains:
                 continue
             w = current_w.get(nxt, 0.0)
             if np.isnan(w):
@@ -695,8 +723,13 @@ class CorrelationPathSelector:
         resolution_m: float = GRID_RESOLUTION_M,
         drone_states: Optional[list[DroneFlightState]] = None,
         ground_stations_m: Optional[list[np.ndarray]] = None,
+        n_drones: Optional[int] = None,
         **_,
     ) -> SelectionResult:
+        # n_drones controls how many physical drones are planned for.
+        # k is n_targets for point selectors; for path selectors only drone
+        # count matters.  Fall back to k for backward compatibility.
+        n_fleet = n_drones if n_drones is not None else k
         t0 = time.perf_counter()
         shape = terrain.shape
         d_max = self.drone_range_m
@@ -714,31 +747,42 @@ class CorrelationPathSelector:
         features = _terrain_features(terrain)
 
         # 2. Terrain-adaptive label map
-        try:
+        import warnings as _warnings
+        with _warnings.catch_warnings():
+            _warnings.filterwarnings("ignore")
             label_map = _felzenszwalb_label_map(
                 terrain, features, self.correlation_length_m, resolution_m,
                 self.min_domain_cells,
             )
-            if _is_pathological(label_map):
-                raise ValueError("Felzenszwalb produced degenerate segmentation")
-            logger.debug("Felzenszwalb: %d domains", int(label_map.max()) + 1)
-        except Exception as exc:
-            logger.warning("Felzenszwalb failed (%s); falling back to regular grid", exc)
-            label_map = _regular_grid_label_map(
-                shape, self.correlation_length_m, resolution_m
-            )
+        logger.info("Felzenszwalb: %d domains", int(label_map.max()) + 1)
 
-        # 3. Correlation graph
+        # 3. Correlation graph (pass fuel_model so burnable fraction is computed)
         graph = _build_correlation_graph(
             label_map=label_map,
             features=features,
             w_field=info_field.w,
             w_by_variable=info_field.w_by_variable,
             resolution_m=resolution_m,
+            fuel_model=terrain.fuel_model,
         )
 
         # 4. GS distance tables (one Dijkstra per GS)
         gs_distances = _compute_all_gs_distances(graph, ground_stations_m, resolution_m)
+
+        # 4b. Non-burnable domain exclusion — domains with < NB_BURNABLE_THRESHOLD
+        #     burnable fraction are blocked from greedy selection.  We log the
+        #     count so callers can spot terrain/resolution mismatches.
+        blocked_domains: set[int] = {
+            d.domain_id
+            for d in graph.domains
+            if d.burnable_fraction < NB_BURNABLE_THRESHOLD
+        }
+        if blocked_domains:
+            logger.debug(
+                "Blocking %d/%d non-burnable domains (threshold=%.0f%%)",
+                len(blocked_domains), len(graph.domains),
+                NB_BURNABLE_THRESHOLD * 100,
+            )
 
         # 5. Per-domain w values and GP variance (shared across drone plans for deconfliction)
         gp_var = info_field.gp_variance.get("fmc")
@@ -767,8 +811,8 @@ class CorrelationPathSelector:
 
         # 6. Initialise drone states on first call
         if drone_states is None:
-            drone_states = self._make_initial_states(k, staging_m)
-        while len(drone_states) < k:
+            drone_states = self._make_initial_states(n_fleet, staging_m)
+        while len(drone_states) < n_fleet:
             drone_states.append(
                 DroneFlightState(
                     drone_id=len(drone_states),
@@ -789,7 +833,15 @@ class CorrelationPathSelector:
         total_info = 0.0
         updated_states: list[DroneFlightState] = []
 
-        for state in drone_states[:k]:
+        # Greedy fallback state — computed lazily on the first NORMAL drone
+        # that triggers the low-info threshold.  One globally-optimal cell is
+        # assigned per falling-back drone in sequence.
+        _greedy_fallback_locs: Optional[list[tuple[int, int]]] = None
+        _greedy_fallback_idx: int = 0
+
+        for state in drone_states[:n_fleet]:
+            used_greedy_search = False
+
             # a. Mode transition check
             state = _check_mode_transitions(
                 state, graph, ground_stations_m, gs_distances,
@@ -825,6 +877,7 @@ class CorrelationPathSelector:
                     return_costs=tgt_return_costs,
                     remaining_range_m=state.remaining_range_m,
                     d_safety=d_safety,
+                    blocked_domains=blocked_domains,
                 )
 
                 # Fallback: if the greedy found no candidates (neighborhood
@@ -891,6 +944,7 @@ class CorrelationPathSelector:
                     # extension uses cheap domain zeroing only (no GP calls).
                     gp_update_budget_m=execute_budget,
                     # No return_costs / remaining_range_m: NORMAL has no endpoint constraint.
+                    blocked_domains=blocked_domains,
                 )
 
                 # Truncate to first-cycle distance for the actual waypoints /
@@ -909,6 +963,45 @@ class CorrelationPathSelector:
                     cum_dist += edge.real_distance_m
                 plan_distance = cum_dist
 
+                # Low-info fallback: if the first-cycle segment yields insufficient
+                # information, the drone is likely far from the fire.  Call the
+                # global GreedySelector to find the best cell on the entire map,
+                # then Dijkstra-route toward it within the cycle budget.  This
+                # makes drones track toward the fire rather than wander locally;
+                # once they arrive and information is high, planning reverts to the
+                # correlation path approach automatically.
+                cycle_info = sum(base_domain_w.get(did, 0.0) for did in domain_ids[1:])
+                if cycle_info < self.min_useful_info:
+                    # Compute global greedy targets on first trigger (shared across
+                    # all drones this cycle so each gets a distinct assigned cell).
+                    if _greedy_fallback_locs is None:
+                        _gs = GreedySelector(resolution_m=resolution_m)
+                        _gr = _gs.select(info_field, gp, ensemble, k=n_fleet)
+                        _greedy_fallback_locs = _gr.selected_locations
+
+                    if _greedy_fallback_idx < len(_greedy_fallback_locs):
+                        target_cell = _greedy_fallback_locs[_greedy_fallback_idx]
+                        _greedy_fallback_idx += 1
+                        target_domain = graph.domain_id_for_cell(target_cell)
+                        _, dijk_path = _dijkstra_path(graph, start_domain, target_domain)
+                        domain_ids = [start_domain]
+                        cum_dist = 0.0
+                        for j in range(1, len(dijk_path)):
+                            edge = graph.edge(dijk_path[j - 1], dijk_path[j])
+                            if edge is None:
+                                break
+                            if cum_dist + edge.real_distance_m > execute_budget:
+                                break
+                            domain_ids.append(dijk_path[j])
+                            current_w[dijk_path[j]] = 0.0
+                            cum_dist += edge.real_distance_m
+                        plan_distance = cum_dist
+                        used_greedy_search = True
+                        logger.info(
+                            "Drone %d: low cycle info (%.4f < %.4f) → greedy target %s",
+                            state.drone_id, cycle_info, self.min_useful_info, target_cell,
+                        )
+
                 if len(domain_ids) <= 1:
                     logger.info("Drone %d: NORMAL loitering (no high-value domains reachable)",
                                 state.drone_id)
@@ -923,7 +1016,7 @@ class CorrelationPathSelector:
                 resolution_m=resolution_m,
                 camera_footprint_cells=self.camera_footprint_cells,
                 plan_distance_m=plan_distance,
-                drone_mode=state.mode.value,
+                drone_mode="TRACKING" if used_greedy_search else state.mode.value,
             )
             drone_plans.append(plan)
 
