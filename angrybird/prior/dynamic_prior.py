@@ -467,33 +467,8 @@ class DynamicPrior:
             else:
                 _skip_wind = False
 
-<<<<<<< HEAD
-    def compute_cycle(
-        self,
-        source,
-        terrain,
-        current_time: float,
-        ensemble_result=None,
-    ) -> None:
-        """
-        Update dynamic prior from an EnvironmentalDataSource object.
-        Delegates to update_cycle using weather data provided by the source.
-        """
-        weather = source.get_weather_at(current_time) if hasattr(source, "get_weather_at") else None
-        self.update_cycle(
-            current_time=current_time,
-            terrain=terrain,
-            weather_source=weather,
-            ensemble_result=ensemble_result,
-        )
-
-    # ----------------------------------------------------------------
-    # GP interface
-    # ----------------------------------------------------------------
-=======
             self.timestamp = current_time
             self.inputs = []
->>>>>>> 601e2e99cfdfdb5a77a8ea8f791078c1c00159e9
 
             weather_m = source.get_weather(current_time)
             if weather_m:
