@@ -103,6 +103,8 @@ from .network import (
     MeshNetworkConfig,
     PingMeshNetwork,
     assign_packet_priority,
+    make_pams_like_mesh_config,
+    make_improved_mesh_config,
 )
 
 import csv
@@ -133,13 +135,30 @@ class SimulationConfig:
     # RAWS stations — 1 randomly placed by default; pass raws_locations to fix positions
     n_raws: int = 1
     raws_locations: list = field(default_factory=list)
+    # Mesh network simulation.
+    # These defaults represent the improved product mode, not the degraded PAMS baseline.
     enable_mesh_network: bool = True
-    mesh_range_m: float = 1200.0
-    mesh_max_link_age_s: float = 30.0
-    mesh_min_link_quality: float = 0.20
+
+    # Realistic small-UAS wildfire mesh assumption:
+    # enough range for multi-hop links, but not so high that every drone is always connected.
+    mesh_range_m: float = 1800.0
+
+    # A link should not disappear instantly after one missed ping.
+    # Wildfire comms can have intermittent losses, so keep links alive briefly.
+    mesh_max_link_age_s: float = 45.0
+
+    # Allow weak-but-usable links, but reject very poor links.
+    mesh_min_link_quality: float = 0.12
+
+    # Wisp uses dt = 10s, so pinging every timestep is fine.
     mesh_ping_interval_s: float = 10.0
-    mesh_packets_per_tick: int = 3
-    mesh_packet_loss_probability: float = 0.02
+
+    # More than 3 prevents old packets from clogging the queue,
+    # but not so high that the network becomes unrealistically perfect.
+    mesh_packets_per_tick: int = 8
+
+    # Small background loss, because path loss is already modeled by link quality.
+    mesh_packet_loss_probability: float = 0.015
     selector_name: str = IGNIS_SELECTOR
 
 # ---------------------------------------------------------------------------
@@ -649,17 +668,12 @@ class SimulationRunner:
         for i in range(len(self.drones)):
             drone_ids.append(self.drones[i].drone_id)
 
+        mesh_config = make_improved_mesh_config()
+
         self.network = PingMeshNetwork(
             ground_station_position=base_pos.copy(),
             drone_ids=drone_ids,
-            config=MeshNetworkConfig(
-                mesh_range_m=config.mesh_range_m,
-                max_link_age_s=config.mesh_max_link_age_s,
-                min_link_quality=config.mesh_min_link_quality,
-                ping_interval_s=config.mesh_ping_interval_s,
-                max_packets_per_drone_per_tick=config.mesh_packets_per_tick,
-                background_packet_loss_probability=config.mesh_packet_loss_probability,
-            ),
+            config=mesh_config,
             rng=np.random.default_rng(777),
         )
 

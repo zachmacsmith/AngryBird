@@ -134,30 +134,62 @@ class NeighborTable:
 
 @dataclass
 class MeshNetworkConfig:
-    """Configuration for the ping-based mesh simulation."""
-
-    mesh_range_m: float = 1200.0
-    max_link_age_s: float = 30.0
-    min_link_quality: float = 0.20
+    mesh_range_m: float = 1800.0
+    max_link_age_s: float = 45.0
+    min_link_quality: float = 0.12
     ping_interval_s: float = 10.0
 
-    # Communication cost settings.
-    hop_penalty: float = 0.03
+    # Keep a small hop penalty so the route does not take unnecessary hops.
+    # But reliability still matters more than hop count.
+    hop_penalty: float = 0.05
     latency_weight: float = 0.0
 
-    # Throughput and stochastic loss.
-    max_packets_per_drone_per_tick: int = 3
-    background_packet_loss_probability: float = 0.02
+    # Realistic improved telemetry:
+    # enough throughput for store-and-forward, not unlimited bandwidth.
+    max_packets_per_drone_per_tick: int = 8
+    background_packet_loss_probability: float = 0.015
 
-    # Link-quality smoothing. Higher = trust old value more.
+    # Smooth ping quality so routes do not jump too wildly every timestep.
     quality_smoothing_alpha: float = 0.70
 
+    # Stale non-urgent packets should not dominate real-time wildfire prediction.
+    # 300s = 5 minutes.
     max_packet_age_s: float = 300.0
 
-    # Optional relay support. Keep disabled if relay is not part of the core design.
     relay_id: Optional[str] = None
     relay_range_m: Optional[float] = None
 
+def make_pams_like_mesh_config() -> MeshNetworkConfig:
+        return MeshNetworkConfig(
+            mesh_range_m=1200.0,
+            max_link_age_s=30.0,
+            min_link_quality=0.20,
+            ping_interval_s=10.0,
+            hop_penalty=0.05,
+            latency_weight=0.0,
+            max_packets_per_drone_per_tick=3,
+            background_packet_loss_probability=0.03,
+            quality_smoothing_alpha=0.70,
+            max_packet_age_s=720.0,
+            relay_id=None,
+            relay_range_m=None,
+        )
+
+def make_improved_mesh_config() -> MeshNetworkConfig:
+        return MeshNetworkConfig(
+            mesh_range_m=1800.0,
+            max_link_age_s=45.0,
+            min_link_quality=0.12,
+            ping_interval_s=10.0,
+            hop_penalty=0.05,
+            latency_weight=0.0,
+            max_packets_per_drone_per_tick=8,
+            background_packet_loss_probability=0.015,
+            quality_smoothing_alpha=0.70,
+            max_packet_age_s=300.0,
+            relay_id=None,
+            relay_range_m=None,
+        )
 
 @dataclass
 class MeshNetworkMetrics:
@@ -345,6 +377,27 @@ class PingMeshNetwork:
 
             delivered_packet_ids: set[str] = set()
             self._drop_stale_packets(drone_id, current_time)
+
+            def _drop_stale_packets(self, drone_id: str, current_time: float) -> None:
+                if drone_id not in self.buffers:
+                    return
+
+                fresh_packets = []
+
+                for i in range(len(self.buffers[drone_id].packets)):
+                    packet = self.buffers[drone_id].packets[i]
+                    age_s = current_time - packet.created_time
+
+                    # Always keep urgent packets.
+                    if packet.priority == 1:
+                        fresh_packets.append(packet)
+
+                    # Keep normal packets only if they are still useful for real-time prediction.
+                    elif age_s <= self.config.max_packet_age_s:
+                        fresh_packets.append(packet)
+
+                self.buffers[drone_id].packets = fresh_packets
+
             candidates = self.buffers[drone_id].get_send_candidates(
                 self.config.max_packets_per_drone_per_tick
             )
