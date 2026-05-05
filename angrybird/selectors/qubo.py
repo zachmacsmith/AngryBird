@@ -299,9 +299,9 @@ class QUBOSelector:
         gains = [float(info_field.w[r, c]) for r, c in selected]
 
         return SelectionResult(
+            kind="points",
             selected_locations=selected,
             marginal_gains=gains,
-            cumulative_gain=list(np.cumsum(gains)),
             strategy_name=self.name,
             compute_time_s=time.perf_counter() - t0,
             solver_metadata={

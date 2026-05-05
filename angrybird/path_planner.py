@@ -1,5 +1,5 @@
 """
-Path planner: drone-to-target assignment, observed-cell computation, MissionQueue.
+Path planner: drone-to-target assignment, observed-cell computation, MissionRequest list.
 
 Phase 4a — ships with the production system.
 
@@ -24,7 +24,7 @@ from .config import (
     GRID_RESOLUTION_M,
     N_DRONES,
 )
-from .types import DronePlan, InformationField, MissionQueue, MissionRequest, TerrainData
+from .types import DronePlan, InformationField, MissionRequest, TerrainData
 from .utils import bresenham, grid_to_latlon
 
 logger = logging.getLogger(__name__)
@@ -157,9 +157,9 @@ def selections_to_mission_queue(
     terrain: TerrainData,
     resolution_m: float = GRID_RESOLUTION_M,
     expiry_minutes: float = CYCLE_INTERVAL_MIN * 1.5,
-) -> MissionQueue:
+) -> list[MissionRequest]:
     """
-    Convert DronePlans to a MissionQueue for the UTM layer.
+    Convert DronePlans to a list of MissionRequests for the UTM layer.
 
     Each MissionRequest is one drone's ordered path — a list of (lat, lon)
     waypoints derived from the plan's grid-cell waypoints.  Drones with no
@@ -202,4 +202,4 @@ def selections_to_mission_queue(
         ))
 
     requests.sort(key=lambda req: req.information_value, reverse=True)
-    return MissionQueue(requests=requests)
+    return requests

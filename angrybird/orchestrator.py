@@ -51,8 +51,7 @@ from .types import (
     EnsembleResult,
     GPPrior,
     InformationField,
-    MissionQueue,
-    PathSelectionResult,
+    MissionRequest,
     SelectionResult,
     TerrainData,
 )
@@ -197,7 +196,7 @@ class IGNISOrchestrator:
         exclusion_mask: Optional[np.ndarray] = None,
         start_time: float = 0.0,
         weather_source: Optional[dict] = None,
-    ) -> tuple[MissionQueue, CycleReport]:
+    ) -> tuple[list[MissionRequest], CycleReport]:
         """
         Execute one full IGNIS cycle.
 
@@ -210,7 +209,7 @@ class IGNISOrchestrator:
             exclusion_mask:        operator exclusion zones (True = excluded)
 
         Returns:
-            (MissionQueue, CycleReport) — queue for the UTM layer + diagnostics.
+            (list[MissionRequest], CycleReport) — requests for the UTM layer + diagnostics.
             CycleReport.evaluations is empty here; SimulationRunner fills it.
         """
         self.cycle_count += 1
@@ -342,7 +341,7 @@ class IGNISOrchestrator:
 
         # 7. Plan paths + build mission queue
         # Path selectors produce DronePlans directly; point selectors need the extra step.
-        if isinstance(primary_result, PathSelectionResult):
+        if primary_result.kind == "paths":
             drone_plans = primary_result.drone_plans
             selected_locations = [
                 p.waypoints[1] for p in drone_plans if len(p.waypoints) > 2

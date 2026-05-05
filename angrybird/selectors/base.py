@@ -20,7 +20,6 @@ if TYPE_CHECKING:
     from ..types import (
         EnsembleResult,
         InformationField,
-        PathSelectionResult,
         SelectionResult,
         TerrainData,
     )
@@ -28,10 +27,14 @@ if TYPE_CHECKING:
 
 @runtime_checkable
 class Selector(Protocol):
-    """Point selector: returns N grid cells ranked by information value."""
+    """
+    Duck-typed interface every selector must satisfy.
+    Point selectors set kind="points"; path selectors set kind="paths".
+    Path selectors receive terrain/staging_area/resolution_m via **context in run().
+    """
 
     name: str
-    kind: str  # "points"
+    kind: str  # "points" or "paths"
 
     def select(
         self,
@@ -39,27 +42,8 @@ class Selector(Protocol):
         gp: "IGNISGPPrior",
         ensemble: "EnsembleResult",
         k: int,
+        **context,
     ) -> "SelectionResult": ...
-
-
-@runtime_checkable
-class PathSelector(Protocol):
-    """Path selector: returns fully planned DronePlans directly."""
-
-    name: str
-    kind: str  # "paths"
-
-    def select(
-        self,
-        info_field: "InformationField",
-        gp: "IGNISGPPrior",
-        ensemble: "EnsembleResult",
-        k: int,
-        *,
-        terrain: "TerrainData",
-        staging_area: tuple[int, int],
-        resolution_m: float,
-    ) -> "PathSelectionResult": ...
 
 
 class SelectorRegistry:
@@ -103,7 +87,7 @@ class SelectorRegistry:
         ensemble: "EnsembleResult",
         k: int,
         **context,
-    ) -> "SelectionResult | PathSelectionResult":
+    ) -> "SelectionResult":
         """Run one selector by name.  Path selectors receive terrain/staging/resolution via **context."""
         sel = self[name]
         if getattr(sel, "kind", "points") == "paths":
@@ -117,7 +101,7 @@ class SelectorRegistry:
         ensemble: "EnsembleResult",
         k: int,
         **context,
-    ) -> "dict[str, SelectionResult | PathSelectionResult]":
+    ) -> "dict[str, SelectionResult]":
         """Run every registered selector; return {name: result}."""
         results = {}
         for name, sel in self._selectors.items():

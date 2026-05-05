@@ -52,10 +52,9 @@ class UniformSelector:
         selected = grid[:k]
 
         return SelectionResult(
+            kind="points",
             selected_locations=selected,
             marginal_gains=[float(info_field.w[r, c]) for r, c in selected],
-            cumulative_gain=list(np.cumsum([float(info_field.w[r, c])
-                                            for r, c in selected])),
             strategy_name=self.name,
             compute_time_s=time.perf_counter() - t0,
         )
@@ -109,9 +108,9 @@ class FireFrontSelector:
         if len(cand_rows) == 0:
             # No valid cells at all — return empty result
             return SelectionResult(
+                kind="points",
                 selected_locations=[],
                 marginal_gains=[],
-                cumulative_gain=[],
                 strategy_name=self.name,
                 compute_time_s=time.perf_counter() - t0,
             )
@@ -147,10 +146,9 @@ class FireFrontSelector:
                         break
 
         return SelectionResult(
+            kind="points",
             selected_locations=selected,
             marginal_gains=[float(info_field.w[r, c]) for r, c in selected],
-            cumulative_gain=list(np.cumsum([float(info_field.w[r, c])
-                                            for r, c in selected])),
             strategy_name=self.name,
             compute_time_s=time.perf_counter() - t0,
         )

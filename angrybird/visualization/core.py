@@ -23,7 +23,7 @@ from matplotlib.figure import Figure
 
 from ..types import (
     DronePlan, EnsembleResult, GPPrior, InformationField,
-    MissionQueue, SelectionResult, TerrainData,
+    MissionRequest, SelectionResult, TerrainData,
 )
 from ..fire_state import FireStateEstimator
 from ..observations import FireDetectionObservation
@@ -352,28 +352,28 @@ def plot_drone_placement(
 # ---------------------------------------------------------------------------
 
 def plot_mission_queue_table(
-    mission_queue: MissionQueue,
+    mission_queue: list[MissionRequest],
     title: str = "Mission Queue",
     figsize: tuple[int, int] = (11, 5),
 ) -> Figure:
     """
     §1.5 — 'What should the UTM act on?'
 
-    Renders the MissionQueue as a matplotlib table with columns:
-    Rank | Lat | Lon | Info Value | Dominant Variable | Expiry (min)
+    Renders the mission queue as a matplotlib table with columns:
+    Drone | Waypoints | First (Lat, Lon) | Info Value | Dominant Variable | Expiry (min)
     """
     fig, ax = plt.subplots(figsize=figsize)
     ax.axis("off")
     fig.suptitle(title, fontsize=12, fontweight="bold")
 
-    if not mission_queue.requests:
+    if not mission_queue:
         ax.text(0.5, 0.5, "No active requests", ha="center", va="center",
                 fontsize=12, color="gray")
         return fig
 
     col_labels = ["Drone", "Waypoints", "First (Lat, Lon)", "Info Value", "Dominant Variable", "Expiry (min)"]
     rows_data = []
-    for req in mission_queue.requests:
+    for req in mission_queue:
         first = req.path[0] if req.path else (float("nan"), float("nan"))
         rows_data.append([
             str(req.drone_id),

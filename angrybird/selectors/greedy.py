@@ -68,8 +68,6 @@ class GreedySelector:
 
         selected: list[tuple[int, int]] = []
         marginal_gains: list[float] = []
-        cumulative_gain: list[float] = []
-        running_total = 0.0
 
         for _ in range(k):
             # Recompute w from current (updated) variance
@@ -86,21 +84,18 @@ class GreedySelector:
 
             flat_idx = int(np.argmax(w))
             loc = (int(flat_idx // shape[1]), int(flat_idx % shape[1]))
-            gain = float(w[loc])
 
             selected.append(loc)
-            marginal_gains.append(gain)
-            running_total += gain
-            cumulative_gain.append(running_total)
+            marginal_gains.append(float(w[loc]))
 
             # Update GP variance to reflect the information this observation provides
             var_fmc  = gp.conditional_variance(var_fmc,  loc)
             var_wind = gp.conditional_variance(var_wind, loc)
 
         return SelectionResult(
+            kind="points",
             selected_locations=selected,
             marginal_gains=marginal_gains,
-            cumulative_gain=cumulative_gain,
             strategy_name=self.name,
             compute_time_s=time.perf_counter() - t0,
         )

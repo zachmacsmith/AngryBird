@@ -34,7 +34,7 @@ from ..config import (
     GRID_RESOLUTION_M,
 )
 from ..path_planner import cells_along_path
-from ..types import DronePlan, EnsembleResult, InformationField, PathSelectionResult, TerrainData
+from ..types import DronePlan, EnsembleResult, InformationField, SelectionResult, TerrainData
 
 if TYPE_CHECKING:
     from ..gp import IGNISGPPrior
@@ -449,7 +449,7 @@ class CorrelationPathSelector:
         staging_area: tuple[int, int],
         resolution_m: float = GRID_RESOLUTION_M,
         **_,
-    ) -> PathSelectionResult:
+    ) -> SelectionResult:
         t0 = time.perf_counter()
         shape = terrain.shape
 
@@ -528,7 +528,7 @@ class CorrelationPathSelector:
             marginal_gains.append(drone_info)
             total_info += drone_info
 
-        return PathSelectionResult(
+        return SelectionResult(
             kind="paths",
             drone_plans=drone_plans,
             strategy_name=self.name,
