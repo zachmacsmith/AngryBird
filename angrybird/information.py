@@ -44,9 +44,9 @@ def _binary_entropy(p: np.ndarray) -> np.ndarray:
     Binary entropy H(p) = -(p·log₂p + (1-p)·log₂(1-p)), clipped to [0, 1].
     Maximum = 1.0 at p = 0.5; zero at p ∈ {0, 1}.
     """
-    eps = 1e-10
-    p   = np.clip(p, eps, 1.0 - eps)
-    return -(p * np.log2(p) + (1.0 - p) * np.log2(1.0 - p))
+    p = np.clip(p, 1e-10, 1.0 - 1e-10)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        return -(p * np.log2(p) + (1.0 - p) * np.log2(1.0 - p))
 
 
 def detect_bimodality(

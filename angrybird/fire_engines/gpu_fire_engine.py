@@ -62,9 +62,11 @@ from angrybird.types import EnsembleResult, GPPrior, TerrainData
 
 try:
     import torch
+    import torch.nn.functional as F
     _TORCH_AVAILABLE = True
 except ImportError:
     torch = None  # type: ignore[assignment]
+    F = None      # type: ignore[assignment]
     _TORCH_AVAILABLE = False
 
 
@@ -295,11 +297,12 @@ def _phi_gradient(phi: "torch.Tensor", dx: float) -> "torch.Tensor":
     """
     Godunov upwind |∇φ| for an expanding front.
     Used only by _redistance — the main loop uses _phi_gradient_full.
+    Uses F.pad+slice (Neumann BCs) instead of roll+clone to halve allocations.
     """
-    phi_xp = torch.roll(phi, -1, dims=2).clone(); phi_xp[:, :, -1] = phi[:, :, -1]
-    phi_xm = torch.roll(phi,  1, dims=2).clone(); phi_xm[:, :,  0] = phi[:, :,  0]
-    phi_yp = torch.roll(phi, -1, dims=1).clone(); phi_yp[:,  -1, :] = phi[:,  -1, :]
-    phi_ym = torch.roll(phi,  1, dims=1).clone(); phi_ym[:,   0, :] = phi[:,   0, :]
+    phi_xp = F.pad(phi, (0, 1), "replicate")[:, :, 1:]    # shift left,  clamp right
+    phi_xm = F.pad(phi, (1, 0), "replicate")[:, :, :-1]   # shift right, clamp left
+    phi_yp = F.pad(phi, (0, 0, 0, 1), "replicate")[:, 1:, :]   # shift up,   clamp bottom
+    phi_ym = F.pad(phi, (0, 0, 1, 0), "replicate")[:, :-1, :]  # shift down, clamp top
 
     Dxm = (phi - phi_xm) / dx;  Dxp = (phi_xp - phi) / dx
     Dym = (phi - phi_ym) / dx;  Dyp = (phi_yp - phi) / dx
@@ -315,9 +318,8 @@ def _phi_gradient_full(
     """
     Fused gradient: Godunov upwind |∇φ| AND central-difference components.
 
-    Performs 4 roll+clone operations (vs 8 if _phi_gradient and
-    _phi_grad_components are called separately), halving the memory traffic
-    of the gradient pass in the hot loop.
+    Uses F.pad+slice for Neumann BCs — 4 pad ops (1 alloc each) instead of
+    4 roll+clone pairs (2 allocs each), halving peak memory in the hot loop.
 
     Returns
     -------
@@ -325,10 +327,10 @@ def _phi_gradient_full(
     gx_cd    : (N, R, C) — ∂φ/∂x (central diff, signed, for normal direction)
     gy_cd    : (N, R, C) — ∂φ/∂y (central diff, signed, for normal direction)
     """
-    phi_xp = torch.roll(phi, -1, dims=2).clone(); phi_xp[:, :, -1] = phi[:, :, -1]
-    phi_xm = torch.roll(phi,  1, dims=2).clone(); phi_xm[:, :,  0] = phi[:, :,  0]
-    phi_yp = torch.roll(phi, -1, dims=1).clone(); phi_yp[:,  -1, :] = phi[:,  -1, :]
-    phi_ym = torch.roll(phi,  1, dims=1).clone(); phi_ym[:,   0, :] = phi[:,   0, :]
+    phi_xp = F.pad(phi, (0, 1), "replicate")[:, :, 1:]    # shift left,  clamp right
+    phi_xm = F.pad(phi, (1, 0), "replicate")[:, :, :-1]   # shift right, clamp left
+    phi_yp = F.pad(phi, (0, 0, 0, 1), "replicate")[:, 1:, :]   # shift up,   clamp bottom
+    phi_ym = F.pad(phi, (0, 0, 1, 0), "replicate")[:, :-1, :]  # shift down, clamp top
 
     Dxm = (phi - phi_xm) / dx;  Dxp = (phi_xp - phi) / dx
     Dym = (phi - phi_ym) / dx;  Dyp = (phi_yp - phi) / dx
@@ -521,29 +523,33 @@ class GPUFireEngine:
         sentinel_s  = total_s * 1.1
         max_arrival = 2.0 * float(horizon_min)
 
-        # ── Per-member perturbations ──────────────────────────────────────
+        # ── Per-member perturbations (generated on device to avoid PCIe transfer) ──
+        # At large N (200-1000), rng.standard_normal((N,R,C)) → numpy alloc + transfer
+        # is the dominant bottleneck.  torch.randn on device eliminates both.
         fmc_std = np.sqrt(np.clip(gp_prior.fmc_variance,        0.0, None)).astype(np.float32)
         ws_std  = np.sqrt(np.clip(gp_prior.wind_speed_variance, 0.0, None)).astype(np.float32)
         wd_std  = np.sqrt(np.clip(gp_prior.wind_dir_variance,   0.0, None)).astype(np.float32)
 
-        n_fmc = rng.standard_normal((n_members, rows, cols)).astype(np.float32)
-        n_ws  = rng.standard_normal((n_members, rows, cols)).astype(np.float32)
-        n_wd  = rng.standard_normal((n_members, rows, cols)).astype(np.float32)
+        # Seed torch RNG from numpy rng for reproducibility
+        if rng is not None:
+            torch.manual_seed(int(rng.integers(0, 2**31)))
 
-        fmc_np = np.clip(
-            gp_prior.fmc_mean[np.newaxis] + n_fmc * fmc_std[np.newaxis],
-            FMC_MIN_FRACTION, FMC_MAX_FRACTION,
-        ).astype(np.float32)
-        ws_np = np.clip(
-            gp_prior.wind_speed_mean[np.newaxis] + n_ws * ws_std[np.newaxis],
-            WIND_SPEED_MIN_MS, WIND_SPEED_MAX_MS,
-        ).astype(np.float32)
-        wd_np = ((gp_prior.wind_dir_mean[np.newaxis] + n_wd * wd_std[np.newaxis]) % 360.0
-                 ).astype(np.float32)
+        # GP prior stats: (R,C) → device; broadcast with (N,R,C) noise automatically
+        fmc_mean_t = torch.tensor(gp_prior.fmc_mean.astype(np.float32),         device=self.device)
+        fmc_std_t  = torch.tensor(fmc_std,                                       device=self.device)
+        ws_mean_t  = torch.tensor(gp_prior.wind_speed_mean.astype(np.float32),   device=self.device)
+        ws_std_t   = torch.tensor(ws_std,                                        device=self.device)
+        wd_mean_t  = torch.tensor(gp_prior.wind_dir_mean.astype(np.float32),     device=self.device)
+        wd_std_t   = torch.tensor(wd_std,                                        device=self.device)
 
-        fmc = torch.tensor(fmc_np, dtype=torch.float32, device=self.device)
-        ws  = torch.tensor(ws_np,  dtype=torch.float32, device=self.device)
-        wd  = torch.tensor(wd_np,  dtype=torch.float32, device=self.device)
+        fmc = (fmc_mean_t + torch.randn(n_members, rows, cols, dtype=torch.float32, device=self.device) * fmc_std_t).clamp(FMC_MIN_FRACTION, FMC_MAX_FRACTION)
+        ws  = (ws_mean_t  + torch.randn(n_members, rows, cols, dtype=torch.float32, device=self.device) * ws_std_t).clamp(WIND_SPEED_MIN_MS, WIND_SPEED_MAX_MS)
+        wd  = (wd_mean_t  + torch.randn(n_members, rows, cols, dtype=torch.float32, device=self.device) * wd_std_t) % 360.0
+
+        # CPU copies for EnsembleResult — transferred once at end of run()
+        fmc_np = fmc.cpu().numpy()
+        ws_np  = ws.cpu().numpy()
+        wd_np  = wd.cpu().numpy()
 
         # ── SDF initialisation ────────────────────────────────────────────
         arrival_t = torch.full(
@@ -624,10 +630,11 @@ class GPUFireEngine:
 
             phi_new  = phi - dt_step * ros_f * grad_mag
 
-            # Sub-timestep arrival: linear interpolation to the zero crossing
+            # Sub-timestep arrival: linear interpolation to the zero crossing.
+            # torch.where avoids boolean scatter (MPS boolean indexing is buggy at large N).
             crossing = (phi > 0) & (phi_new <= 0)
             t_cross  = t + dt_step * phi / (phi - phi_new + 1e-10)
-            arrival_t[crossing] = t_cross[crossing]
+            arrival_t = torch.where(crossing, t_cross, arrival_t)
 
             phi   = phi_new
             step += 1

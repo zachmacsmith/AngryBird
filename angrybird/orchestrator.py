@@ -23,7 +23,7 @@ from typing import Optional, Protocol, runtime_checkable
 import numpy as np
 
 from .assimilation import assimilate_observations
-from .prior import DynamicPrior
+from .prior import DynamicPrior, EnvironmentalDataSource, StaticDataSource
 from .config import (
     DRONE_RANGE_M,
     ENSEMBLE_SIZE,
@@ -135,6 +135,7 @@ class IGNISOrchestrator:
         bimodal_alpha: float = 0.5,
         bimodal_beta: float = 0.3,
         ground_stations: Optional[list[tuple[int, int]]] = None,
+        data_source: Optional[EnvironmentalDataSource] = None,
     ) -> None:
         self.terrain          = terrain
         self.gp               = gp
@@ -177,11 +178,12 @@ class IGNISOrchestrator:
         # Initialised lazily on first cycle (need graph to be built).
         self._drone_states: Optional[list[DroneFlightState]] = None
 
-        # ── Dynamic prior ─────────────────────────────────────────────
+        # ── Dynamic prior + data source ───────────────────────────────
         self.dynamic_prior = DynamicPrior(
             grid_shape=terrain.shape,
             resolution_m=resolution_m,
         )
+        self.data_source: Optional[EnvironmentalDataSource] = data_source
 
         # ── Fire state estimation components ──────────────────────────────
         # max_arrival sentinel: 2× horizon in seconds (mirrors GPU engine's
@@ -213,8 +215,8 @@ class IGNISOrchestrator:
 
     def run_cycle(
         self,
-        fire_state: np.ndarray,
         observations: list[DroneObservation],
+        fire_state: Optional[np.ndarray] = None,
         ensemble: Optional[EnsembleResult] = None,
         priority_weight_field: Optional[np.ndarray] = None,
         exclusion_mask: Optional[np.ndarray] = None,
@@ -225,8 +227,11 @@ class IGNISOrchestrator:
         Execute one full IGNIS cycle.
 
         Args:
-            fire_state:            bool/float32[rows, cols] current burn mask
             observations:          DroneObservations from the previous cycle
+            fire_state:            DEPRECATED — oracle burn mask; pass None
+                                   (or omit) to use obs_store fire detections.
+                                   Still accepted for backward compatibility with
+                                   CycleRunner; ignored when initial_phi is set.
             ensemble:              pre-computed EnsembleResult (SimulationRunner
                                    passes one to avoid double computation)
             priority_weight_field: operator priority overlay (>1 in priority regions)
@@ -241,16 +246,26 @@ class IGNISOrchestrator:
         shape = self.terrain.shape
         _t = {}  # phase timing: name → wall seconds
 
-        # 0. Update dynamic prior from weather + last cycle's ensemble, then
-        #    push derived fields into the GP as prior means.
+        # 0. Update dynamic prior, then push derived fields into the GP as prior means.
+        #    Prefer self.data_source (new API); fall back to weather_source dict (legacy).
         _t0 = time.perf_counter()
-        if weather_source is not None:
+        active_source = self.data_source
+        if active_source is None and weather_source is not None:
+            # Legacy dict path: keep existing callers (e.g. tests) working
             self.dynamic_prior.update_cycle(
                 current_time=start_time,
                 terrain=self.terrain,
                 weather_source=weather_source,
                 ensemble_result=self._last_ensemble_result,
             )
+        elif active_source is not None:
+            self.dynamic_prior.compute_cycle(
+                source=active_source,
+                terrain=self.terrain,
+                current_time=start_time,
+                ensemble_result=self._last_ensemble_result,
+            )
+        if self.dynamic_prior.is_initialized():
             means = self.dynamic_prior.get_gp_prior_means()
             if means["fmc"] is not None:
                 self.gp.set_nelson_mean(means["fmc"])
@@ -288,55 +303,93 @@ class IGNISOrchestrator:
         _t["gp_fit_post"] = time.perf_counter() - _t0
 
         # ── Fire state management ─────────────────────────────────────────
+        # Primary path: obs_store fire detections drive all fire state
+        # estimation.  fire_state (oracle burn mask) is accepted only for
+        # backward compatibility with CycleRunner and ignored when initial_phi
+        # is available from the ensemble fire state.
         _t0 = time.perf_counter()
-        if not self.ensemble_fire_state.initialized:
-            self.ensemble_fire_state.initialize_from_fire_state(fire_state)
-
         initial_phi_for_engine: Optional[np.ndarray] = None
-        fire_obs = self.obs_store.get_fire_detections(
-            since=self._last_cycle_time_s)
 
-        if fire_obs and self._last_ensemble_result is not None:
-            should_reset, disagreement = self.consistency_checker.check(
-                fire_obs, self._last_ensemble_result, start_time)
-
-            if should_reset:
-                arrival_field = self.fire_state_estimator.reconstruct_arrival_time(
-                    fire_obs, start_time, self.terrain, gp_prior)
-                self.ensemble_fire_state.initialize_from_reconstruction(
-                    arrival_field,
-                    self.fire_state_estimator.arrival_uncertainty,
-                    current_time=start_time,
-                )
-                logger.info(
-                    "Cycle %d | fire state HARD RESET | disagreement=%.0f%% | "
-                    "n_obs=%d",
-                    self.cycle_count, disagreement * 100, len(fire_obs),
-                )
+        if not self.ensemble_fire_state.initialized:
+            if fire_state is not None:
+                # Legacy / CycleRunner path: oracle burn mask available.
+                self.ensemble_fire_state.initialize_from_fire_state(fire_state)
             else:
-                indices, n_eff = particle_filter_fire(
-                    self._last_ensemble_result, fire_obs,
-                    start_time, self.n_members)
-                self.ensemble_fire_state.resample(indices)
-                logger.info(
-                    "Cycle %d | fire state particle filter | "
-                    "disagreement=%.0f%% | N_eff=%.0f",
-                    self.cycle_count, disagreement * 100, n_eff,
-                )
+                # Primary path: reconstruct from all accumulated fire detections.
+                seed_obs = self.obs_store.get_fire_detections()
+                if seed_obs:
+                    arrival_field = self.fire_state_estimator.reconstruct_arrival_time(
+                        seed_obs, start_time, self.terrain, gp_prior)
+                    self.ensemble_fire_state.initialize_from_reconstruction(
+                        arrival_field,
+                        self.fire_state_estimator.arrival_uncertainty,
+                        current_time=start_time,
+                    )
+                    logger.info(
+                        "Cycle %d | fire state INITIALIZED from %d observations",
+                        self.cycle_count, len(seed_obs),
+                    )
+                else:
+                    logger.warning(
+                        "Cycle %d | no fire detections in store yet — "
+                        "fire state deferred; ensemble will use null initial state",
+                        self.cycle_count,
+                    )
+
+        # Incremental update: particle filter or hard reset from new obs
+        if self.ensemble_fire_state.initialized and self._last_ensemble_result is not None:
+            fire_obs = self.obs_store.get_fire_detections(since=self._last_cycle_time_s)
+            if fire_obs:
+                should_reset, disagreement = self.consistency_checker.check(
+                    fire_obs, self._last_ensemble_result, start_time)
+
+                if should_reset:
+                    arrival_field = self.fire_state_estimator.reconstruct_arrival_time(
+                        fire_obs, start_time, self.terrain, gp_prior)
+                    self.ensemble_fire_state.initialize_from_reconstruction(
+                        arrival_field,
+                        self.fire_state_estimator.arrival_uncertainty,
+                        current_time=start_time,
+                    )
+                    logger.info(
+                        "Cycle %d | fire state HARD RESET | disagreement=%.0f%% | "
+                        "n_obs=%d",
+                        self.cycle_count, disagreement * 100, len(fire_obs),
+                    )
+                else:
+                    indices, n_eff = particle_filter_fire(
+                        self._last_ensemble_result, fire_obs,
+                        start_time, self.n_members)
+                    self.ensemble_fire_state.resample(indices)
+                    logger.info(
+                        "Cycle %d | fire state particle filter | "
+                        "disagreement=%.0f%% | N_eff=%.0f",
+                        self.cycle_count, disagreement * 100, n_eff,
+                    )
 
         if self.ensemble_fire_state.initialized:
-            initial_phi_for_engine = self.ensemble_fire_state.get_initial_phi(
-                start_time)
+            initial_phi_for_engine = self.ensemble_fire_state.get_initial_phi(start_time)
         _t["fire_state"] = time.perf_counter() - _t0
 
         # 4. Ensemble — use caller-provided or run fire engine
         _t0 = time.perf_counter()
         if ensemble is None:
-            ensemble = self.fire_engine.run(
-                self.terrain, gp_prior, fire_state,
-                self.n_members, self.horizon_min, rng,
-                initial_phi=initial_phi_for_engine,
-            )
+            if initial_phi_for_engine is None and fire_state is None:
+                # No fire state available at all — cannot run ensemble.
+                # This should only occur on cycle 1 if the obs_store has no
+                # fire detections (e.g. ignition seed was not injected).
+                logger.warning(
+                    "Cycle %d | skipping ensemble: no fire state available",
+                    self.cycle_count,
+                )
+                ensemble = _neutral_ensemble(shape, self.n_members)
+            else:
+                ensemble = self.fire_engine.run(
+                    self.terrain, gp_prior,
+                    fire_state,          # None OK: engine ignores when initial_phi set
+                    self.n_members, self.horizon_min, rng,
+                    initial_phi=initial_phi_for_engine,
+                )
         _t["ensemble"] = time.perf_counter() - _t0
 
         # Carry forward per-member fire state for next cycle.
@@ -478,7 +531,6 @@ class IGNISOrchestrator:
                     remaining_range_m=DRONE_RANGE_M,
                     mode=DroneMode.NORMAL,
                     target_gs_idx=-1,
-                    visited_domains=set(),
                     sortie_distance_m=0.0,
                     returned=False,
                 ))
