@@ -105,6 +105,12 @@ def main(
 ) -> None:
     t0 = time.time()
 
+    # ── Resolve cache_dir relative to repo root if it doesn't exist as-is ──
+    _cache = Path(cache_dir)
+    if not _cache.is_absolute() and not _cache.is_dir():
+        _cache = Path(__file__).resolve().parent.parent / cache_dir
+    cache_dir = str(_cache)
+
     # ── Load LANDFIRE terrain ─────────────────────────────────────────────
     log.info("Loading LANDFIRE terrain from '%s' …", cache_dir)
     terrain = load_from_directory(cache_dir, resolution_m=100.0)
@@ -254,7 +260,6 @@ if __name__ == "__main__":
                         help="Number of drones (default: 1)")
     parser.add_argument("--targets", type=int, default=6,
                         help="Waypoints selected per cycle (default: 6)")
-    parser.add_argument("--members", type=int, default=20,
     parser.add_argument("--members", type=int, default=200,
                         help="Ensemble size (default: 20)")
     parser.add_argument("--hours",   type=float, default=1.0,
