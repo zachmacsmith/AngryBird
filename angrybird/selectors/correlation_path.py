@@ -8,13 +8,20 @@ boundaries follow ridgelines, fuel transitions, and aspect breaks.
 
 Three operating modes per drone (all transitions are one-way within a sortie):
 
-  NORMAL    — budget=d_cycle, free exploration, nearest-GS return cost
-  RETURN    — budget=min(d_cycle, r-d_safety), reachability invariant enforced,
-               target GS locked at NORMAL→RETURN transition
-  EMERGENCY — direct shortest path to target GS, no optimisation
+  NORMAL    — budget = 1.1 × d_cycle, free exploration from current position,
+               no endpoint constraint. Greedy stops when budget exhausted.
+  RETURN    — budget = min(d_cycle, r - d_safety), battery feasibility enforced,
+               target GS locked at NORMAL→RETURN transition. Falls back to
+               Dijkstra toward target GS if greedy finds no candidates.
+  EMERGENCY — direct shortest path to target GS, no optimisation.
 
 Drone states persist across cycles (same sortie). On GS landing the
 orchestrator resets battery and mode for the next sortie.
+
+Visited-domain exclusion is local to each planning call (prevents within-path
+cycles). Cross-cycle exclusion is unnecessary: the info field's GP variance
+already encodes observation history — w_i falls at observed locations and rises
+again only when genuine new uncertainty develops there.
 """
 
 from __future__ import annotations
@@ -55,6 +62,10 @@ if TYPE_CHECKING:
     from ..gp import IGNISGPPrior
 
 logger = logging.getLogger(__name__)
+
+# 10 % budget buffer: covers comms delay, wind drift, and autopilot lag
+# between receiving the new plan and executing the first waypoint.
+BUDGET_BUFFER = 1.10
 
 
 # ---------------------------------------------------------------------------
@@ -370,11 +381,10 @@ def _check_mode_transitions(
     R_threshold: float,
 ) -> DroneFlightState:
     """
-    Apply NORMAL→RETURN and RETURN→EMERGENCY transitions in-place.
+    Apply NORMAL→RETURN and RETURN→EMERGENCY transitions.
     Returns a shallow copy of state with updated mode/target_gs_idx.
     """
     state = copy.copy(state)
-    state.visited_domains = set(state.visited_domains)
 
     if state.mode == DroneMode.EMERGENCY:
         return state  # terminal mode
@@ -450,24 +460,35 @@ def _plan_greedy_path(
     graph: CorrelationGraph,
     start_domain: int,
     budget_m: float,
-    return_costs: dict[int, float],    # domain → distance to return destination
-    current_w: dict[int, float],       # mutable — visited domains zeroed on selection
-    current_var: np.ndarray,           # GP variance, updated in-place
+    current_w: dict[int, float],         # mutable — visited domains zeroed on selection
+    current_var: np.ndarray,             # GP variance, updated in-place
     gp: "IGNISGPPrior",
-    visited_global: set[int],          # already-observed domains (entire sortie)
+    return_costs: Optional[dict[int, float]] = None,   # RETURN mode: dist to target GS
+    remaining_range_m: Optional[float] = None,         # RETURN mode: current battery
+    d_safety: float = 0.0,                             # RETURN mode: safety margin
 ) -> tuple[list[int], float]:
     """
     Greedy orienteering from start_domain up to budget_m metres.
 
-    return_costs governs the feasibility constraint:
-      - NORMAL:  nearest-GS distances (no safety margin in budget)
-      - RETURN:  target-GS distances (budget already = r - d_safety)
+    visited is a LOCAL set, scoped to this call — it only prevents the path from
+    revisiting a domain it has already queued in this cycle.  Cross-cycle exclusion
+    is handled by the info field: after assimilation, GP variance (and therefore
+    w_i) drops at observed locations, so the greedy naturally avoids them without
+    any persistent state.
+
+    NORMAL  — budget_m = 1.1 × d_cycle. No endpoint constraint; greedy runs
+              until budget exhausted. Drone ends wherever the path ends.
+
+    RETURN  — budget_m = min(d_cycle, r - d_safety).
+              Battery feasibility: traveled + d + dist_to_gs(nxt) + d_safety ≤ r.
+              Caller falls back to Dijkstra toward GS if this returns a trivial path.
 
     Returns (domain_id_path, total_distance_m).
     """
     path = [start_domain]
-    visited = {start_domain} | visited_global
+    visited = {start_domain}    # local only — discarded when function returns
     remaining = budget_m
+    traveled = 0.0
     current = start_domain
     total_dist = 0.0
     rep_by_id = {d.domain_id: d.representative_cell for d in graph.domains}
@@ -484,17 +505,24 @@ def _plan_greedy_path(
             w = current_w.get(nxt, 0.0)
             if w <= 0.0:
                 continue
-            ret = return_costs.get(nxt, np.inf)
-            if edge.real_distance_m + ret > remaining:
+            d = edge.real_distance_m
+
+            # Cycle budget: can we afford this hop?
+            if d > remaining:
                 continue
 
-            total_info = w + edge.information_gain
-            score = total_info / (edge.real_distance_m + 1.0)
+            # RETURN mode: battery feasibility — from nxt we must be able to
+            # reach target GS with remaining battery minus safety margin.
+            if return_costs is not None and remaining_range_m is not None:
+                ret = return_costs.get(nxt, np.inf)
+                if traveled + d + ret + d_safety > remaining_range_m:
+                    continue
 
+            score = (w + edge.information_gain) / (d + 1.0)
             if score > best_score:
                 best_score = score
                 best_domain = nxt
-                best_travel = edge.real_distance_m
+                best_travel = d
 
         if best_domain is None:
             break
@@ -520,27 +548,11 @@ def _plan_greedy_path(
         path.append(best_domain)
         visited.add(best_domain)
         remaining -= best_travel
+        traveled  += best_travel
         total_dist += best_travel
         current = best_domain
 
     return path, total_dist
-
-
-# ---------------------------------------------------------------------------
-# Revisit threshold
-# ---------------------------------------------------------------------------
-
-def _apply_revisit_threshold(
-    visited_domains: set[int],
-    domain_w: dict[int, float],
-    percentile: float,
-) -> set[int]:
-    """Remove domains from visited_domains if their w_i > top-percentile threshold."""
-    all_w = [v for v in domain_w.values() if v > 0]
-    if not all_w:
-        return set(visited_domains)
-    threshold = float(np.percentile(all_w, percentile))
-    return {d for d in visited_domains if domain_w.get(d, 0.0) <= threshold}
 
 
 # ---------------------------------------------------------------------------
@@ -568,7 +580,6 @@ def _domains_to_drone_plan(
         )
 
     domain_by_id = {d.domain_id: d for d in graph.domains}
-    # Start waypoint derived from position_m
     rows, cols = shape
     start_row = int(np.clip(start_pos_m[0] / resolution_m, 0, rows - 1))
     start_col = int(np.clip(start_pos_m[1] / resolution_m, 0, cols - 1))
@@ -619,7 +630,6 @@ class CorrelationPathSelector:
         d_cycle_m: float = DRONE_CYCLE_DISTANCE_M,
         R_threshold: float = DRONE_RETURN_THRESHOLD,
         safety_fraction: float = DRONE_SAFETY_FRACTION,
-        revisit_percentile: float = DRONE_REVISIT_PERCENTILE,
         min_useful_info: float = DRONE_MIN_USEFUL_INFO,
     ) -> None:
         self.correlation_length_m   = correlation_length_m
@@ -629,7 +639,6 @@ class CorrelationPathSelector:
         self.d_cycle_m              = d_cycle_m
         self.R_threshold            = R_threshold
         self.d_safety               = safety_fraction * drone_range_m
-        self.revisit_percentile     = revisit_percentile
         self.min_useful_info        = min_useful_info
 
     # ------------------------------------------------------------------
@@ -648,7 +657,6 @@ class CorrelationPathSelector:
                 remaining_range_m=self.drone_range_m,
                 mode=DroneMode.NORMAL,
                 target_gs_idx=-1,
-                visited_domains=set(),
             )
             for i in range(n_drones)
         ]
@@ -713,9 +721,8 @@ class CorrelationPathSelector:
 
         # 4. GS distance tables (one Dijkstra per GS)
         gs_distances = _compute_all_gs_distances(graph, ground_stations_m, resolution_m)
-        min_return_costs = _min_gs_return_costs(gs_distances)
 
-        # 5. Initial per-domain w values and GP variance (shared across drone plans)
+        # 5. Per-domain w values and GP variance (shared across drone plans for deconfliction)
         base_domain_w: dict[int, float] = {d.domain_id: d.info_value for d in graph.domains}
         gp_var = info_field.gp_variance.get("fmc")
         if gp_var is None:
@@ -733,12 +740,11 @@ class CorrelationPathSelector:
                     remaining_range_m=d_max,
                     mode=DroneMode.NORMAL,
                     target_gs_idx=-1,
-                    visited_domains=set(),
                 )
             )
 
-        # Shared current_w — zeroed for domains already visited by earlier drones
-        # (cross-drone deconfliction via shared GP variance update)
+        # Shared current_w: domains visited by earlier drones are zeroed via GP
+        # variance updates, ensuring cross-drone deconfliction without persistent state.
         current_w: dict[int, float] = dict(base_domain_w)
 
         # 7. Plan each drone
@@ -754,18 +760,12 @@ class CorrelationPathSelector:
                 resolution_m, d_max, d_safety, self.R_threshold,
             )
 
-            # b. Re-admit visited domains where w > revisit threshold
-            state.visited_domains = _apply_revisit_threshold(
-                state.visited_domains, current_w, self.revisit_percentile
-            )
-
             start_domain = _pos_to_domain(state.position_m, graph, resolution_m)
             plan_distance = 0.0
             landed = False
 
-            # c. Plan according to mode
+            # b. Plan according to mode
             if state.mode == DroneMode.EMERGENCY:
-                # Direct shortest path to target GS
                 gs_domain = _pos_to_domain(
                     ground_stations_m[state.target_gs_idx], graph, resolution_m
                 )
@@ -775,7 +775,6 @@ class CorrelationPathSelector:
                             state.drone_id, state.target_gs_idx, plan_distance)
 
             elif state.mode == DroneMode.RETURN:
-                # Greedy with reachability invariant using target-GS return costs
                 tgt_return_costs = gs_distances[state.target_gs_idx]
                 budget = min(self.d_cycle_m, state.remaining_range_m - d_safety)
                 budget = max(budget, 0.0)
@@ -784,53 +783,76 @@ class CorrelationPathSelector:
                     graph=graph,
                     start_domain=start_domain,
                     budget_m=budget,
-                    return_costs=tgt_return_costs,
                     current_w=current_w,
                     current_var=current_var,
                     gp=gp,
-                    visited_global=state.visited_domains,
+                    return_costs=tgt_return_costs,
+                    remaining_range_m=state.remaining_range_m,
+                    d_safety=d_safety,
                 )
 
-                # Detect final return cycle: endpoint within d_safety of GS
-                gs_domain = _pos_to_domain(
-                    ground_stations_m[state.target_gs_idx], graph, resolution_m
-                )
+                # Fallback: if the greedy found no candidates (neighborhood
+                # genuinely empty — zero w, not a visited-set issue), walk the
+                # Dijkstra shortest path toward the target GS, collecting whatever
+                # info lies along the way, subject to budget + battery constraints.
+                if len(domain_ids) <= 1:
+                    gs_domain = _pos_to_domain(
+                        ground_stations_m[state.target_gs_idx], graph, resolution_m
+                    )
+                    _, dijk_path = _dijkstra_path(graph, start_domain, gs_domain)
+                    traveled_fb = 0.0
+                    domain_ids = [start_domain]
+                    for nxt in dijk_path[1:]:
+                        edge = graph.edge(domain_ids[-1], nxt)
+                        if edge is None:
+                            break
+                        d = edge.real_distance_m
+                        if traveled_fb + d > budget:
+                            break
+                        if traveled_fb + d + tgt_return_costs.get(nxt, np.inf) + d_safety > state.remaining_range_m:
+                            break
+                        domain_ids.append(nxt)
+                        current_w[nxt] = 0.0
+                        traveled_fb += d
+                    plan_distance = traveled_fb
+                    logger.info("Drone %d: RETURN fallback → Dijkstra toward GS%d (%.0f m, %d hops)",
+                                state.drone_id, state.target_gs_idx, plan_distance, len(domain_ids) - 1)
+
+                if len(domain_ids) <= 1:
+                    logger.info("Drone %d: RETURN loitering (budget=%.0f m)", state.drone_id, budget)
+
+                # Detect final return: endpoint within d_safety of GS
                 end_to_gs = tgt_return_costs.get(domain_ids[-1], np.inf)
                 if end_to_gs <= d_safety:
-                    # Append GS domain to path so plan ends at station
+                    gs_domain = _pos_to_domain(
+                        ground_stations_m[state.target_gs_idx], graph, resolution_m
+                    )
                     _, path_to_gs = _dijkstra_path(graph, domain_ids[-1], gs_domain)
                     for nd in path_to_gs[1:]:
                         domain_ids.append(nd)
-                    plan_distance = tgt_return_costs.get(start_domain, 0.0) - tgt_return_costs.get(domain_ids[-1], 0.0)
-                    # Approximate: use budget used
-                    plan_distance = min(state.remaining_range_m - d_safety, plan_distance)
                     landed = True
                     logger.info("Drone %d: RETURN final cycle → GS%d",
                                 state.drone_id, state.target_gs_idx)
 
-                # Loiter detection: if plan is trivially short, log
-                if len(domain_ids) <= 1:
-                    logger.info("Drone %d: RETURN loitering (budget=%.0f m)", state.drone_id, budget)
-
             else:  # NORMAL
-                budget = self.d_cycle_m
+                # Budget includes 10 % buffer for comms lag / wind drift.
+                # No endpoint constraint: drone ends wherever the greedy stops.
+                budget = self.d_cycle_m * BUDGET_BUFFER
                 domain_ids, plan_distance = _plan_greedy_path(
                     graph=graph,
                     start_domain=start_domain,
                     budget_m=budget,
-                    return_costs=min_return_costs,
                     current_w=current_w,
                     current_var=current_var,
                     gp=gp,
-                    visited_global=state.visited_domains,
+                    # No return_costs / remaining_range_m: NORMAL has no endpoint constraint.
                 )
 
-                # Loiter detection
                 if len(domain_ids) <= 1:
                     logger.info("Drone %d: NORMAL loitering (no high-value domains reachable)",
                                 state.drone_id)
 
-            # d. Build DronePlan
+            # c. Build DronePlan
             plan = _domains_to_drone_plan(
                 drone_id=state.drone_id,
                 domain_ids=domain_ids,
@@ -844,7 +866,7 @@ class CorrelationPathSelector:
             )
             drone_plans.append(plan)
 
-            # e. Info gain accounting
+            # d. Info gain accounting
             drone_info = sum(
                 float(info_field.w[r, c])
                 for r, c in plan.waypoints[1:]
@@ -852,13 +874,12 @@ class CorrelationPathSelector:
             marginal_gains.append(drone_info)
             total_info += drone_info
 
-            # f. Update drone state
+            # e. Update drone state
             new_pos = state.position_m.copy()
             if len(domain_ids) > 1:
-                end_domain = graph.domains[
-                    next(i for i, d in enumerate(graph.domains)
-                         if d.domain_id == domain_ids[-1])
-                ]
+                end_domain = next(
+                    d for d in graph.domains if d.domain_id == domain_ids[-1]
+                )
                 new_pos = end_domain.centroid_m.copy()
 
             new_state = DroneFlightState(
@@ -867,7 +888,6 @@ class CorrelationPathSelector:
                 remaining_range_m=max(0.0, state.remaining_range_m - plan_distance),
                 mode=state.mode,
                 target_gs_idx=state.target_gs_idx,
-                visited_domains=state.visited_domains | set(domain_ids),
                 sortie_distance_m=state.sortie_distance_m + plan_distance,
                 returned=landed,
             )

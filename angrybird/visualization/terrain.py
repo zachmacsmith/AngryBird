@@ -83,9 +83,30 @@ def plot_terrain_overview(
     h_km = rows * res / 1000
     ext = [0, w_km, h_km, 0]
 
+    # Tight data bbox: fuel_model==0 is always nodata-fill (no valid SB40 code is 0)
+    valid = terrain.fuel_model != 0
+    r_valid = np.where(valid.any(axis=1))[0]
+    c_valid = np.where(valid.any(axis=0))[0]
+    if len(r_valid) and len(c_valid):
+        pad = 3
+        r0 = max(0, r_valid[0] - pad)
+        r1 = min(rows - 1, r_valid[-1] + pad)
+        c0 = max(0, c_valid[0] - pad)
+        c1 = min(cols - 1, c_valid[-1] + pad)
+        data_rows = r1 - r0 + 1
+        data_cols = c1 - c0 + 1
+        xlim = (c0 * res / 1000, (c1 + 1) * res / 1000)
+        ylim = ((r1 + 1) * res / 1000, r0 * res / 1000)
+    else:
+        data_rows, data_cols = rows, cols
+        xlim = ylim = None
+
+    data_aspect = data_rows / data_cols
+    panel_w = 18 / 4
+    fig_h = max(6, 2 * panel_w * data_aspect + 1.5)
     fig, axes = plt.subplots(
         2, 4,
-        figsize=(18, 9),
+        figsize=(18, fig_h),
         dpi=VIZ_CONFIG["figure_dpi"],
         constrained_layout=True,
     )
@@ -98,7 +119,8 @@ def plot_terrain_overview(
     norm_elev = plt.Normalize(terrain.elevation.min(), terrain.elevation.max())
     elev_rgb = plt.get_cmap("terrain")(norm_elev(terrain.elevation))
     elev_rgb[..., :3] *= hs[..., np.newaxis]
-    ax.imshow(elev_rgb, origin="upper", interpolation="nearest", extent=ext)
+    ax.imshow(elev_rgb, origin="upper", interpolation="nearest", extent=ext,
+              aspect="auto")
     sm = plt.cm.ScalarMappable(cmap="terrain", norm=norm_elev)
     cb = fig.colorbar(sm, ax=ax, fraction=0.046, pad=0.04)
     cb.set_label("m", fontsize=VIZ_CONFIG["label_size"])
@@ -116,7 +138,7 @@ def plot_terrain_overview(
     # Fuel model
     ax = axes[0, 3]
     ax.imshow(_fuel_model_rgb(terrain.fuel_model), origin="upper",
-              interpolation="nearest", extent=ext)
+              interpolation="nearest", extent=ext, aspect="auto")
     _panel_labels(ax, "Fuel Model (SB40)", has_extent=True)
     _fuel_model_legend(ax)
 
@@ -133,6 +155,12 @@ def plot_terrain_overview(
 
     _imshow(axes[1, 3], terrain.canopy_bulk_density, "Canopy Bulk Density", "Blues",
             vmin=0, colorbar_label="kg/m³", extent=ext)
+
+    if xlim is not None:
+        for row_axes in axes:
+            for ax in row_axes:
+                ax.set_xlim(*xlim)
+                ax.set_ylim(*ylim)
 
     _domain_footnote(fig, rows, cols, res)
 

@@ -200,6 +200,8 @@ def hilly_heterogeneous(
         base_wd=180.0,
         wind_events=events,
         seed=seed,
+        temperature_c=32.0,    # hot afternoon — consistent with FMC=0.08
+        relative_humidity=0.20,
     )
 
     config = SimulationConfig(
@@ -250,6 +252,8 @@ def wind_shift(
         base_wd=180.0,
         wind_events=events,
         seed=seed,
+        temperature_c=32.0,
+        relative_humidity=0.20,
     )
 
     config = SimulationConfig(
@@ -292,6 +296,8 @@ def flat_homogeneous(
         base_wd=180.0,
         wind_events=[],
         seed=seed,
+        temperature_c=28.0,
+        relative_humidity=0.30,
     )
 
     config = SimulationConfig(
@@ -346,6 +352,8 @@ def dual_ignition(
         base_wd=225.0,    # SW wind — pushes both fires into different terrain features
         wind_events=events,
         seed=seed,
+        temperature_c=36.0,    # extreme conditions — consistent with FMC=0.07
+        relative_humidity=0.15,
     )
 
     config = SimulationConfig(
@@ -396,6 +404,8 @@ def crown_fire_risk(
         base_wd=180.0,
         wind_events=[],
         seed=seed,
+        temperature_c=34.0,
+        relative_humidity=0.18,
     )
 
     config = SimulationConfig(

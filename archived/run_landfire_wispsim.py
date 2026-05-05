@@ -42,6 +42,7 @@ from angrybird.orchestrator import IGNISOrchestrator
 from angrybird.selectors.base import SelectorRegistry
 from angrybird.selectors.greedy import GreedySelector
 from angrybird.selectors.baselines import UniformSelector, FireFrontSelector
+from angrybird.selectors.correlation_path import CorrelationPathSelector
 from angrybird.types import TerrainData
 from wispsim.ground_truth import generate_ground_truth, WindEvent
 from wispsim.runner import SimulationConfig, SimulationRunner
@@ -102,6 +103,7 @@ def main(
     n_members: int = 20,
     hours: float = 1.0,
     out_dir: str = "out/landfire_wispsim",
+    selector: str = "correlation_path",
 ) -> None:
     t0 = time.time()
 
@@ -165,17 +167,29 @@ def main(
     log.info("  Engine ready.")
 
     # ── Orchestrator ──────────────────────────────────────────────────────
-    # Drone base: south edge of the grid, centre column
-    base_cell = (R - 1, C // 2)
+    # Drone base: 10% inset from south edge, centre column — inside the map
+    base_cell = (int(R * 0.90), C // 2)
 
-    # Build a selector registry with the correct resolution for this terrain.
-    # The default global registry uses GRID_RESOLUTION_M=50 m; for 100 m LANDFIRE
-    # cells the min-spacing and observability calculations would otherwise be wrong.
-    res = terrain.resolution_m
+    # Build a selector registry with the correct resolution and drone parameters
+    # for this terrain.  The default global registry uses GRID_RESOLUTION_M=50 m
+    # and default drone specs; LANDFIRE runs use 100 m cells and a different drone.
+    res            = terrain.resolution_m
+    drone_speed    = 23.25                          # m/s (52 mph)
+    cycle_s        = 600.0                          # 10-min IGNIS cycle
+    endurance_s    = 48_462.0                       # ~700 mi range @ 52 mph
+    d_cycle_m      = drone_speed * cycle_s          # 13 950 m per cycle
+    drone_range_m  = drone_speed * endurance_s      # ~1 128 km total endurance
+
     local_registry = SelectorRegistry()
     local_registry.register(GreedySelector(resolution_m=res))
     local_registry.register(UniformSelector())
     local_registry.register(FireFrontSelector())
+    local_registry.register(CorrelationPathSelector(
+        drone_range_m=drone_range_m,
+        d_cycle_m=d_cycle_m,
+        correlation_length_m=2000.0,   # ~2 km for 100 m cells (≈ 20-cell domains)
+        min_domain_cells=15,
+    ))
 
     # Planning horizon: 4 hours ahead, even though the sim runs for 1 hour.
     # With a 1-hour horizon the fire footprint (~475 cells) is too small —
@@ -187,7 +201,7 @@ def main(
         gp=gp,
         obs_store=obs_store,
         fire_engine=fire_engine,
-        selector_name="greedy",
+        selector_name=selector,
         selector_registry=local_registry,
         n_drones=n_drones,
         n_targets=n_targets,      # select more points than drones for multi-waypoint paths
@@ -264,8 +278,11 @@ if __name__ == "__main__":
                         help="Ensemble size (default: 20)")
     parser.add_argument("--hours",   type=float, default=1.0,
                         help="Simulation duration in hours (default: 1.0)")
-    parser.add_argument("--out",     default="out/landfire_wispsim",
+    parser.add_argument("--out",      default="out/landfire_wispsim",
                         help="Output directory (default: out/landfire_wispsim)")
+    parser.add_argument("--selector", default="correlation_path",
+                        choices=["correlation_path", "greedy", "uniform", "fire_front"],
+                        help="Path/point selector strategy (default: correlation_path)")
     args = parser.parse_args()
 
     main(
@@ -276,4 +293,5 @@ if __name__ == "__main__":
         n_members=args.members,
         hours=args.hours,
         out_dir=args.out,
+        selector=args.selector,
     )
