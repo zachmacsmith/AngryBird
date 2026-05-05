@@ -261,7 +261,9 @@ def _build_correlation_graph(
         feat_diff = features[ri, ci] - features[rj, cj]
         dissimilarity = float(np.sqrt((feat_diff ** 2).sum()))
         cross_corr = float(np.exp(-dissimilarity))
-        edge_info = (1.0 - cross_corr) * min(di.info_value, dj.info_value)
+        i_val = di.info_value if np.isfinite(di.info_value) else 0.0
+        j_val = dj.info_value if np.isfinite(dj.info_value) else 0.0
+        edge_info = (1.0 - cross_corr) * min(i_val, j_val)
         adj[d_i].append(DomainEdge(d_i, d_j, cross_corr, edge_info, real_dist))
         adj[d_j].append(DomainEdge(d_j, d_i, cross_corr, edge_info, real_dist))
 
@@ -466,6 +468,9 @@ def _plan_greedy_path(
     return_costs: Optional[dict[int, float]] = None,   # RETURN mode: dist to target GS
     remaining_range_m: Optional[float] = None,         # RETURN mode: current battery
     d_safety: float = 0.0,                             # RETURN mode: safety margin
+    gp_update_budget_m: Optional[float] = None,        # distance up to which the expensive
+                                                       # GP conditional-variance update runs;
+                                                       # hops beyond this get cheap zeroing only
 ) -> tuple[list[int], float]:
     """
     Greedy orienteering from start_domain up to budget_m metres.
@@ -476,8 +481,11 @@ def _plan_greedy_path(
     w_i) drops at observed locations, so the greedy naturally avoids them without
     any persistent state.
 
-    NORMAL  — budget_m = 1.1 × d_cycle. No endpoint constraint; greedy runs
-              until budget exhausted. Drone ends wherever the path ends.
+    NORMAL  — budget_m = 1.1 × d_cycle × horizon_cycles.  Only the first-cycle
+              portion is sent to the autopilot; the rest is used for deconfliction
+              (claiming territory) via current_w zeroing.  To keep selection fast,
+              the expensive gp.conditional_variance update is skipped after
+              gp_update_budget_m metres (default: the first-cycle portion only).
 
     RETURN  — budget_m = min(d_cycle, r - d_safety).
               Battery feasibility: traveled + d + dist_to_gs(nxt) + d_safety ≤ r.
@@ -485,6 +493,9 @@ def _plan_greedy_path(
 
     Returns (domain_id_path, total_distance_m).
     """
+    if gp_update_budget_m is None:
+        gp_update_budget_m = budget_m   # default: run GP updates for the full path
+
     path = [start_domain]
     visited = {start_domain}    # local only — discarded when function returns
     remaining = budget_m
@@ -503,8 +514,8 @@ def _plan_greedy_path(
             if nxt in visited:
                 continue
             w = current_w.get(nxt, 0.0)
-            if w <= 0.0:
-                continue
+            if np.isnan(w):
+                w = 0.0
             d = edge.real_distance_m
 
             # Cycle budget: can we afford this hop?
@@ -530,20 +541,25 @@ def _plan_greedy_path(
         # Zero selected domain immediately so later drones skip it.
         current_w[best_domain] = 0.0
 
-        # Discount unvisited domains by marginal variance reduction.
-        rep_cell = rep_by_id[best_domain]
-        updated_var = gp.conditional_variance(current_var, rep_cell)
+        # GP conditional-variance update: only within the first-cycle portion of
+        # the path (gp_update_budget_m).  For the horizon-extension portion (beyond
+        # the first cycle) we skip this expensive call — domain zeroing above is
+        # sufficient for deconfliction, and the extra hops don't generate real
+        # observations this cycle anyway.
+        if traveled < gp_update_budget_m:
+            rep_cell = rep_by_id[best_domain]
+            updated_var = gp.conditional_variance(current_var, rep_cell)
 
-        for d in graph.domains:
-            if d.domain_id in visited or d.domain_id == best_domain:
-                continue
-            r, c = rep_by_id[d.domain_id]
-            old_v = float(current_var[r, c])
-            if old_v > 1e-12:
-                ratio = float(updated_var[r, c]) / old_v
-                current_w[d.domain_id] = current_w.get(d.domain_id, 0.0) * ratio
+            for d in graph.domains:
+                if d.domain_id in visited or d.domain_id == best_domain:
+                    continue
+                r, c = rep_by_id[d.domain_id]
+                old_v = float(current_var[r, c])
+                if old_v > 1e-12:
+                    ratio = float(updated_var[r, c]) / old_v
+                    current_w[d.domain_id] = current_w.get(d.domain_id, 0.0) * ratio
 
-        np.copyto(current_var, updated_var)
+            np.copyto(current_var, updated_var)
 
         path.append(best_domain)
         visited.add(best_domain)
@@ -631,6 +647,7 @@ class CorrelationPathSelector:
         R_threshold: float = DRONE_RETURN_THRESHOLD,
         safety_fraction: float = DRONE_SAFETY_FRACTION,
         min_useful_info: float = DRONE_MIN_USEFUL_INFO,
+        horizon_cycles: float = 1.0,
     ) -> None:
         self.correlation_length_m   = correlation_length_m
         self.drone_range_m          = drone_range_m
@@ -640,6 +657,7 @@ class CorrelationPathSelector:
         self.R_threshold            = R_threshold
         self.d_safety               = safety_fraction * drone_range_m
         self.min_useful_info        = min_useful_info
+        self.horizon_cycles         = max(1.0, float(horizon_cycles))
 
     # ------------------------------------------------------------------
     # Initialisation helpers
@@ -723,11 +741,29 @@ class CorrelationPathSelector:
         gs_distances = _compute_all_gs_distances(graph, ground_stations_m, resolution_m)
 
         # 5. Per-domain w values and GP variance (shared across drone plans for deconfliction)
-        base_domain_w: dict[int, float] = {d.domain_id: d.info_value for d in graph.domains}
         gp_var = info_field.gp_variance.get("fmc")
         if gp_var is None:
             gp_var = next(iter(info_field.gp_variance.values()))
         current_var = gp_var.astype(np.float64)
+
+        raw_w = {d.domain_id: d.info_value for d in graph.domains}
+        total_w = sum(v for v in raw_w.values() if np.isfinite(v) and v > 0)
+
+        if total_w <= 0:
+            # Info field is degenerate (fire hasn't spread yet, sensitivity=0).
+            # Fall back to mean GP variance per domain so drones explore where
+            # measurement uncertainty is highest rather than loitering.
+            logger.debug("Info field degenerate (w≈0); using GP variance as domain score")
+            rep_by_id = {d.domain_id: d.representative_cell for d in graph.domains}
+            base_domain_w = {
+                d.domain_id: float(np.mean(gp_var[
+                    [c[0] for c in d.cells],
+                    [c[1] for c in d.cells],
+                ]))
+                for d in graph.domains
+            }
+        else:
+            base_domain_w = raw_w
 
         # 6. Initialise drone states on first call
         if drone_states is None:
@@ -835,18 +871,43 @@ class CorrelationPathSelector:
                                 state.drone_id, state.target_gs_idx)
 
             else:  # NORMAL
-                # Budget includes 10 % buffer for comms lag / wind drift.
-                # No endpoint constraint: drone ends wherever the greedy stops.
-                budget = self.d_cycle_m * BUDGET_BUFFER
-                domain_ids, plan_distance = _plan_greedy_path(
+                # Plan over horizon_cycles worth of distance.  Deconfliction
+                # zeroes ALL domains in the long path, forcing each subsequent
+                # drone to find a completely different trajectory — this is
+                # what spreads the fleet across the map.  Only the first
+                # d_cycle_m worth of waypoints is sent to the autopilot for
+                # this cycle; the drone's state end-position is updated to the
+                # first-cycle boundary so replanning starts from there.
+                execute_budget = self.d_cycle_m * BUDGET_BUFFER
+                plan_budget = execute_budget * self.horizon_cycles
+                domain_ids_full, _ = _plan_greedy_path(
                     graph=graph,
                     start_domain=start_domain,
-                    budget_m=budget,
+                    budget_m=plan_budget,
                     current_w=current_w,
                     current_var=current_var,
                     gp=gp,
+                    # GP variance update only for the first-cycle portion; horizon
+                    # extension uses cheap domain zeroing only (no GP calls).
+                    gp_update_budget_m=execute_budget,
                     # No return_costs / remaining_range_m: NORMAL has no endpoint constraint.
                 )
+
+                # Truncate to first-cycle distance for the actual waypoints /
+                # observation footprint this cycle.  The domain_ids beyond the
+                # truncation already had their current_w zeroed inside
+                # _plan_greedy_path, so deconfliction covers the full horizon.
+                domain_ids = [domain_ids_full[0]]
+                cum_dist    = 0.0
+                for i in range(1, len(domain_ids_full)):
+                    edge = graph.edge(domain_ids_full[i - 1], domain_ids_full[i])
+                    if edge is None:
+                        break
+                    if cum_dist + edge.real_distance_m > execute_budget:
+                        break
+                    domain_ids.append(domain_ids_full[i])
+                    cum_dist += edge.real_distance_m
+                plan_distance = cum_dist
 
                 if len(domain_ids) <= 1:
                     logger.info("Drone %d: NORMAL loitering (no high-value domains reachable)",
