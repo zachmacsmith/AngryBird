@@ -179,6 +179,7 @@ from angrybird.selectors.base import SelectorRegistry
 from angrybird.selectors.baselines import FireFrontSelector, UniformSelector
 from angrybird.selectors.correlation_path import CorrelationPathSelector
 from angrybird.selectors.greedy import GreedySelector
+from angrybird.selectors.heuristics import FireFrontOrbitSelector, LawnmowerSelector
 from angrybird.types import TerrainData
 from wispsim.ground_truth import WindEvent, generate_ground_truth
 from wispsim.runner import SimulationConfig, SimulationRunner
@@ -401,6 +402,8 @@ def make_registry(
         min_domain_cells=min_domain_cells,
         horizon_cycles=horizon_cycles,
     ))
+    reg.register(LawnmowerSelector(drone_speed_ms=drone_speed_ms, cycle_s=cycle_s, resolution_m=res))
+    reg.register(FireFrontOrbitSelector(drone_speed_ms=drone_speed_ms, cycle_s=cycle_s, resolution_m=res))
     return reg
 
 

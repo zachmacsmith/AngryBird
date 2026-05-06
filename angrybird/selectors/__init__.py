@@ -24,6 +24,7 @@ from .base import Selector, SelectorRegistry, spacing_mask
 from .baselines import FireFrontSelector, UniformSelector
 from .correlation_path import CorrelationPathSelector
 from .greedy import GreedySelector
+from .heuristics import FireFrontOrbitSelector, LawnmowerSelector
 from .qubo import QUBOSelector, build_qubo, extract_candidates, solve_qubo
 
 # Global registry — the orchestrator and scripts import this directly.
@@ -33,6 +34,8 @@ registry.register(QUBOSelector())
 registry.register(UniformSelector())
 registry.register(FireFrontSelector())
 registry.register(CorrelationPathSelector())
+registry.register(LawnmowerSelector())
+registry.register(FireFrontOrbitSelector())
 
 __all__ = [
     "registry",
@@ -43,6 +46,8 @@ __all__ = [
     "UniformSelector",
     "FireFrontSelector",
     "CorrelationPathSelector",
+    "LawnmowerSelector",
+    "FireFrontOrbitSelector",
     "build_qubo",
     "extract_candidates",
     "solve_qubo",
