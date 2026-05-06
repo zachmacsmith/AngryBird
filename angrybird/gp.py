@@ -227,6 +227,14 @@ class IGNISGPPrior:
         self._cached_shape:  Optional[tuple[int, int]] = None
         self._cached_X_grid: Optional[np.ndarray] = None
 
+        # V_grid cache for conditional_variance — the expensive triangular solve
+        # solve_triangular(L_, K_train_grid) depends only on the GP's training set
+        # and the fixed grid, so it is valid for all greedy selector iterations
+        # within a cycle.  Invalidated by id(gp.X_train_) when fit() replaces the
+        # training array.
+        self._cv_V_grid:     Optional[np.ndarray] = None  # (n_train, n_grid) float64
+        self._cv_V_grid_key: Optional[int]        = None  # id(gp.X_train_) at cache fill
+
         # Physics-informed prior means.
         # When set, observations are fitted as residuals (obs - prior) and
         # predictions add the prior back. See set_nelson_mean() and
@@ -251,7 +259,14 @@ class IGNISGPPrior:
         Call once per IGNIS cycle before gp.predict(), passing the Nelson field
         recomputed for the current hour / temperature / humidity.
         """
-        self._nelson_mean = np.asarray(field, dtype=np.float32).copy()
+        # Guard against NaN cells (e.g. from satellite FMC with patchy coverage).
+        # NaN in the prior mean propagates to fmc_mean via `fmc_mean + nelson`,
+        # and np.clip cannot remove it.  Replace with GP default so uncovered
+        # cells degrade gracefully to the background prior.
+        field_arr = np.asarray(field, dtype=np.float32).copy()
+        if not np.all(np.isfinite(field_arr)):
+            field_arr = np.where(np.isfinite(field_arr), field_arr, GP_DEFAULT_FMC_MEAN)
+        self._nelson_mean = field_arr
         self._gp_fmc = None  # residuals changed — force fresh kernel optimization
 
     def set_wind_prior_mean(
@@ -271,8 +286,14 @@ class IGNISGPPrior:
         Wind direction residuals use circular arithmetic so wrap-around at 0°/
         360° does not introduce a ~360° spike.
         """
-        self._wind_speed_mean = np.asarray(ws_field, dtype=np.float32).copy()
-        self._wind_dir_mean   = np.asarray(wd_field, dtype=np.float32).copy()
+        ws_arr = np.asarray(ws_field, dtype=np.float32).copy()
+        wd_arr = np.asarray(wd_field, dtype=np.float32).copy()
+        if not np.all(np.isfinite(ws_arr)):
+            ws_arr = np.where(np.isfinite(ws_arr), ws_arr, GP_DEFAULT_WIND_SPEED_MEAN)
+        if not np.all(np.isfinite(wd_arr)):
+            wd_arr = np.where(np.isfinite(wd_arr), wd_arr, GP_DEFAULT_WIND_DIR_MEAN)
+        self._wind_speed_mean = ws_arr
+        self._wind_dir_mean   = wd_arr
         self._gp_ws = None  # force fresh kernel — residuals changed
         self._gp_wd = None
 
@@ -536,8 +557,16 @@ class IGNISGPPrior:
             return mean, var
 
         mu, sigma = gp.predict(X_grid, return_std=True)
-        mean = mu.reshape(rows, cols).astype(np.float32)
-        var  = (sigma ** 2).reshape(rows, cols).astype(np.float32)
+        # sklearn can return NaN sigma on degenerate/near-singular fits.
+        # np.clip propagates NaN silently, so guard before clip.
+        mean = np.nan_to_num(
+            mu.reshape(rows, cols).astype(np.float32),
+            nan=default_mean, posinf=default_mean, neginf=default_mean,
+        )
+        var = np.nan_to_num(
+            (sigma ** 2).reshape(rows, cols).astype(np.float32),
+            nan=default_variance, posinf=default_variance, neginf=0.0,
+        )
         return mean, var
 
     def _get_grid_features(self, shape: tuple[int, int]) -> np.ndarray:
@@ -595,6 +624,13 @@ class IGNISGPPrior:
         if _wd_prior is not None:
             wd_mean = ((wd_mean + _wd_prior) % 360.0).astype(np.float32)
 
+        # Final NaN/inf guard: clip propagates NaN, so sanitize first.
+        fmc_var = np.nan_to_num(fmc_var, nan=0.0, posinf=0.0, neginf=0.0)
+        ws_var  = np.nan_to_num(ws_var,  nan=0.0, posinf=0.0, neginf=0.0)
+        wd_var  = np.nan_to_num(wd_var,  nan=0.0, posinf=0.0, neginf=0.0)
+        fmc_mean = np.nan_to_num(fmc_mean, nan=GP_DEFAULT_FMC_MEAN,        posinf=GP_DEFAULT_FMC_MEAN,        neginf=GP_DEFAULT_FMC_MEAN)
+        ws_mean  = np.nan_to_num(ws_mean,  nan=GP_DEFAULT_WIND_SPEED_MEAN, posinf=GP_DEFAULT_WIND_SPEED_MEAN, neginf=GP_DEFAULT_WIND_SPEED_MEAN)
+        wd_mean  = np.nan_to_num(wd_mean,  nan=GP_DEFAULT_WIND_DIR_MEAN,   posinf=GP_DEFAULT_WIND_DIR_MEAN,   neginf=GP_DEFAULT_WIND_DIR_MEAN)
         return GPPrior(
             fmc_mean          = fmc_mean,
             fmc_variance      = np.clip(fmc_var, 0.0, None),
@@ -654,10 +690,19 @@ class IGNISGPPrior:
         K_prior_cross_norm = kernel(X_grid, X_new).ravel()
         K_prior_self_norm  = float(kernel(X_new, X_new)[0, 0])
 
-        K_train_new  = kernel(gp.X_train_, X_new)
-        K_train_grid = kernel(gp.X_train_, X_grid)
-        V_new  = solve_triangular(gp.L_, K_train_new,  lower=True)
-        V_grid = solve_triangular(gp.L_, K_train_grid, lower=True)
+        K_train_new = kernel(gp.X_train_, X_new)
+        V_new = solve_triangular(gp.L_, K_train_new, lower=True)
+
+        # V_grid = solve_triangular(L_, K_train_grid) is the dominant cost
+        # (300×80k triangular solve).  It depends only on the training set and
+        # fixed grid, so cache it and reuse across all greedy selector iterations
+        # within a cycle.  Invalidate when fit() replaces X_train_ (new id).
+        x_train_id = id(gp.X_train_)
+        if self._cv_V_grid is None or self._cv_V_grid_key != x_train_id:
+            K_train_grid = kernel(gp.X_train_, X_grid)
+            self._cv_V_grid     = solve_triangular(gp.L_, K_train_grid, lower=True)
+            self._cv_V_grid_key = x_train_id
+        V_grid = self._cv_V_grid
 
         k_post_cross = (K_prior_cross_norm - (V_grid * V_new).sum(axis=0)) * y_var
         k_post_self  = (K_prior_self_norm  - float((V_new ** 2).sum()))     * y_var

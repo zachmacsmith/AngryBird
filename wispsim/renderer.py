@@ -49,8 +49,14 @@ logger = logging.getLogger(__name__)
 
 _DRONE_COLORS = ["#E91E63", "#9C27B0", "#3F51B5", "#00BCD4", "#8BC34A",
                  "#FF5722", "#795548", "#607D8B", "#F44336", "#2196F3"]
-_STATUS_COLORS = {"idle": "#9E9E9E", "transit": "#4CAF50",
-                  "returning": "#FF9800", "unknown": "#9E9E9E"}
+
+# Fill colour by planning mode — outline is always the per-drone path colour.
+_MODE_FILL_COLORS = {
+    "NORMAL":    "#4CAF50",  # green  — operational correlation-path planning
+    "TRACKING":  "#2196F3",  # blue   — greedy search (tracking toward fire)
+    "RETURN":    "#FFEB3B",  # yellow — returning to ground station
+    "EMERGENCY": "#F44336",  # red    — emergency direct flight
+}
 
 
 # ---------------------------------------------------------------------------
@@ -75,18 +81,22 @@ def _arrival_rgba(
     time_until = arrival_times_h - current_h          # hours from now; < 0 = burned
     rows, cols = arrival_times_h.shape
 
-    cmap = plt.cm.RdYlGn_r
-    norm = mcolors.Normalize(vmin=0.0, vmax=horizon_h)
+    cmap = plt.cm.YlOrRd_r
+    # Use a negative vmin so that 0.0 (about to burn) starts slightly into the orange
+    # rather than at the absolute dark red of the colormap, providing better contrast
+    # with the already-burned red.
+    norm = mcolors.Normalize(vmin=-0.2 * horizon_h, vmax=horizon_h)
     rgba = cmap(norm(np.clip(time_until, 0.0, horizon_h))).astype(np.float32)
     rgba[..., 3] = 0.72
 
     # Cells with no predicted ignition within the horizon
-    nan_mask = np.isnan(arrival_times_h)
-    rgba[nan_mask] = [0.78, 0.78, 0.78, 0.45]
+    beyond_mask = (time_until >= horizon_h) | np.isnan(arrival_times_h)
+    # A pleasant semi-transparent green for safe areas
+    rgba[beyond_mask] = [0.30, 0.70, 0.30, 0.45]
 
-    # Already-burned cells
-    burned_mask = (~nan_mask) & (time_until <= 0.0)
-    rgba[burned_mask] = [0.30, 0.0, 0.0, 0.75]
+    # Already-burned cells (dark red)
+    burned_mask = (~beyond_mask) & (time_until <= 0.0)
+    rgba[burned_mask] = [0.60, 0.0, 0.0, 0.85]
 
     return rgba
 
@@ -267,24 +277,29 @@ class MapPanel:
                 self._dyn.append(sc)
 
         # ── Drone positions + trails ──────────────────────────────────────
+        # Outline: permanent per-drone path colour (matches the route line).
+        # Fill:    mode-dependent — TRACKING=blue, NORMAL=green,
+        #          RETURN=yellow, EMERGENCY=red.
 
         if drones and shape:
-            for drone in drones:
+            plan_mode: dict[int, str] = {
+                p.drone_id: p.drone_mode for p in (drone_plans or [])
+            }
+            for i, drone in enumerate(drones):
                 cell = pos_m_to_cell(drone.position, resolution_m, shape)
-                color = _STATUS_COLORS.get(drone.status, "#9E9E9E")
+                outline = _DRONE_COLORS[i % len(_DRONE_COLORS)]
+                try:
+                    drone_idx = int(drone.drone_id.split("_")[-1])
+                except (ValueError, AttributeError):
+                    drone_idx = i
+                mode = plan_mode.get(drone_idx, "NORMAL")
+                fill = _MODE_FILL_COLORS.get(mode, "#9E9E9E")
                 sc = ax.scatter([cell[1]], [cell[0]], marker="o",
-                                c=color, s=50, zorder=9,
-                                edgecolors="white", linewidths=1.0)
+                                c=fill, s=70, zorder=12,
+                                edgecolors=outline, linewidths=2.0)
                 self._dyn.append(sc)
 
-                trail = drone.path_history[-60:]   # longer look-back
-                if len(trail) > 1:
-                    cells = [pos_m_to_cell(p, resolution_m, shape) for p in trail]
-                    ty = [c_[0] for c_ in cells]
-                    tx_ = [c_[1] for c_ in cells]
-                    ln, = ax.plot(tx_, ty, "-", color=color, alpha=0.55,
-                                  linewidth=1.5, zorder=8)
-                    self._dyn.append(ln)
+                # Historical trail suppressed — planned path lines are sufficient.
 
 
 # ---------------------------------------------------------------------------
@@ -308,17 +323,17 @@ def _draw_arrival_colorbar(ax, horizon_h: float = 6.0) -> None:
         bbox_transform=ax.transAxes,
         borderpad=0,
     )
-    cmap = plt.cm.RdYlGn_r
-    norm = mcolors.Normalize(vmin=0, vmax=horizon_h)
+    cmap = plt.cm.YlOrRd_r
+    norm = mcolors.Normalize(vmin=-0.2 * horizon_h, vmax=horizon_h)
     sm   = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
     sm.set_array([])
     cbar = ax.figure.colorbar(sm, cax=cax, orientation="horizontal")
     cbar.set_label("Hours until ignition", fontsize=5)
     cbar.ax.tick_params(labelsize=4)
     ax.annotate(
-        "▪ burned   ▪ no threat (grey)",
+        "▪ burned (red)   ▪ no threat (green)",
         xy=(0.99, 0.10), xycoords="axes fraction",
-        fontsize=4.5, va="bottom", ha="right", color="#555",
+        fontsize=4.5, va="bottom", ha="right", color="#333",
         bbox=dict(boxstyle="round,pad=0.2", fc="white", alpha=0.65, ec="none"),
     )
 
@@ -401,7 +416,7 @@ class FrameRenderer:
         self.horizon_h      = horizon_h
         self._frame_count   = 0
         self._step_count    = 0
-        self._cb_drawn      = False   # arrival-time colorbar drawn once
+        self._cbs_drawn: set[str] = set()   # track which panels have colorbars
         self._raws_locations = raws_locations or []
         # Set by SimulationRunner after RAWS seeding: used to draw the RAWS-only
         # GP-variance-reduction baseline alongside the full-model curve.
@@ -413,26 +428,30 @@ class FrameRenderer:
         # as observations arrive through the network, not just at cycle boundaries.
         self._live_gp_trace: list[tuple[float, float]] = []
 
-        # Build figure — 4 map panels + GP variance strip + accuracy strip
+        # Build figure — 3x2 layout
+        # Row 1: Truth Arrival, Truth Env
+        # Row 2: Est Arrival,   Est Env
+        # Row 3: Info Field,    Accuracy
         self.fig = plt.figure(figsize=figsize)
         gs = gridspec.GridSpec(
-            2, 4,
+            3, 2,
             figure=self.fig,
-            height_ratios=[3, 1.2],
-            hspace=0.38, wspace=0.28,
+            height_ratios=[3, 3, 2.5],
+            hspace=0.35, wspace=0.18,
         )
-        ax_truth   = self.fig.add_subplot(gs[0, 0])
-        ax_est     = self.fig.add_subplot(gs[0, 1])
-        ax_arrival = self.fig.add_subplot(gs[0, 2])
-        ax_info    = self.fig.add_subplot(gs[0, 3])
-        self.ax_entropy  = self.fig.add_subplot(gs[1, :2])  # left: GP variance
-        self.ax_accuracy = self.fig.add_subplot(gs[1, 2:])  # right: CRPS/RMSE
+        ax_truth_arr = self.fig.add_subplot(gs[0, 0])
+        ax_truth_env = self.fig.add_subplot(gs[0, 1])
+        ax_est_arr   = self.fig.add_subplot(gs[1, 0])
+        ax_est_env   = self.fig.add_subplot(gs[1, 1])
+        ax_info      = self.fig.add_subplot(gs[2, 0])
+        self.ax_accuracy = self.fig.add_subplot(gs[2, 1])
 
         self.panels = {
-            "truth":   MapPanel(ax_truth,   terrain, "Ground Truth: FMC + Wind + Fire"),
-            "est":     MapPanel(ax_est,     terrain, "WISP Estimate: FMC + Wind  ▲live"),
-            "arrival": MapPanel(ax_arrival, terrain, "Estimated Arrival Time  ▲live"),
-            "info":    MapPanel(ax_info,    terrain, "Information Field + Drone Targets"),
+            "truth_arr": MapPanel(ax_truth_arr, terrain, "Ground Truth: Arrival Time"),
+            "truth_env": MapPanel(ax_truth_env, terrain, "Ground Truth: FMC + Wind"),
+            "est_arr":   MapPanel(ax_est_arr,   terrain, "Estimated Arrival Time  ▲live"),
+            "est_env":   MapPanel(ax_est_env,   terrain, "Estimated FMC + Wind  ▲live"),
+            "info":      MapPanel(ax_info,      terrain, "Information Field + Drone Targets"),
         }
 
     def render_frame(
@@ -449,6 +468,8 @@ class FrameRenderer:
         cycle_reports: Optional[list[CycleReport]] = None,
         live_gp_prior: Optional[GPPrior] = None,
         live_arrival_times_h: Optional[np.ndarray] = None,
+        truth_arrival_times_h: Optional[np.ndarray] = None,
+        accuracy_trace: Optional[list[dict]] = None,
     ) -> None:
         """
         Render one frame if step % frame_interval == 0.
@@ -459,6 +480,9 @@ class FrameRenderer:
             live_arrival_times_h: single-member arrival time estimate in hours,
                                   NaN for cells not reached within the horizon;
                                   updated per-observation between WISP cycles
+            truth_arrival_times_h: single-member arrival time from oracle fire run using
+                                  true FMC/wind, same format as live_arrival_times_h;
+                                  falls back to raw CA arrival times if None
         """
         self._step_count = step
         if step % self.frame_interval != 0:
@@ -486,20 +510,53 @@ class FrameRenderer:
 
         rl = self._raws_locations  # shorthand
 
-        # ── Panel 1: Ground truth ─────────────────────────────────────────
-        self.panels["truth"].update(
+        # ── Panel 1: Ground truth Arrival ─────────────────────────────────
+        # Prefer the fire-engine projection using true conditions (same method
+        # as the estimate panel) so both panels are directly comparable.
+        # Falls back to the raw CA arrival times if the oracle run isn't ready yet.
+        _truth_arr_h = (
+            truth_arrival_times_h
+            if truth_arrival_times_h is not None
+            else ground_truth.fire.arrival_times.astype(np.float32) / 3600.0
+        )
+        self.panels["truth_arr"].update(
+            arrival_times_h=_truth_arr_h,
+            current_time=time_s,
+            horizon_h=self.horizon_h,
+            drone_plans=drone_plans,
+            drones=drones, resolution_m=res, shape=sh,
+            raws_locations=rl,
+        )
+        if "truth_arr" not in self._cbs_drawn:
+            _draw_arrival_colorbar(self.panels["truth_arr"].ax, self.horizon_h)
+            self._cbs_drawn.add("truth_arr")
+
+        # ── Panel 2: Ground truth FMC + Wind ──────────────────────────────
+        self.panels["truth_env"].update(
             fmc=ground_truth.fmc,
             wind_speed=ground_truth.wind_speed,
             wind_direction=ground_truth.wind_direction,
-            fire_arrival=ground_truth.fire.arrival_times.astype(np.float32),
             current_time=time_s,
             drone_plans=drone_plans,
             drones=drones, resolution_m=res, shape=sh,
             raws_locations=rl,
         )
 
-        # ── Panel 2: Live WISP estimate — FMC + wind ─────────────────────
-        self.panels["est"].update(
+        # ── Panel 3: Estimated Arrival ────────────────────────────────────
+        self.panels["est_arr"].update(
+            arrival_times_h=live_arrival_times_h,
+            current_time=time_s,
+            horizon_h=self.horizon_h,
+            drone_plans=drone_plans,
+            drones=drones, resolution_m=res, shape=sh,
+            raws_locations=rl,
+        )
+        if "est_arr" not in self._cbs_drawn and live_arrival_times_h is not None:
+            _draw_arrival_colorbar(self.panels["est_arr"].ax, self.horizon_h)
+            self._cbs_drawn.add("est_arr")
+
+        # ── Panel 4: Estimated FMC + Wind ─────────────────────────────────
+        self.panels["est_env"].update(
             fmc=est_prior.fmc_mean if est_prior is not None else None,
             wind_speed=(est_prior.wind_speed_mean if est_prior is not None else None),
             wind_direction=(est_prior.wind_dir_mean if est_prior is not None else None),
@@ -508,20 +565,7 @@ class FrameRenderer:
             raws_locations=rl,
         )
 
-        # ── Panel 3: Live estimated arrival time ──────────────────────────
-        self.panels["arrival"].update(
-            arrival_times_h=live_arrival_times_h,
-            current_time=time_s,
-            horizon_h=self.horizon_h,
-            drone_plans=drone_plans,
-            drones=drones, resolution_m=res, shape=sh,
-            raws_locations=rl,
-        )
-        if not self._cb_drawn and live_arrival_times_h is not None:
-            _draw_arrival_colorbar(self.panels["arrival"].ax, self.horizon_h)
-            self._cb_drawn = True
-
-        # ── Panel 4: Information field (per WISP cycle) ──────────────────
+        # ── Panel 5: Information Field ────────────────────────────────────
         self.panels["info"].update(
             uncertainty=info_field.w if info_field is not None else None,
             drone_targets=mission_targets or [],
@@ -530,18 +574,7 @@ class FrameRenderer:
             raws_locations=rl,
         )
 
-        # ── Bottom: GP variance convergence ──────────────────────────────
-        # Sample live GP variance every render frame so the curve updates
-        # as observations arrive through the network between WISP cycles.
-        live_prior = live_gp_prior if live_gp_prior is not None else gp_prior
-        if live_prior is not None:
-            live_var = float(
-                live_prior.fmc_variance.sum() + live_prior.wind_speed_variance.sum()
-            )
-            self._live_gp_trace.append((time_s / 60.0, live_var))
-
-        self._update_entropy(cycle_reports or [], time_s)
-        self._update_accuracy(cycle_reports or [])
+        self._update_accuracy(accuracy_trace or [])
 
         # ── Save frame ────────────────────────────────────────────────────
         frame_path = self.out_dir / f"frame_{self._frame_count:05d}.png"
@@ -549,128 +582,41 @@ class FrameRenderer:
         self._frame_count += 1
         logger.debug("Frame %d saved (t=%.0fs)", self._frame_count, time_s)
 
-    def _update_entropy(self, reports: list[CycleReport], current_time_s: float = 0.0) -> None:
-        ax = self.ax_entropy
-        ax.clear()
-        ax.set_title(
-            "GP Variance (FMC + Wind) — Live vs RAWS-Only Baseline",
-            fontsize=8, fontweight="bold",
-        )
-        ax.set_xlabel("Simulation Time (min)", fontsize=7)
-        ax.set_ylabel("Total GP Variance (FMC + wind)", fontsize=7)
-        ax.tick_params(labelsize=6)
-        ax.grid(True, alpha=0.3)
 
-        any_plotted = False
-
-        # Continuous live GP variance trace — updates every render frame as
-        # observations arrive through the network, not just at cycle boundaries.
-        if len(self._live_gp_trace) >= 2:
-            t_min = [pt[0] for pt in self._live_gp_trace]
-            v     = [pt[1] for pt in self._live_gp_trace]
-            ax.plot(t_min, v, color="#2196F3", linewidth=1.5,
-                    label="Live GP variance (RAWS + drones)")
-            any_plotted = True
-
-        # WISP cycle boundary markers — vertical dashed lines at each cycle time.
-        for r in reports:
-            t_cyc = r.start_time / 60.0
-            ax.axvline(t_cyc, color="#9C27B0", linestyle=":", linewidth=0.8, alpha=0.7)
-
-        # Per-cycle assimilation dots — show the GP variance *after* each full
-        # EnKF assimilation pass, colour-coded to the cycle number.
-        for r in reports:
-            if "greedy" in r.evaluations:
-                e = r.evaluations["greedy"]
-                t_cyc = r.start_time / 60.0
-                ax.scatter([t_cyc], [e.gp_var_after], marker="D",
-                           color="#9C27B0", s=28, zorder=6)
-        if reports and any("greedy" in r.evaluations for r in reports):
-            ax.scatter([], [], marker="D", color="#9C27B0", s=28,
-                       label="Post-assimilation (WISP cycle)")
-            any_plotted = True
-
-        # RAWS-only baseline: constant horizontal line showing how much variance
-        # the static RAWS network alone would leave behind.
-        if self._raws_only_gp_var_sum > 0:
-            x_max = max(current_time_s / 60.0, 1.0)
-            ax.hlines(
-                self._raws_only_gp_var_sum, xmin=0, xmax=x_max,
-                colors="#FF9800", linestyles="--", linewidth=1.5,
-                label=f"RAWS-only floor ({self._raws_only_gp_var_sum:.0f})",
-            )
-            any_plotted = True
-
-        if any_plotted:
-            ax.legend(fontsize=6, loc="upper right")
-
-    def _update_accuracy(self, reports: list[CycleReport]) -> None:
+    def _update_accuracy(self, accuracy_trace: list[dict]) -> None:
         """
-        Right bottom strip — prediction accuracy vs oracle ground truth.
+        Right bottom strip — per-burning-cell CRPS over time.
 
-        Plots CRPS and RMSE (minutes, left y-axis) and spread-skill ratio
-        (dimensionless, right y-axis) for each completed WISP cycle.
-
-        Both metrics come from the primary strategy's StrategyEvaluation
-        (populated by compute_arrival_accuracy in the runner).
-        Spread-skill ≈ 1.0 means the ensemble spread correctly predicts the
-        magnitude of the errors — dashed reference line drawn at 1.0.
+        Dividing by the number of cells that will burn within the planning
+        horizon removes the confound where raw CRPS grows simply because the
+        fire is larger.  Ideal value is 0 (perfect arrival-time forecast).
         """
         ax = self.ax_accuracy
         ax.clear()
         ax.set_title(
-            "Prediction Accuracy vs Oracle (per WISP Cycle)",
+            "CRPS per Active Burning Cell (per WISP Cycle)",
             fontsize=8, fontweight="bold",
         )
         ax.set_xlabel("Simulation Time (min)", fontsize=7)
-        ax.set_ylabel("Error (minutes)", fontsize=7)
+        ax.set_ylabel("CRPS / burning cell (min)", fontsize=7)
         ax.tick_params(labelsize=6)
         ax.grid(True, alpha=0.3)
 
-        # Collect per-cycle accuracy metrics from the primary strategy evaluation.
-        # Falls back to any available strategy if "greedy" isn't present.
-        t_min_list: list[float] = []
-        crps_list:  list[float] = []
-        rmse_list:  list[float] = []
-        skill_list: list[float] = []
-
-        for r in reports:
-            if not r.evaluations:
-                continue
-            # Prefer primary strategy; fall back to first available
-            eval_ = r.evaluations.get("greedy") or next(iter(r.evaluations.values()))
-            if eval_.crps_minutes == 0.0 and eval_.rmse_minutes == 0.0:
-                continue  # metrics not yet computed (e.g. no fire burned cells)
-            t_min_list.append(r.start_time / 60.0)
-            crps_list.append(eval_.crps_minutes)
-            rmse_list.append(eval_.rmse_minutes)
-            skill_list.append(eval_.spread_skill_ratio)
-
-        if not t_min_list:
+        if not accuracy_trace:
             ax.text(0.5, 0.5, "Accuracy metrics\navailable once\nfire spreads",
                     ha="center", va="center", transform=ax.transAxes,
                     fontsize=7, color="#888888")
             return
 
-        ax.plot(t_min_list, crps_list, "o-", color="#F44336", linewidth=1.5,
-                markersize=4, label="CRPS (↓ better)")
-        ax.plot(t_min_list, rmse_list, "s--", color="#FF9800", linewidth=1.2,
-                markersize=4, label="RMSE (ensemble mean)")
+        t_min  = [row["time_min"]              for row in accuracy_trace]
+        pccrps = [row["crps_per_cell_minutes"]  for row in accuracy_trace]
 
-        # Spread-skill on twin axis
-        ax2 = ax.twinx()
-        ax2.set_ylabel("Spread-skill ratio", fontsize=7, color="#2196F3")
-        ax2.tick_params(labelsize=6, colors="#2196F3")
-        ax2.plot(t_min_list, skill_list, "^:", color="#2196F3", linewidth=1.2,
-                 markersize=4, label="Spread-skill")
-        ax2.axhline(1.0, color="#2196F3", linestyle=":", linewidth=0.8, alpha=0.5,
-                    label="Ideal (1.0)")
-        ax2.set_ylim(bottom=0.0)
-
-        # Merge legends from both axes
-        lines1, labs1 = ax.get_legend_handles_labels()
-        lines2, labs2 = ax2.get_legend_handles_labels()
-        ax.legend(lines1 + lines2, labs1 + labs2, fontsize=6, loc="upper right")
+        ax.plot(t_min, pccrps, "o-", color="#F44336", linewidth=1.8,
+                markersize=4, label="CRPS / burning cell")
+        ax.axhline(0.0, color="#888888", linestyle="--", linewidth=0.8, alpha=0.6,
+                   label="Ideal (0)")
+        ax.set_ylim(bottom=0.0)
+        ax.legend(fontsize=6, loc="upper right")
 
     def finalize(self) -> None:
         """Close figure and optionally assemble video from PNG frames."""

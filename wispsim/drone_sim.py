@@ -65,12 +65,13 @@ class DroneState:
     drone_id:                str
     position:                np.ndarray       # [y_m, x_m] float64
     speed:                   float            # m/s cruise speed
-    status:                  str              # "idle"|"transit"|"returning"
+    status:                  str              # "idle"|"transit"|"returning"|"pending"
     waypoint_queue:          list[np.ndarray] # remaining target positions (metres)
     current_target:          Optional[np.ndarray]
     path_history:            list[np.ndarray] # positions visited (for trail rendering)
     endurance_remaining_s:   float            # seconds of flight time left
     base_position:           np.ndarray       # home staging area [y_m, x_m]
+    spawn_time_s:            float = 0.0      # simulation time at which this drone activates
 
 
 # ---------------------------------------------------------------------------

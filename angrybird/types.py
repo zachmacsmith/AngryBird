@@ -149,6 +149,9 @@ class StrategyEvaluation:
     crps_minutes: float = 0.0        # proper scoring rule over full ensemble distribution
     rmse_minutes: float = 0.0        # RMSE of ensemble mean vs ground truth
     spread_skill_ratio: float = 0.0  # sqrt(mean variance) / RMSE; ~1.0 = well-calibrated
+    oracle_crps_minutes: float = 0.0 # CRPS of a 1-member oracle forecast (true FMC/wind);
+                                     # irreducible model-error floor — best achievable CRPS
+                                     # even with perfect observations
 
 
 @dataclass(frozen=True)

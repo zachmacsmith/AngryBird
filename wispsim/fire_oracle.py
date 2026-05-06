@@ -178,6 +178,7 @@ class GroundTruthFire:
                     self.fire_types[nr, nc]     = ft
                     heapq.heappush(self._heap, (t_new, nr, nc))
 
+
     @property
     def burned_mask(self) -> np.ndarray:
         """bool[rows, cols] — True for cells that have ignited by current_time."""

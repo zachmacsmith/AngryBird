@@ -140,8 +140,9 @@ def compute_sensitivity(
         std_P = np.where(std_P < 1e-10, 1e-10, std_P)
         # Use population mean (N denominator) to be consistent with std().
         # N-1 Bessel correction mixed with population std can push |corr| > 1.
-        cov = (A_c * P_c).mean(axis=0)                     # (D,) population cov
-        corr = np.clip(cov / (std_A * std_P), -1.0, 1.0)  # (D,) guaranteed in [-1, 1]
+        cov = (A_c * P_c).mean(axis=0)                              # (D,) population cov
+        corr = np.clip(cov / (std_A * std_P), -1.0, 1.0)           # (D,) guaranteed in [-1, 1]
+        corr = np.nan_to_num(corr, nan=0.0, posinf=0.0, neginf=0.0)  # guard any residual NaN
         return corr.reshape(rows, cols).astype(np.float32)
 
     # FMC perturbation = member field − prior mean
@@ -255,43 +256,85 @@ def compute_information_field(
     sensitivity = compute_sensitivity(ensemble, gp_prior, horizon_minutes)
     observability = compute_observability(ensemble, shape, resolution_m)
 
-    # Per-variable information maps
+    # Per-variable information maps.
+    # NaN-guard each GP variance field: ill-conditioned GP fits on large/heterogeneous
+    # grids (especially wind direction) can produce NaN posterior variances which would
+    # poison the entire w field.  Replace NaN/negative variance with 0 so those cells
+    # simply contribute nothing rather than collapsing the whole information field.
+    fmc_var  = np.nan_to_num(gp_prior.fmc_variance,  nan=0.0, posinf=0.0, neginf=0.0)
+    wind_var = np.nan_to_num(gp_prior.wind_speed_variance, nan=0.0, posinf=0.0, neginf=0.0)
+    fmc_var  = np.clip(fmc_var,  0.0, None)
+    wind_var = np.clip(wind_var, 0.0, None)
+
     w_fmc = (
-        gp_prior.fmc_variance
+        fmc_var
         * np.abs(sensitivity["fmc"])
         * observability["fmc"]
     ).astype(np.float32)
 
     w_wind = (
-        gp_prior.wind_speed_variance
+        wind_var
         * np.abs(sensitivity["wind_speed"])
         * observability["wind_speed"]
     ).astype(np.float32)
 
-    w = w_fmc + w_wind
-
     w_wind_dir: Optional[np.ndarray] = None
     if "wind_dir" in sensitivity:
+        wd_var = np.nan_to_num(gp_prior.wind_dir_variance, nan=0.0, posinf=0.0, neginf=0.0)
+        wd_var = np.clip(wd_var, 0.0, None)
         w_wind_dir = (
-            gp_prior.wind_dir_variance
+            wd_var
             * np.abs(sensitivity["wind_dir"])
             * observability["wind_dir"]
         ).astype(np.float32)
-        w = (w + w_wind_dir).astype(np.float32)
 
-    # Bimodal entropy augmentation (Extended Fire Physics §3)
+    # ── Normalization (Fix 1) ──────────────────────────────────────────────
+    # The raw continuous terms (GP variance × sensitivity × observability) have
+    # magnitude ~0.001–0.05, while binary entropy is 0–1 by definition.  Without
+    # normalization, any bimodal_alpha > 0.05 causes entropy to completely dominate,
+    # making the 20-100× magnitude difference between terms determine weighting
+    # rather than the user-specified alphas.
+    #
+    # We normalise the continuous term to [0, 1] using its 99th-percentile value
+    # (robust to single outlier cells).  Binary/fire-state entropy is already [0,1]
+    # so alpha=0.5 genuinely means "at most half the peak continuous weight."
+    w_continuous = w_fmc + w_wind
+    if w_wind_dir is not None:
+        w_continuous = w_continuous + w_wind_dir
+
+    pos_vals = w_continuous[w_continuous > 0]
+    norm_scale = float(np.percentile(pos_vals, 99)) if pos_vals.size > 0 else 1.0
+    norm_scale = max(norm_scale, 1e-10)
+
+    w_fmc      = (w_fmc      / norm_scale).astype(np.float32)
+    w_wind     = (w_wind     / norm_scale).astype(np.float32)
+    if w_wind_dir is not None:
+        w_wind_dir = (w_wind_dir / norm_scale).astype(np.float32)
+    w = (w_continuous / norm_scale).astype(np.float32)
+    # ── End normalization ──────────────────────────────────────────────────
+
+    # Bimodal entropy augmentation — future burn uncertainty.
+    # Binary entropy of ensemble burn fraction: peaks at 0.5 (genuine disagreement
+    # about whether cell will burn in horizon), zero at 0 or 1 (consensus).
+    # Already [0,1] by definition; alpha controls weight relative to continuous term.
     max_arrival = _max_arrival_sentinel(horizon_minutes)
     if bimodal_alpha > 0.0:
         burn_frac, _ = detect_bimodality(ensemble.member_arrival_times, max_arrival)
-        w = (w + bimodal_alpha * _binary_entropy(burn_frac)).astype(np.float32)
+        burn_entropy = _binary_entropy(burn_frac)
+        # Suppress fringe: cells reached by fewer than 10% of members are driven
+        # by 1-4 outlier ensemble members, not genuine uncertainty.  Sending a
+        # drone km off course to resolve a 5% burn probability wastes a sortie.
+        min_frac = max(0.10, 1.0 / max(ensemble.n_members, 1))
+        burn_entropy = np.where(burn_frac >= min_frac, burn_entropy, 0.0).astype(np.float32)
+        w = (w + bimodal_alpha * burn_entropy).astype(np.float32)
 
     if bimodal_beta > 0.0 and ensemble.member_fire_types is not None:
         crown_frac, _ = detect_regime_split(ensemble.member_fire_types)
         w = (w + bimodal_beta * _binary_entropy(crown_frac)).astype(np.float32)
 
-    # Fire location uncertainty (from EnsembleFireState per-member fronts)
-    # High entropy at cells where members disagree about current fire position.
-    # Drives drones to confirm fire perimeter when location is the key uncertainty.
+    # Current fire location uncertainty — diagnostic: where is the perimeter NOW?
+    # High entropy where ensemble members disagree about current fire boundary.
+    # After normalization, fire_state_alpha=0.3 gives 30% of peak continuous weight.
     if fire_state_alpha > 0.0 and fire_state_burn_prob is not None:
         w_fire_state = (fire_state_alpha * _binary_entropy(fire_state_burn_prob)).astype(np.float32)
         w = (w + w_fire_state).astype(np.float32)
@@ -319,14 +362,17 @@ def compute_information_field(
         if w_wind_dir is not None:
             w_wind_dir[exclusion_mask] = 0.0
 
+    # Sanitize gp_variance before exposing outside this function.
+    # gp_prior variances may contain NaN on ill-conditioned GP fits; downstream
+    # consumers (greedy selector, visualization) assume finite values.
     w_by_variable: dict[str, np.ndarray] = {"fmc": w_fmc, "wind_speed": w_wind}
     gp_variance: dict[str, np.ndarray] = {
-        "fmc": gp_prior.fmc_variance,
-        "wind_speed": gp_prior.wind_speed_variance,
+        "fmc":        np.nan_to_num(gp_prior.fmc_variance,        nan=0.0, posinf=0.0, neginf=0.0),
+        "wind_speed": np.nan_to_num(gp_prior.wind_speed_variance, nan=0.0, posinf=0.0, neginf=0.0),
     }
     if w_wind_dir is not None:
         w_by_variable["wind_dir"] = w_wind_dir
-        gp_variance["wind_dir"] = gp_prior.wind_dir_variance
+        gp_variance["wind_dir"] = np.nan_to_num(gp_prior.wind_dir_variance, nan=0.0, posinf=0.0, neginf=0.0)
 
     return InformationField(
         w=w,

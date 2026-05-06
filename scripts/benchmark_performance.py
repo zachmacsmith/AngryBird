@@ -44,6 +44,7 @@ import torch
 
 from angrybird.fire_engines.gpu_fire_engine import GPUFireEngine, _redistance, _phi_gradient_full
 from angrybird.gp import IGNISGPPrior
+from angrybird.hardware import HardwareBackend
 from angrybird.landfire import load_from_directory
 from angrybird.observations import ObservationStore, ObservationType
 from angrybird.orchestrator import IGNISOrchestrator
@@ -72,15 +73,14 @@ def timed(label: str, store: dict, key: str):
     store[key] = time.perf_counter() - t0
 
 
-def mps_sync():
-    if torch.backends.mps.is_available():
-        torch.mps.synchronize()
-
-
-def free_mps():
+def free_device(backend: HardwareBackend) -> None:
+    """Flush device memory caches between benchmark runs."""
+    backend.synchronize()
     gc.collect()
-    if hasattr(torch.mps, "empty_cache"):
+    if backend.device == "mps" and hasattr(torch, "mps") and hasattr(torch.mps, "empty_cache"):
         torch.mps.empty_cache()
+    elif backend.device == "cuda" and torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 
 def fmt_row(label: str, val: float, total: float, unit: str = "s") -> str:
@@ -117,6 +117,7 @@ def run_engine_instrumented(
     fire_state: np.ndarray,
     n_members: int,
     horizon_min: int = 240,
+    backend: Optional[HardwareBackend] = None,
 ) -> dict[str, float]:
     """Run one ensemble and return wall-clock seconds per phase."""
     from scipy.ndimage import distance_transform_edt
@@ -131,6 +132,7 @@ def run_engine_instrumented(
     )
     import torch
 
+    sync = backend.synchronize if backend is not None else (lambda: None)
     T: dict[str, float] = {}
     dev = engine.device
     rng = np.random.default_rng(42)
@@ -156,7 +158,7 @@ def run_engine_instrumented(
     fmc = (fmc_mean_t + torch.randn(n_members, rows, cols, dtype=torch.float32, device=dev) * fmc_std_t).clamp(FMC_MIN_FRACTION, FMC_MAX_FRACTION)
     ws  = (ws_mean_t  + torch.randn(n_members, rows, cols, dtype=torch.float32, device=dev) * ws_std_t).clamp(WIND_SPEED_MIN_MS, WIND_SPEED_MAX_MS)
     wd  = (wd_mean_t  + torch.randn(n_members, rows, cols, dtype=torch.float32, device=dev) * wd_std_t) % 360.0
-    mps_sync()
+    sync()
     T["perturbation_gen"] = time.perf_counter() - t0
 
     # ── 2. SDF init ───────────────────────────────────────────────────────
@@ -170,7 +172,7 @@ def run_engine_instrumented(
     arrival_t = torch.full((n_members, rows, cols), sentinel_s, dtype=torch.float32, device=dev)
     burned_t = torch.tensor(burned_np, device=dev)
     arrival_t[:, burned_t] = 0.0
-    mps_sync()
+    sync()
     T["sdf_init"] = time.perf_counter() - t0
 
     # ── 3. Static precomputation ──────────────────────────────────────────
@@ -193,7 +195,7 @@ def run_engine_instrumented(
     surface_v  = ros_s.new_ones(ros_s.shape)
     max_ros    = max(ros_s.max().item(), ros_crown.max().item())
     dt         = float(max(0.5, min(engine.target_cfl * engine.dx / max(max_ros, 1e-10), 300.0)))
-    mps_sync()
+    sync()
     T["rothermel_precompute"] = time.perf_counter() - t0
 
     print(f"    dt={dt:.2f}s  steps={int(total_s/dt)}  max_ros={max_ros:.4f}m/s", flush=True)
@@ -213,7 +215,7 @@ def run_engine_instrumented(
 
         _t = time.perf_counter()
         grad_mag, gx_cd, gy_cd = _phi_gradient_full(phi, engine.dx)
-        mps_sync()
+        sync()
         t_grad += time.perf_counter() - _t
 
         _t = time.perf_counter()
@@ -222,7 +224,7 @@ def run_engine_instrumented(
         initiates = intensity > I_crit
         ros_f     = torch.where(initiates, torch.maximum(ros_dir, ros_crown), ros_dir)
         fire_type = torch.where(initiates, crown_v, surface_v)
-        mps_sync()
+        sync()
         t_ros += time.perf_counter() - _t
 
         _t = time.perf_counter()
@@ -231,7 +233,7 @@ def run_engine_instrumented(
         t_cross   = t_sim + dt_step * phi / (phi - phi_new + 1e-10)
         arrival_t = torch.where(crossing, t_cross, arrival_t)
         phi = phi_new
-        mps_sync()
+        sync()
         t_phi += time.perf_counter() - _t
 
         step += 1
@@ -240,7 +242,7 @@ def run_engine_instrumented(
         if step % _REDISTANCE_EVERY == 0:
             _t = time.perf_counter()
             phi = _redistance(phi, engine.dx)
-            mps_sync()
+            sync()
             t_redist += time.perf_counter() - _t
             n_redist += 1
 
@@ -280,21 +282,22 @@ def benchmark_engine(terrain: TerrainData, device: str, members: list[int]) -> N
         warnings.simplefilter("ignore")
         engine = GPUFireEngine(terrain, device=device, target_cfl=0.7)
 
+    backend = HardwareBackend(device)
     results: list[tuple[int, dict]] = []
 
     for N in members:
-        free_mps()
+        free_device(backend)
         print(f"\n{HEADER}─── N={N} members ───{RESET}")
         # Warmup
         print("  warmup...", end="", flush=True)
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             engine.run(terrain, gp_prior, fire_state, N, 240, np.random.default_rng(0))
-        free_mps()
+        free_device(backend)
         print(" done")
 
         # Instrumented run
-        T = run_engine_instrumented(engine, terrain, gp_prior, fire_state, N)
+        T = run_engine_instrumented(engine, terrain, gp_prior, fire_state, N, backend=backend)
         results.append((N, T))
 
         total = T["perturbation_gen"] + T["sdf_init"] + T["rothermel_precompute"] + T["cfl_loop_total"] + T["cpu_transfer"]

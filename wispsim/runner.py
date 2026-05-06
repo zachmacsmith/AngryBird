@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import copy
 import logging
+from concurrent.futures import Future
 from dataclasses import dataclass, field, replace as dc_replace
 from typing import Optional
 
@@ -73,6 +74,7 @@ from .drone_sim import (
 )
 from .evaluator import CounterfactualEvaluator, compute_arrival_accuracy
 from .ground_truth import GroundTruth, compute_wind_field
+from angrybird.hardware import HardwareBackend
 from angrybird.prior import SimulatedEnvironmentalSource
 from .observation_buffer import ObservationBuffer, thin_observations
 from angrybird.assimilation import aggregate_drone_observations
@@ -135,6 +137,8 @@ class SimulationConfig:
     base_cell: tuple[int, int] = (195, 100) # (row, col) drone home location
     frame_interval: int = 6                 # render one frame every N sim steps
     fps: int = 10                           # video frames per second
+    live_fire_update_interval_s: float = 300.0  # how often to rerun the 1-member live fire estimate (s)
+    live_fire_horizon_h: float = 1.0            # horizon for the between-cycle 1-member fire estimate (h)
     output_path: str = "out/simulation"
     scenario_name: str = "simulation"
     # RAWS stations — 1 randomly placed by default; pass raws_locations to fix positions
@@ -165,6 +169,11 @@ class SimulationConfig:
     # Small background loss, because path loss is already modeled by link quality.
     mesh_packet_loss_probability: float = 0.015
     selector_name: str = IGNIS_SELECTOR
+    # Per-drone spawn times (seconds).  drone_spawn_times_s[i] is the simulation
+    # time at which drone i activates and leaves the ground station.  Drones with
+    # no entry (or entry=0) activate immediately at t=0.  Shorter list than
+    # n_drones → remaining drones default to 0.
+    drone_spawn_times_s: list = field(default_factory=list)
 
 # ---------------------------------------------------------------------------
 # LiveEstimator
@@ -209,22 +218,36 @@ class LiveEstimator:
         orchestrator: IGNISOrchestrator,
         terrain,
         horizon_h: float = 1.0,
+        fire_update_interval_s: float = 300.0,
+        backend=None,  # HardwareBackend | None — injected by SimulationRunner
     ) -> None:
         self._orchestrator  = orchestrator
         self._terrain       = terrain
         self.horizon_h      = horizon_h
+        # How often (sim-seconds) to rerun the 1-member fire estimate.
+        # Default 300 s (5 min) — configurable via SimulationConfig.live_fire_update_interval_s.
+        self._fire_update_interval_s = fire_update_interval_s
+        self._last_fire_est_time: float = -fire_update_interval_s  # trigger immediately on first call
+        # Hardware backend — drives async vs blocking dispatch.
+        # None → always blocking (safe default for CycleRunner / tests).
+        self._backend = backend
+        # In-flight future for async CUDA dispatch; None when idle.
+        self._pending_future: Optional[Future] = None
         # Snapshot of the orchestrator GP at the last cycle boundary.
-        # Never modified between cycles — all inter-cycle obs go into _obs_buffer.
-        self._live_gp       = copy.deepcopy(orchestrator.gp)
-        # ObservationBuffer applies the same 200 m spatial thinning the main
-        # runner uses before WISP cycles.  Raw obs are added here; thinned()
-        # view is computed in compute_estimate without consuming the buffer.
+        # Never modified between cycles.
+        self._live_gp = copy.deepcopy(orchestrator.gp)
         self._obs_buffer = ObservationBuffer(
             min_spacing_m=OBSERVATION_THINNING_SPACING_M,
             resolution_m=terrain.resolution_m,
         )
-        self._has_obs       = False   # True when buffer has new unseen obs
-        self._cached_prior: Optional[GPPrior] = None  # reused when buffer unchanged
+        self._has_obs = False
+        # GP prior: updated at cycle snapshots; inter-cycle just uses snapshot predict.
+        # The expensive fork+fit-on-drone-obs was costing ~2-3s per render frame
+        # (sklearn re-fits on 300+ training points each call).  Displaying the
+        # cycle-snapshot posterior is accurate enough between 5-min fire updates.
+        self._cached_prior: Optional[GPPrior] = None
+        # Cached 1-member fire arrival time map — reused until update interval elapses.
+        self._cached_arrival_times_h: Optional[np.ndarray] = None
 
     # ------------------------------------------------------------------
 
@@ -236,14 +259,38 @@ class LiveEstimator:
         are small once fitted) and happens only every 20 sim-minutes.
         The obs buffer is cleared so the next inter-cycle estimate starts fresh
         from the updated posterior rather than re-adding old observations.
+
+        Any in-flight async fire estimate is cancelled: its GP snapshot is now
+        stale.  On CUDA, Future.cancel() is a best-effort signal — if the
+        worker has already started running, the result is simply discarded
+        when the next collect attempt finds a fresh estimate has been queued.
+
+        NOTE: _cached_prior and _cached_arrival_times_h are intentionally
+        preserved here.  The renderer will show the previous cycle's estimate
+        for the one frame that coincides with the cycle boundary, rather than
+        flashing blank while the new async fire run completes.  The timer
+        reset below forces a fresh run on the very next compute_estimate call
+        so the display is updated within one render frame.
         """
+        # Discard any in-flight run — it was seeded from the old GP snapshot.
+        if self._pending_future is not None and not self._pending_future.done():
+            self._pending_future.cancel()
+        self._pending_future = None
+
         self._live_gp     = copy.deepcopy(self._orchestrator.gp)
         self._obs_buffer  = ObservationBuffer(
             min_spacing_m=OBSERVATION_THINNING_SPACING_M,
             resolution_m=self._terrain.resolution_m,
         )
-        self._has_obs     = False
+        self._has_obs = False
+        # Invalidate the cached GP prior so the new posterior is used on the
+        # next predict() call, but keep _cached_arrival_times_h alive so the
+        # renderer has something to show on the cycle-boundary frame.
         self._cached_prior = None
+        # Force a fire re-run on the next compute_estimate call after a cycle,
+        # but do NOT null _cached_arrival_times_h — the old estimate is still
+        # better than a blank frame for one render step.
+        self._last_fire_est_time = -self._fire_update_interval_s
 
     def add_observations(self, obs: list[DroneObservation]) -> None:
         """
@@ -263,91 +310,112 @@ class LiveEstimator:
         shape: tuple[int, int],
         fire_state: np.ndarray,
         rng: np.random.Generator,
+        current_time: float = 0.0,
     ) -> tuple[GPPrior, Optional[np.ndarray]]:
         """
-        Compute the live best estimate using thinned drone observations.
+        Compute the live best estimate.
 
-        When new observations have arrived since the last call, thin the
-        buffer (200 m min spacing — identical to the WISP cycle pipeline) and
-        temporarily condition a copy of the snapshot GP on FMC + wind speed +
-        wind direction from those thinned obs.  The snapshot GP itself is never
-        mutated between cycles.
+        GP prior
+        --------
+        Returns the cycle-snapshot posterior (cheap: GP predict ~1 ms).
+        The expensive fork+fit-on-drone-obs path was removed: sklearn re-fits
+        on 300+ training points costs 2-3 s per call, and displaying the
+        snapshot posterior between cycles is visually accurate enough.
+
+        Fire arrival times
+        ------------------
+        Re-runs the 1-member fire simulation at most once per
+        `fire_update_interval_s` (configurable, default 300 s / 5 min).
+        Between updates the cached result is returned unchanged.  A WISP cycle
+        snapshot resets the timer so the first post-cycle frame always gets a
+        fresh fire estimate.
 
         Returns
         -------
         prior : GPPrior
-            GP posterior conditioned on all thinned observations collected since
-            the last WISP cycle (FMC mean, wind speed mean, wind dir mean,
-            and their variances).
-        arrival_times_h : ndarray or None
-            Float32 (rows, cols) estimated ignition time in hours from
-            simulation start.  NaN for cells not reached within the horizon.
-            None if no fire engine is available.
+        arrival_times_h : float32[rows, cols] or None
         """
-        if self._has_obs:
-            # Aggregate the buffer's raw obs at the full GP correlation length.
-            aggregated = aggregate_drone_observations(
-                self._obs_buffer._buffer,
-                spacing_m=GP_CORRELATION_LENGTH_FMC_M,
-                resolution_m=self._obs_buffer._resolution_m,
-            )
-            if aggregated:
-                # Fork the live GP's store so we can add new obs without touching
-                # the main store. The deep-copied GP points to the forked store.
-                work_store = self._live_gp._store.fork()
-                work_gp    = copy.deepcopy(self._live_gp)
-                work_gp._store = work_store
-
-                new_obs: list[DroneObs] = []
-                ws_by_loc = {o.location: o for o in aggregated
-                             if o.wind_speed is not None and np.isfinite(o.wind_speed)
-                             and o.wind_speed_sigma is not None}
-                wd_by_loc = {o.location: o for o in aggregated
-                             if o.wind_dir is not None and np.isfinite(o.wind_dir)}
-                for o in aggregated:
-                    wo = ws_by_loc.get(o.location)
-                    do = wd_by_loc.get(o.location)
-                    new_obs.append(DroneObs(
-                        _source_id           = o.drone_id or "drone",
-                        _timestamp           = o.timestamp or 0.0,
-                        location             = o.location,
-                        fmc                  = o.fmc,
-                        fmc_sigma            = o.fmc_sigma,
-                        wind_speed           = wo.wind_speed if wo else None,
-                        wind_speed_sigma     = wo.wind_speed_sigma if wo else None,
-                        wind_direction       = do.wind_dir if do else None,
-                        wind_direction_sigma = (do.wind_dir_sigma if do and do.wind_dir_sigma
-                                                is not None else (10.0 if do else None)),
-                    ))
-
-                if new_obs:
-                    work_store.add_batch(new_obs)
-                self._cached_prior = work_gp.predict(shape)
-            # Reset so we don't redo the expensive fork/predict unless new obs arrive.
-            self._has_obs = False
+        self._has_obs = False   # drain flag; observations already in _obs_buffer
 
         prior = self._cached_prior if self._cached_prior is not None \
             else self._live_gp.predict(shape)
 
-        arrival_times_h: Optional[np.ndarray] = None
         fire_engine = getattr(self._orchestrator, "fire_engine", None)
-        if fire_engine is not None:
-            try:
-                result = fire_engine.run(
-                    self._terrain,
-                    prior,
-                    fire_state,
-                    n_members=1,
-                    horizon_min=int(self.horizon_h * 60),
-                    rng=rng,
-                )
-                # member_arrival_times: (n_members, rows, cols) in hours;
-                # NaN for cells not reached within the horizon.
-                arrival_times_h = result.member_arrival_times[0].astype(np.float32)
-            except Exception as exc:
-                logger.warning("LiveEstimator fire run failed: %s", exc)
 
-        return prior, arrival_times_h
+        # ── Collect: pick up a finished async run ─────────────────────────
+        # On CUDA, the background thread may have finished since the last
+        # render frame.  On MPS/CPU the future is always already resolved
+        # (blocking inline path), so this check is effectively free.
+        if self._pending_future is not None and self._pending_future.done():
+            try:
+                result = self._pending_future.result()
+                self._cached_arrival_times_h = (
+                    (result.member_arrival_times[0].astype(np.float32) / 60.0) + (current_time / 3600.0)
+                )
+                self._last_fire_est_time = current_time
+            except Exception as exc:
+                logger.warning("LiveEstimator async fire run failed: %s", exc)
+            finally:
+                self._pending_future = None
+
+        # ── Submit: launch a new run when due and nothing is in flight ────
+        # On CUDA this returns immediately; the background thread does the
+        # work while the main loop continues to the next render frame.
+        # On MPS/CPU HardwareBackend.submit_fire_estimate() runs inline so
+        # the pending_future is already resolved by the collect step above on
+        # the same call.
+        due = (current_time - self._last_fire_est_time) >= self._fire_update_interval_s
+        if (due or self._cached_arrival_times_h is None) \
+                and self._pending_future is None \
+                and fire_engine is not None:
+
+            # Capture a snapshot of mutable arguments so the background
+            # thread never races with the main loop.
+            _terrain     = self._terrain
+            _prior       = prior
+            _fire_state  = fire_state.copy() if hasattr(fire_state, "copy") else fire_state
+            _rng         = rng
+            _horizon_min = int(self.horizon_h * 60)
+
+            def _run_fire_est():
+                return fire_engine.run(
+                    _terrain, _prior, _fire_state,
+                    n_members=1,
+                    horizon_min=_horizon_min,
+                    rng=_rng,
+                )
+
+            if self._backend is not None:
+                self._pending_future = self._backend.submit_fire_estimate(
+                    _run_fire_est
+                )
+                # If we have absolutely no cached estimate (e.g. very first frame),
+                # block and wait for it so we don't render a blank frame.
+                if self._cached_arrival_times_h is None:
+                    try:
+                        result = self._pending_future.result()
+                        self._cached_arrival_times_h = (
+                            (result.member_arrival_times[0].astype(np.float32) / 60.0) + (current_time / 3600.0)
+                        )
+                        self._last_fire_est_time = current_time
+                    except Exception as exc:
+                        logger.warning("LiveEstimator first async fire run failed: %s", exc)
+                    finally:
+                        self._pending_future = None
+
+            else:
+                # No backend supplied (e.g. CycleRunner / unit tests) — run
+                # blocking and store result directly.
+                try:
+                    result = _run_fire_est()
+                    self._cached_arrival_times_h = (
+                        (result.member_arrival_times[0].astype(np.float32) / 60.0) + (current_time / 3600.0)
+                    )
+                    self._last_fire_est_time = current_time
+                except Exception as exc:
+                    logger.warning("LiveEstimator fire run failed: %s", exc)
+
+        return prior, self._cached_arrival_times_h
 
 
 # ---------------------------------------------------------------------------
@@ -390,7 +458,7 @@ class CycleRunner:
         resolution_m: float = GRID_RESOLUTION_M,
         obs_source: Optional[ObservationSource] = None,
         bimodal_alpha: float = 0.5,
-        bimodal_beta: float = 0.3,
+        bimodal_beta: float = 0.0,   # disabled — see orchestrator.py comment
         nelson_T_C: float = NELSON_DEFAULT_T_C,
         nelson_RH: float = NELSON_DEFAULT_RH,
         nelson_hour: float = 14.0,
@@ -644,6 +712,20 @@ class SimulationRunner:
         self.truth        = ground_truth
         self.orchestrator = orchestrator
 
+        # Pre-compute full oracle arrival times for consistent CRPS evaluation.
+        # Uses a fresh GroundTruthFire so self.truth.fire stays at t=0.
+        # One large step (Dijkstra wavefront) is sufficient — all cells are
+        # processed in correct arrival-time order regardless of step size.
+        from .fire_oracle import GroundTruthFire as _GTF
+        _pre = _GTF(terrain, ground_truth.ignition_cells)
+        _pre.step(
+            config.total_time_s,
+            ground_truth.wind_speed,
+            ground_truth.wind_direction,
+            ground_truth.fmc,
+        )
+        self._oracle_arrival_times: np.ndarray = _pre.arrival_times.copy()
+
         horizon_h = getattr(orchestrator, "horizon_min", SIMULATION_HORIZON_MIN) / 60.0
 
         self.obs_buffer = ObservationBuffer(
@@ -672,17 +754,19 @@ class SimulationRunner:
         self._prev_gp_var_sum: float = (GP_DEFAULT_FMC_VARIANCE + GP_DEFAULT_WIND_SPEED_VARIANCE) * _n
 
         base_pos = cell_to_pos_m(config.base_cell, terrain.resolution_m)
+        _spawn_times = list(config.drone_spawn_times_s) + [0.0] * config.n_drones
         self.drones = [
             DroneState(
                 drone_id=f"drone_{i}",
                 position=base_pos.copy(),
                 speed=config.drone_speed_ms,
-                status="idle",
+                status="pending" if _spawn_times[i] > 0.0 else "idle",
                 waypoint_queue=[],
                 current_target=None,
                 path_history=[base_pos.copy()],
                 endurance_remaining_s=config.drone_endurance_s,
                 base_position=base_pos.copy(),
+                spawn_time_s=_spawn_times[i],
             )
             for i in range(config.n_drones)
         ]
@@ -801,15 +885,42 @@ class SimulationRunner:
         # Last ensemble result — used to recompute info field live at render cadence.
         self._last_ensemble: Optional[EnsembleResult] = None
         self._live_info_field: Optional[InformationField] = None
+        # Dirty flag: True after each WISP cycle updates the ensemble/prior.
+        # compute_information_field is only recomputed when dirty — the result
+        # is identical between cycles since neither ensemble nor prior changes.
+        self._live_info_field_dirty: bool = False
 
-        # Live estimator — updates between cycles with raw per-step observations
+        # Hardware backend — resolves device capabilities once and passes them
+        # down to components that need async dispatch or explicit synchronisation.
+        # Inferred from the fire engine's device; falls back to "cpu" if the
+        # orchestrator has no fire engine attached yet.
+        _fe = getattr(orchestrator, "fire_engine", None)
+        _dev = str(getattr(_fe, "device", "cpu"))  # torch.device or str both work
+        self._hw_backend = HardwareBackend(_dev)
+
+        # Live estimator — updates between cycles with raw per-step observations.
+        # Uses a shorter horizon than the full ensemble (default 1 h) so each
+        # 1-member fire run is fast enough to run every few minutes of sim time.
+        # On CUDA the backend enables async dispatch so the fire sim overlaps
+        # with the main loop; on MPS/CPU it falls back to blocking.
         self._live_est = LiveEstimator(
             orchestrator=orchestrator,
             terrain=terrain,
-            horizon_h=horizon_h,
+            horizon_h=config.live_fire_horizon_h,
+            fire_update_interval_s=config.live_fire_update_interval_s,
+            backend=self._hw_backend,
         )
         self._live_gp_prior: Optional[GPPrior] = None
         self._live_arrival_times_h: Optional[np.ndarray] = None
+        # Oracle arrival times: fire-engine projection using true FMC/wind, same
+        # format as live_arrival_times_h so both panels are directly comparable.
+        self._truth_arrival_times_h: Optional[np.ndarray] = None
+        self._last_truth_est_time: float = -config.live_fire_update_interval_s
+        # Per-cycle metrics CSV: rows accumulated in _run_ignis_cycle, written at end.
+        self._cycle_metrics_rows: list[dict] = []
+        self._cumulative_obs: int = 0   # drone obs delivered to GP (excluding RAWS)
+        # Per-cycle accuracy trace for the renderer (WispSim-only; not stored in CycleReport).
+        self._accuracy_trace: list[dict] = []
         self.network_log_rows = []
 
     # ------------------------------------------------------------------
@@ -870,6 +981,18 @@ class SimulationRunner:
             # 3. Move drones + collect observations
             _t0 = _time.perf_counter()
             for drone in self.drones:
+                # Activate pending drones whose spawn time has arrived.
+                if drone.status == "pending" and self.current_time >= drone.spawn_time_s:
+                    drone.status = "idle"
+                    drone.position = drone.base_position.copy()
+                    logger.info(
+                        "Drone %s activated at t=%.0fs (spawn_time=%.0fs)",
+                        drone.drone_id, self.current_time, drone.spawn_time_s,
+                    )
+
+                if drone.status == "pending":
+                    continue  # not yet active — skip movement and observations
+
                 move_drone(drone, self.config.dt)
                 self._refuel_if_home(drone)
 
@@ -971,12 +1094,47 @@ class SimulationRunner:
                         shape=self.terrain.shape,
                         fire_state=fire_state,
                         rng=np.random.default_rng(step),
+                        current_time=self.current_time,
                     )
                 )
-                # Recompute the info field live: reuse the cached ensemble from
-                # the last WISP cycle but with the freshest GP prior so that the
-                # panel reflects new observations as they arrive through the network.
-                if self._last_ensemble is not None:
+                # Oracle arrival time: same fire-engine projection as the estimate
+                # but seeded with the true FMC and wind fields instead of the GP
+                # posterior.  Uses the same update interval as the live estimate.
+                fire_engine = getattr(self.orchestrator, "fire_engine", None)
+                if (fire_engine is not None and (
+                    self._truth_arrival_times_h is None or
+                    (self.current_time - self._last_truth_est_time)
+                        >= self.config.live_fire_update_interval_s
+                )):
+                    try:
+                        _zero = np.zeros(self.terrain.shape, dtype=np.float32)
+                        _truth_prior = GPPrior(
+                            fmc_mean=self.truth.fmc.astype(np.float32),
+                            fmc_variance=_zero,
+                            wind_speed_mean=self.truth.wind_speed.astype(np.float32),
+                            wind_speed_variance=_zero,
+                            wind_dir_mean=self.truth.wind_direction.astype(np.float32),
+                            wind_dir_variance=_zero,
+                        )
+                        _truth_result = fire_engine.run(
+                            self.terrain, _truth_prior,
+                            fire_state.copy(),
+                            n_members=1,
+                            horizon_min=int(self._live_est.horizon_h * 60),
+                            rng=np.random.default_rng(step + 1),
+                        )
+                        self._truth_arrival_times_h = (
+                            _truth_result.member_arrival_times[0].astype(np.float32)
+                            / 60.0
+                        ) + (self.current_time / 3600.0)
+                        self._last_truth_est_time = self.current_time
+                    except Exception as _exc:
+                        logger.warning("Oracle fire estimate failed: %s", _exc)
+                # Recompute the info field only when the ensemble or GP prior has
+                # changed (i.e., just after a WISP cycle).  Between cycles the
+                # ensemble and prior are both constant, so the result is identical
+                # every frame — no need to recompute 60× per hour.
+                if self._last_ensemble is not None and self._live_info_field_dirty:
                     live_prior = (
                         self._live_gp_prior
                         if self._live_gp_prior is not None
@@ -992,6 +1150,7 @@ class SimulationRunner:
                                 bimodal_alpha=self.orchestrator.bimodal_alpha,
                                 bimodal_beta=self.orchestrator.bimodal_beta,
                             )
+                            self._live_info_field_dirty = False
                         except Exception:
                             pass  # fall back to last cycle's info field
             _step_buckets["live_est"] += _time.perf_counter() - _t0
@@ -1014,6 +1173,8 @@ class SimulationRunner:
                 cycle_reports=self.cycle_reports,
                 live_gp_prior=self._live_gp_prior,
                 live_arrival_times_h=self._live_arrival_times_h,
+                truth_arrival_times_h=self._truth_arrival_times_h,
+                accuracy_trace=self._accuracy_trace,
             )
             _step_buckets["render"] += _time.perf_counter() - _t0
 
@@ -1040,6 +1201,15 @@ class SimulationRunner:
             logger.info("Mesh network metrics: %s", self.network.get_metrics())
             logger.info("Final drone buffer sizes: %s", self.network.get_buffer_sizes())
 
+        # Write per-cycle metrics CSV (used by demo/compare_runs.py).
+        if self._cycle_metrics_rows:
+            metrics_csv = self.renderer.out_dir.parent / f"{self.config.scenario_name}_metrics.csv"
+            with open(metrics_csv, "w", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=self._cycle_metrics_rows[0].keys())
+                writer.writeheader()
+                writer.writerows(self._cycle_metrics_rows)
+            logger.info("Cycle metrics saved to %s", metrics_csv)
+
         if hasattr(self, "network_log_rows"):
             output_dir = Path("out")
             output_dir.mkdir(exist_ok=True)
@@ -1057,6 +1227,11 @@ class SimulationRunner:
 
                 logger.info("Network metrics saved to %s", network_csv)
 
+        # Ensure the background fire-estimate executor is stopped cleanly.
+        # On CUDA this waits for any in-flight run to finish before returning.
+        # On MPS/CPU the executor is None so this is a no-op.
+        self._hw_backend.shutdown(wait=True)
+
         return self.cycle_reports
 
     # ------------------------------------------------------------------
@@ -1066,6 +1241,7 @@ class SimulationRunner:
     def _run_ignis_cycle(self) -> None:
         """Flush observation buffer, run orchestrator, dispatch drones."""
         observations = self.obs_buffer.flush_thinned()
+        self._cumulative_obs += len(observations)
 
         # Prune expired observations; temporal decay is query-time-parameterized
         # (passed to get_data_points at fit time) so no update_time() needed.
@@ -1082,6 +1258,31 @@ class SimulationRunner:
             )
             if sat_obs:
                 self.orchestrator.obs_store.add_batch(sat_obs)
+
+        # Sync physical drone positions into the orchestrator's DroneFlightState so
+        # that the path planner starts each drone's route from its actual location,
+        # not from the predicted end-of-last-cycle domain centroid.
+        # Pending (not-yet-spawned) drones are pinned to the base position so the
+        # path planner correctly treats them as starting from the ground station.
+        if self.orchestrator._drone_states is not None:
+            from angrybird.types import DroneFlightState as _DFS
+            synced = []
+            for phys, flight in zip(self.drones, self.orchestrator._drone_states):
+                actual_pos = (
+                    phys.base_position.copy()
+                    if phys.status == "pending"
+                    else phys.position.copy()
+                )
+                synced.append(_DFS(
+                    drone_id      = flight.drone_id,
+                    position_m    = actual_pos,
+                    remaining_range_m = flight.remaining_range_m,
+                    mode          = flight.mode,
+                    target_gs_idx = flight.target_gs_idx,
+                    sortie_distance_m = flight.sortie_distance_m,
+                    returned      = flight.returned,
+                ))
+            self.orchestrator._drone_states = synced
 
         # No fire_state argument — orchestrator derives fire state from obs_store
         # (drone thermal detections + GOES/VIIRS satellite passes).
@@ -1108,15 +1309,62 @@ class SimulationRunner:
         # Arrival time accuracy against oracle ground truth.
         # Always uses the ensemble from THIS cycle (post-assimilation GP),
         # including cycle 0 where the GP is seeded by RAWS only.
-        # compute_arrival_accuracy returns (0, 0, 0) if no cells have burned yet.
+        # compute_arrival_accuracy returns (0, 0, 0) if no cells will burn in horizon.
+        # Uses _oracle_arrival_times (pre-computed full run) so both IGNIS and the
+        # static prior baseline are scored against the same set of cells at every
+        # cycle — incremental truth would give n_active≈0 at early cycles (unfair).
+        horizon_s = self.orchestrator.horizon_min * 60.0
         crps_min = rmse_min = spread_skill = 0.0
         if self._last_ensemble is not None:
-            horizon_s = self.orchestrator.horizon_min * 60.0
             crps_min, rmse_min, spread_skill = compute_arrival_accuracy(
                 self._last_ensemble,
-                self.truth.fire.arrival_times,
+                self._oracle_arrival_times,
                 horizon_s=horizon_s,
+                current_time_s=self.current_time,
             )
+
+        # Active cells within the horizon from oracle truth (consistent denominator).
+        # compute_arrival_accuracy already returns the per-cell mean; crps_per_cell_min
+        # mirrors that value so both CSV columns carry the same information.
+        _active_mask = (
+            (self._oracle_arrival_times >= self.current_time) &
+            ((self._oracle_arrival_times - self.current_time) < horizon_s) &
+            np.isfinite(self._oracle_arrival_times)
+        )
+        n_active_cells = int(_active_mask.sum())
+        crps_per_cell_min = crps_min  # already per-cell mean from compute_arrival_accuracy
+
+        # Oracle CRPS: 1-member fire run seeded with true FMC + wind (zero GP
+        # uncertainty).  Gives the irreducible model-error floor — the best CRPS
+        # achievable even with perfect observations.
+        oracle_crps_min = 0.0
+        _fire_engine = getattr(self.orchestrator, "fire_engine", None)
+        if _fire_engine is not None:
+            try:
+                _zero = np.zeros(self.terrain.shape, dtype=np.float32)
+                _oracle_prior = GPPrior(
+                    fmc_mean=self.truth.fmc.astype(np.float32),
+                    fmc_variance=_zero,
+                    wind_speed_mean=self.truth.wind_speed.astype(np.float32),
+                    wind_speed_variance=_zero,
+                    wind_dir_mean=self.truth.wind_direction.astype(np.float32),
+                    wind_dir_variance=_zero,
+                )
+                _oracle_result = _fire_engine.run(
+                    self.terrain, _oracle_prior,
+                    self.truth.fire.fire_state.copy(),
+                    n_members=1,
+                    horizon_min=self.orchestrator.horizon_min,
+                    rng=np.random.default_rng(0),
+                )
+                oracle_crps_min, _, _ = compute_arrival_accuracy(
+                    _oracle_result,
+                    self._oracle_arrival_times,
+                    horizon_s=horizon_s,
+                    current_time_s=self.current_time,
+                )
+            except Exception as _exc:
+                logger.warning("Oracle CRPS computation failed: %s", _exc)
 
         evaluations: dict[str, StrategyEvaluation] = {}
 
@@ -1150,15 +1398,46 @@ class SimulationRunner:
                 crps_minutes=crps_min,
                 rmse_minutes=rmse_min,
                 spread_skill_ratio=spread_skill,
+                oracle_crps_minutes=oracle_crps_min,
             )
 
         # CycleReport is frozen — use dataclasses.replace to attach evaluations.
         cycle_report = dc_replace(cycle_report, evaluations=evaluations)
         self.cycle_reports.append(cycle_report)
 
+        # Accumulate per-cycle metrics row for CSV export.
+        _n_cells = self.terrain.shape[0] * self.terrain.shape[1]
+        _n_burned = int((self.truth.fire.arrival_times < self.current_time).sum())
+        self._accuracy_trace.append({
+            "time_min":              round(self.current_time / 60.0, 3),
+            "crps_per_cell_minutes": round(crps_per_cell_min, 6),
+            "n_active_cells":        n_active_cells,
+        })
+        self._cycle_metrics_rows.append({
+            "scenario_name":         self.config.scenario_name,
+            "n_drones":              self.config.n_drones,
+            "cycle":                 len(self.cycle_reports),
+            "time_min":              round(self.current_time / 60.0, 3),
+            "n_obs_cumulative":      self._cumulative_obs,
+            "crps_minutes":          round(crps_min, 4),
+            "crps_per_cell_minutes": round(crps_per_cell_min, 6),
+            "n_active_cells":        n_active_cells,
+            "oracle_crps_minutes":   round(oracle_crps_min, 4),
+            "spread_skill":          round(spread_skill, 4),
+            "gp_var_fmc_mean":       round(float(self._gp_prior.fmc_variance.mean()), 6)
+                                     if self._gp_prior is not None else 0.0,
+            "gp_var_wind_mean":      round(float(self._gp_prior.wind_speed_variance.mean()), 6)
+                                     if self._gp_prior is not None else 0.0,
+            "n_burned_cells":        _n_burned,
+            "burn_fraction":         round(_n_burned / max(_n_cells, 1), 6),
+        })
+
         # Sync live estimator to the updated orchestrator GP state so the next
         # inter-cycle live estimate starts from the freshest posterior.
         self._live_est.snapshot_from_cycle()
+        # Mark info field stale — will be recomputed on the next render frame
+        # after the live estimator produces a fresh fire estimate.
+        self._live_info_field_dirty = True
 
         self._assign_drone_waypoints(self.orchestrator._drone_plans)
 
@@ -1189,9 +1468,11 @@ class SimulationRunner:
 
         New WISP cycle plans preempt whatever the drone is currently flying —
         the drone drops its remaining waypoints and starts the new route from
-        its current position.
+        its current position.  Pending (not-yet-spawned) drones are skipped.
         """
         for drone, plan in zip(self.drones, drone_plans):
+            if drone.status == "pending":
+                continue
             path = plan.waypoints[1:] if len(plan.waypoints) > 1 else []
             if path:
                 assign_waypoints(drone, path, self.terrain.resolution_m)

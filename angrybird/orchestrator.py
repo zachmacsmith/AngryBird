@@ -34,11 +34,14 @@ from .config import (
     N_DRONES,
     SIMULATION_HORIZON_MIN,
 )
+from .fire_retrospect import generate_fire_retrospect_observations
 from .fire_state import (
     ConsistencyChecker,
     EnsembleFireState,
     FireStateEstimator,
+    compute_particle_weights,
     particle_filter_fire,
+    systematic_resample,
 )
 from .gp import IGNISGPPrior
 from .information import compute_information_field
@@ -133,7 +136,12 @@ class IGNISOrchestrator:
         resolution_m: float = GRID_RESOLUTION_M,
         base_seed: int = 0,
         bimodal_alpha: float = 0.5,
-        bimodal_beta: float = 0.3,
+        bimodal_beta: float = 0.0,   # DISABLED: member_fire_types is a static terrain
+                                      # crown-susceptibility map, not conditioned on fire
+                                      # reaching cells — its binary entropy contaminates
+                                      # ~50% of the domain with terrain noise unrelated
+                                      # to fire dynamics.  Re-enable only once crown fire
+                                      # is gated on burn_probability > 0 per cell.
         ground_stations: Optional[list[tuple[int, int]]] = None,
         data_source: Optional[EnvironmentalDataSource] = None,
     ) -> None:
@@ -208,6 +216,23 @@ class IGNISOrchestrator:
         self._last_cycle_time_s: float = 0.0
         # Last ensemble result — used by ConsistencyChecker next cycle.
         self._last_ensemble_result: Optional[EnsembleResult] = None
+        # Phi level-set used as fire-engine input on cycle 1; captured so the
+        # static-prior baseline can run the same initial fire state.
+        self._cycle1_initial_phi: Optional[np.ndarray] = None
+
+        # ── Terrain domain graph for fire retrospect observations ─────────────
+        # Built once from static terrain; used each cycle to identify
+        # representative cells for weighted FMC/wind observations at the fire front.
+        try:
+            from .selectors.correlation_path import build_terrain_domain_graph
+            self._domain_graph = build_terrain_domain_graph(terrain, resolution_m)
+            logger.debug(
+                "Fire retrospect: %d terrain domains ready",
+                len(self._domain_graph.domains),
+            )
+        except Exception as _exc:
+            logger.warning("Fire retrospect: could not build domain graph — %s", _exc)
+            self._domain_graph = None
 
     # ------------------------------------------------------------------
     # Main cycle
@@ -341,7 +366,9 @@ class IGNISOrchestrator:
             fire_obs = self.obs_store.get_fire_detections(since=self._last_cycle_time_s)
             if fire_obs:
                 should_reset, disagreement = self.consistency_checker.check(
-                    fire_obs, self._last_ensemble_result, start_time)
+                    fire_obs, self._last_ensemble_result, start_time,
+                    last_cycle_time_s=self._last_cycle_time_s,
+                )
 
                 if should_reset:
                     arrival_field = self.fire_state_estimator.reconstruct_arrival_time(
@@ -357,9 +384,15 @@ class IGNISOrchestrator:
                         self.cycle_count, disagreement * 100, len(fire_obs),
                     )
                 else:
-                    indices, n_eff = particle_filter_fire(
+                    retro_weights, n_eff = compute_particle_weights(
                         self._last_ensemble_result, fire_obs,
-                        start_time, self.n_members)
+                        start_time, self.n_members,
+                        last_cycle_time_s=self._last_cycle_time_s,
+                    )
+                    if n_eff < self.n_members * 0.5:
+                        indices = systematic_resample(retro_weights, self.n_members)
+                    else:
+                        indices = np.arange(self.n_members)
                     self.ensemble_fire_state.resample(indices)
                     logger.info(
                         "Cycle %d | fire state particle filter | "
@@ -367,8 +400,45 @@ class IGNISOrchestrator:
                         self.cycle_count, disagreement * 100, n_eff,
                     )
 
+                    # ── Fire retrospect: update GP with weighted FMC/wind at fire front.
+                    # Gate 1: skip when weights are nearly uniform — uniform weights
+                    # mean fire obs didn't discriminate members, so the weighted mean
+                    # equals the prior mean and injecting it tightens GP for free.
+                    _retro_useful = n_eff < self.n_members * 0.8
+                    if _retro_useful and self._domain_graph is not None:
+                        elapsed_min = (start_time - self._last_cycle_time_s) / 60.0
+                        burn_frac   = (
+                            self._last_ensemble_result.member_arrival_times < elapsed_min
+                        ).mean(axis=0).astype(np.float32)
+                        fire_front  = (burn_frac > 0.05) & (burn_frac < 0.95)
+                        if fire_front.any():
+                            retro_obs = generate_fire_retrospect_observations(
+                                retro_weights,
+                                fire_obs,
+                                self._last_ensemble_result,
+                                fire_front,
+                                self._domain_graph.domains,
+                                gp_prior,
+                                n_eff=n_eff,
+                                n_members=self.n_members,
+                                current_time=start_time,
+                            )
+                            if retro_obs:
+                                self.obs_store.remove_by_source_prefix("fire_retrospect")
+                                self.obs_store.add_batch(retro_obs)
+                                self.gp.fit(start_time)
+                                gp_prior = self.gp.predict(shape)
+                                logger.info(
+                                    "Cycle %d | fire retrospect: %d domain obs "
+                                    "(N_eff=%.1f, inflation=%.1f×)",
+                                    self.cycle_count, len(retro_obs),
+                                    n_eff, self.n_members / max(n_eff, 1.0),
+                                )
+
         if self.ensemble_fire_state.initialized:
             initial_phi_for_engine = self.ensemble_fire_state.get_initial_phi(start_time)
+            if self._cycle1_initial_phi is None:
+                self._cycle1_initial_phi = initial_phi_for_engine.copy()
         _t["fire_state"] = time.perf_counter() - _t0
 
         # 4. Ensemble — use caller-provided or run fire engine
@@ -393,7 +463,12 @@ class IGNISOrchestrator:
         _t["ensemble"] = time.perf_counter() - _t0
 
         # Carry forward per-member fire state for next cycle.
-        self.ensemble_fire_state.carry_forward(ensemble.member_arrival_times)
+        # carry_forward_time_s records this cycle's start so the next cycle's
+        # get_initial_phi / particle_filter can compute elapsed time correctly.
+        self.ensemble_fire_state.carry_forward(
+            ensemble.member_arrival_times,
+            carry_forward_time_s=start_time,
+        )
         self._last_ensemble_result = ensemble
         self._last_cycle_time_s    = start_time
 
@@ -427,6 +502,7 @@ class IGNISOrchestrator:
             resolution_m=self.resolution_m,
             drone_states=self._drone_states,
             ground_stations_m=self._ground_stations_m,
+            n_drones=self.n_drones,
         )
         _t["selection"] = time.perf_counter() - _t0
 
